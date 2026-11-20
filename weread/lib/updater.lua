@@ -13,8 +13,9 @@ Updater.AUTO_CHECK_INTERVAL = 60 * 60
 Updater.REMINDER_INTERVAL = 24 * 60 * 60
 Updater.MAX_NOTES_BYTES = 64 * 1024
 Updater.MAX_PACKAGE_BYTES = 10 * 1024 * 1024
-Updater.API_URL = "https://api.github.com/repos/finlater/weread.koplugin/releases/latest"
-Updater.RELEASE_PREFIX = "https://github.com/finlater/weread.koplugin/releases/download/"
+local repository = "lonelygo/weread.koplugin"
+Updater.API_URL = "https://api.github.com/repos/" .. repository .. "/releases/latest"
+Updater.RELEASE_PREFIX = "https://github.com/" .. repository .. "/releases/download/"
 Updater.GITHUB_MIRRORS = {
     "https://gh-proxy.com/",
     "https://ghfast.top/",
@@ -207,7 +208,18 @@ function Updater:new(options)
         plugin_dir = options.plugin_dir or plugin_dir_from_source(),
     }
     assert(obj.plugin_dir and obj.plugin_dir ~= "", "plugin directory unavailable")
-    return setmetatable(obj, self)
+    setmetatable(obj, self)
+    if obj:_state().repository ~= repository then
+        -- A manual install over upstream keeps settings, including any pending
+        -- update. Only the check preferences carry over between channels.
+        obj:_save_state{
+            repository = repository, last_check = 0, available_version = "",
+            archive_url = "", checksum_url = "", archive_size = 0,
+            release_notes = "", release_url = "", skipped_version = "",
+            snoozed_version = "", snooze_until = 0,
+        }
+    end
+    return obj
 end
 
 function Updater:_state()

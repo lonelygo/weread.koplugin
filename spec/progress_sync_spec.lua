@@ -96,7 +96,7 @@ local function fixture(remote, options)
         get_book = function() return book end,
         get_chapters = options.get_chapters or function() return chapters end,
         refresh_catalog = options.refresh_catalog,
-        get_file_context = function()
+        get_file_context = options.get_file_context or function()
             return nil, nil, true
         end,
         run_online = options.run_online or function(_kind, callback)
@@ -626,6 +626,27 @@ test("a fresh automatic pull replaces an older retry chain", function()
     eq(#f.queue, 1, "stale chain does not schedule another retry")
     f.step()
     eq(#f.queue, 1, "replacement chain remains active")
+end)
+
+test("incremental aggregate recalculates chapter and local fraction", function()
+    local chapter_index = 1
+    local fractions = { 0.5, 0.5 }
+    local f = fixture({}, {
+        get_file_context = function()
+            local chapter = chapters[chapter_index]
+            return chapter_index, chapter, false, {
+                incremental = true,
+                chapter_fraction = fractions[chapter_index],
+            }
+        end,
+    })
+    local first = assert(f.sync:capture_local())
+    eq(first.chapter_uid, 11, "first aggregate chapter")
+    eq(first.chapter_offset, 50, "first aggregate chapter offset")
+    chapter_index = 2
+    local second = assert(f.sync:capture_local())
+    eq(second.chapter_uid, 22, "same-path chapter context refreshed")
+    eq(second.chapter_offset, 150, "second aggregate chapter offset")
 end)
 
 print(string.format(

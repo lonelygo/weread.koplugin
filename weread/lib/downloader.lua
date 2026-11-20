@@ -71,7 +71,8 @@ local RESUME_SKIP_BATCH_SIZE = 25
 --   client, settings,                       -- injected dependencies
 --   show_info(text), show_transient(text, timeout),
 --   refresh_ui(), refresh_shelf(),
---   open_file(path), safe_callback(label, fn),
+--   open_file(path), open_chapter(book, chapter, cached_path),
+--   safe_callback(label, fn),
 --   require_login(cookie, api_key), run_online_task(label, fn),
 --   background_worker,                         -- host framework
 -- }
@@ -79,6 +80,17 @@ function Downloader:new(o)
     o = o or {}
     setmetatable(o, self)
     return o
+end
+
+function Downloader:_openDownloaded(dl, path)
+    if dl and dl.single_chapter and type(self.open_chapter) == "function" then
+        local chapter = dl.selected and dl.selected[1]
+            or dl.chapters and dl.chapters[1]
+        if chapter then
+            return self.open_chapter(dl.book, chapter, path)
+        end
+    end
+    return self.open_file(path)
 end
 
 function Downloader:recover()
@@ -391,9 +403,13 @@ function Downloader:_applyPrefetchResult(dl, result)
     local record = books[book_id] or books[tonumber(book_id)] or {}
     local function apply(target)
         target.cached_chapters = target.cached_chapters or {}
-        target.cached_chapters[uid] = value.path
+        target.cached_chapters[uid] = value.cache_path or value.path
         target.cache_dir = value.cache_dir or target.cache_dir
         target.reader_url = target.reader_url or value.reader_url
+        if value.cache_path then
+            target.incremental_reader_file = value.path
+            target.incremental_chapter_uids = value.incremental_chapter_uids
+        end
         if value.annotation_document then
             target.annotation_documents = target.annotation_documents or {}
             target.annotation_documents[value.path] = value.annotation_document
@@ -410,7 +426,9 @@ function Downloader:_applyPrefetchResult(dl, result)
         "chapter_uid=", uid, "path=", value.path)
     self:_notifyCompletion(dl, true, value.path)
     self:_finishJob(dl)
-    if dl.open_on_complete then self.open_file(value.path) end
+    if dl.open_on_complete then
+        self:_openDownloaded(dl, value.cache_path or value.path)
+    end
 end
 
 function Downloader:_startPrefetchWorker(dl)
@@ -1106,15 +1124,28 @@ function Downloader:_step(dl)
         end
         self:_setStage(dl, _("Building EPUB..."), dl.total)
         local save_started = time.now()
-        local ok, path, chapter_paths = pcall(function()
+        local ok, path, chapter_paths, chapter_cache_path = pcall(function()
+            if dl.single_chapter or dl.separate_chapters then
+                local catalog, catalog_err = Content.ensure_catalog(
+                    self.client, self.settings, dl.book)
+                if not catalog then
+                    error(catalog_err or "chapter catalog is unavailable", 0)
+                end
+            end
             if dl.single_chapter then
                 local chapter = dl.selected[1]
                 local uid = tostring(chapter.chapterUid or 1)
-                return Content.save_chapter_epub(
+                local cached = Content.save_chapter_epub(
                     self.settings, dl.book, chapter, dl.bodies[uid],
                     (dl.assets_by_uid and dl.assets_by_uid[uid]) or dl.assets,
                     dl.state.css
                 )
+                dl.book.cached_chapters = dl.book.cached_chapters or {}
+                dl.book.cached_chapters[uid] = cached
+                local incremental, aggregate_err = Content.save_incremental_book_epub(
+                    self.settings, dl.book)
+                if not incremental then error(aggregate_err, 0) end
+                return incremental, nil, cached
             end
             if dl.separate_chapters then
                 local paths = {}
@@ -1126,7 +1157,14 @@ function Downloader:_step(dl)
                         dl.state.css
                     )
                 end
-                return paths[tostring(dl.selected[1].chapterUid or 1)], paths
+                dl.book.cached_chapters = dl.book.cached_chapters or {}
+                for uid, cached in pairs(paths) do
+                    dl.book.cached_chapters[uid] = cached
+                end
+                local incremental, aggregate_err = Content.save_incremental_book_epub(
+                    self.settings, dl.book)
+                if not incremental then error(aggregate_err, 0) end
+                return incremental, paths
             end
             local cover_data
             local cover_url = WeRead.normalize_cover_url(dl.book.cover)
@@ -1180,11 +1218,23 @@ function Downloader:_step(dl)
                 if not ok then return end
                 if dl.single_chapter then
                     local chapter = dl.selected[1]
-                    target.cached_chapters[tostring(chapter.chapterUid or 1)] = path
+                    target.cached_chapters[tostring(chapter.chapterUid or 1)] =
+                        chapter_cache_path or path
+                    if chapter_cache_path then
+                        target.incremental_reader_file = path
+                        target.incremental_chapter_uids =
+                            dl.book.incremental_chapter_uids
+                    end
                 elseif dl.separate_chapters then
                     for chapter_index, chapter in ipairs(dl.selected) do
                         local uid = tostring(chapter.chapterUid or chapter_index)
                         target.cached_chapters[uid] = chapter_paths[uid]
+                    end
+                    if dl.book.incremental_reader_file then
+                        target.incremental_reader_file =
+                            dl.book.incremental_reader_file
+                        target.incremental_chapter_uids =
+                            dl.book.incremental_chapter_uids
                     end
                 else
                     local previous_full = target.cached_full_book
@@ -1285,7 +1335,7 @@ function Downloader:_step(dl)
         if dl.open_on_complete then
             self:_notifyCompletion(dl, true, path)
             self:_finishJob(dl)
-            self.open_file(path)
+            self:_openDownloaded(dl, chapter_cache_path or path)
             return
         end
         self:_notifyCompletion(dl, true, path)
@@ -1302,7 +1352,7 @@ function Downloader:_step(dl)
             text = completion_text,
             ok_text = _("Read now"),
             ok_callback = self.safe_callback(_("Read now"), function()
-                self.open_file(path)
+                self:_openDownloaded(dl, chapter_cache_path or path)
             end),
             cancel_text = _("Close"),
         })

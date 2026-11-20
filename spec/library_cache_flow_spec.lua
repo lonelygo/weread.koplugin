@@ -43,6 +43,23 @@ package.preload["weread.lib.content"] = function()
             return true
         end,
         load_catalog_cache = function() return nil end,
+        incremental_reader_path = function() return "/cache/offline.epub" end,
+        activate_chapter_epub = function(_settings, book, chapter)
+            book.incremental_reader_file = "/cache/offline.epub"
+            book.active_chapter_uid = tostring(chapter.chapterUid)
+            local bundled = {}
+            for _, item in ipairs(book.chapters or {}) do
+                if book.cached_chapters
+                    and existing_paths[book.cached_chapters[tostring(item.chapterUid)]] then
+                    bundled[#bundled + 1] = { chapterUid = item.chapterUid }
+                end
+            end
+            book.annotation_documents = book.annotation_documents or {}
+            book.annotation_documents[book.incremental_reader_file] = {
+                chapters = bundled, clean = true,
+            }
+            return book.incremental_reader_file
+        end,
     }
 end
 
@@ -99,6 +116,8 @@ local host = {
     showBusy = function() end,
     closeBusy = function() end,
     client = {},
+    ui = {},
+    closeWeReadUI = function() end,
 }
 for key, value in pairs(Library) do
     if host[key] == nil then host[key] = value end
@@ -148,13 +167,38 @@ local partial = {
 existing_paths["/cache/2.epub"] = true
 existing_paths["/cache/4.epub"] = true
 host:openBookForReading(partial)
-expect(opened_path == "/cache/2.epub",
+expect(opened_path == "/cache/offline.epub"
+        and partial.active_chapter_uid == "2",
     "equal-distance cached chapter did not prefer the preceding chapter")
 
 partial.chapter_uid = 4
 host:openBookForReading(partial)
-expect(opened_path == "/cache/4.epub",
+expect(opened_path == "/cache/offline.epub"
+        and partial.active_chapter_uid == "4",
     "exact cached progress chapter was not selected")
+
+local jumps = {}
+host.ui.document = {
+    file = "/cache/offline.epub",
+    getToc = function()
+        return { { xpointer = "chapter-2" }, { xpointer = "chapter-4" } }
+    end,
+}
+host.ui.rolling = {
+    onGotoXPointer = function(_self, xpointer) jumps[#jumps + 1] = xpointer end,
+}
+host.ui.reloadDocument = function(self, after_close, _seamless, after_open)
+    after_close()
+    after_open(self)
+end
+expect(host:openCachedChapter(partial, partial.chapters[2], "/cache/2.epub")
+        and host:openCachedChapter(partial, partial.chapters[4], "/cache/4.epub")
+        and host:openCachedChapter(partial, partial.chapters[2], "/cache/2.epub"),
+    "cached aggregate did not support 2 -> 4 -> 2 reloads")
+expect(table.concat(jumps, ",") == "chapter-2,chapter-4,chapter-2",
+    "aggregate reload did not restore the requested chapter anchor")
+expect(partial.incremental_reader_file == "/cache/offline.epub",
+    "aggregate reload changed the stable reader path")
 
 partial.full_path = "/cache/full.epub"
 existing_paths[partial.full_path] = true

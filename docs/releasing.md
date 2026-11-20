@@ -1,5 +1,7 @@
 # Releasing / 发布
 
+kevin 维护版从本仓库的 [GitHub Releases](https://github.com/lonelygo/weread.koplugin/releases) 发布。上游 `finlater` 的版本仍需手动切换一次，之后设备会检查 `lonelygo/weread.koplugin` 的稳定版。安装 ZIP 与 SHA-256 校验文件均由发布工作流生成。
+
 The release package contains only files needed by KOReader:
 
 - `_meta.lua` and `main.lua`;

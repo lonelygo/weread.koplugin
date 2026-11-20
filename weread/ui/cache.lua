@@ -129,6 +129,8 @@ function M:moveBooksToNewDir(movable, new_dir)
                     book.cached_file = self:remapCachedPath(book.cached_file, m.dst)
                     book.cached_full_book = self:remapCachedPath(
                         book.cached_full_book, m.dst)
+                    book.incremental_reader_file = self:remapCachedPath(
+                        book.incremental_reader_file, m.dst)
                     local new_cached_full_book = book.cached_full_book or book.cached_file
                     if old_cached_full_book and new_cached_full_book ~= old_cached_full_book then
                         table.insert(collection_updates, {
@@ -140,6 +142,13 @@ function M:moveBooksToNewDir(movable, new_dir)
                         for uid, path in pairs(book.cached_chapters) do
                             book.cached_chapters[uid] = self:remapCachedPath(path, m.dst)
                         end
+                    end
+                    if type(book.annotation_documents) == "table" then
+                        local remapped = {}
+                        for path, descriptor in pairs(book.annotation_documents) do
+                            remapped[self:remapCachedPath(path, m.dst)] = descriptor
+                        end
+                        book.annotation_documents = remapped
                     end
                 end
                 moved = moved + 1
@@ -689,6 +698,7 @@ local function annotation_document_paths(book)
     if type(book) ~= "table" then return paths end
     add(book.cached_file)
     add(book.cached_full_book)
+    add(book.incremental_reader_file)
     for _, path in pairs(book.cached_chapters or {}) do add(path) end
     for path in pairs(book.annotation_documents or {}) do add(path) end
     return paths

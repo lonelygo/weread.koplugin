@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run with python3 scripts/test_mock_weread.py; no KOReader or network account."""
+import base64
 import json
 import threading
 import time
@@ -78,6 +79,36 @@ class MockTests(unittest.TestCase):
         self.request("/web/book/read", dict(b=weread_e(BOOK_ID), c=weread_e(2), ci=2, co=120, pr=25))
         _, progress = self.gateway("/book/getprogress", bookId=BOOK_ID)
         self.assertEqual(progress["book"]["chapterOffset"], 120)
+
+    def test_private_annotation_write_contract_and_delete(self):
+        quote = "这是第2章的第1段"
+        start = chapter_html(2).index(quote)
+        base = dict(bookId=BOOK_ID, chapterUid=2, chapterIdx=2, bookVersion=17,
+                    range=f"{start}-{start + len(quote)}")
+        bookmark = dict(base, markText=base64.b64encode(quote.encode()).decode(), type=1)
+        self.assertEqual(self.request("/web/book/addBookmark", dict(bookmark, range="0-4"))[0], 400)
+        self.assertEqual(self.request("/web/book/addBookmark", dict(bookmark, bookVersion=16))[0], 400)
+        self.assertEqual(self.request("/web/book/addBookmark", dict(bookmark, markText="%%%"))[0], 400)
+        status, added = self.request("/web/book/addBookmark", bookmark)
+        self.assertEqual(status, 200)
+        # The fixture deliberately does not deduplicate creates: integration
+        # tests must prove the product avoids duplicate network mutations.
+        _, duplicate = self.request("/web/book/addBookmark", bookmark)
+        self.assertNotEqual(added["bookmarkId"], duplicate["bookmarkId"])
+        self.request("/web/book/removeBookmark", dict(bookmarkId=duplicate["bookmarkId"]))
+        thought = dict(base, abstract=quote, content="合成私密笔记", isPrivate=1, type=1)
+        self.assertEqual(self.request("/web/review/add", dict(thought, isPrivate=0))[0], 400)
+        status, review = self.request("/web/review/add", thought)
+        self.assertEqual(status, 200)
+        state = self.request("/__state")[1]
+        self.assertEqual(state["bookmarks"][added["bookmarkId"]]["decoded_mark_text"], quote)
+        self.assertEqual(state["private_reviews"][review["reviewId"]]["content"], thought["content"])
+        self.assertEqual(self.request("/web/book/removeBookmark", dict(bookmarkId=added["bookmarkId"]))[0], 200)
+        self.assertEqual(self.request("/web/review/delete", dict(reviewId=review["reviewId"]))[0], 200)
+        state = self.request("/__state")[1]
+        self.assertNotIn(added["bookmarkId"], state["bookmarks"])
+        self.assertNotIn(review["reviewId"], state["private_reviews"])
+        self.assertEqual(self.request("/web/review/delete", dict(reviewId="unknown"))[0], 400)
 
     def test_fault_once_delay_and_recovery(self):
         self.request("/__control", dict(match="/book/info", times=1, status=503, delay=0.02))

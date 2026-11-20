@@ -51,6 +51,34 @@ function M:_removeReaderHighlightTapGuard()
     self._reader_highlight_original_on_tap = nil
 end
 
+function M:_installNativeAnnotationGuard()
+    local annotation = self.ui and self.ui.annotation
+    if not annotation or type(annotation.onAnnotationsModified) ~= "function" then
+        return false
+    end
+    if self._native_annotation_guard_target == annotation then return true end
+    self:_removeNativeAnnotationGuard()
+    local original = annotation.onAnnotationsModified
+    self._native_annotation_guard_target = annotation
+    self._native_annotation_original = original
+    annotation.onAnnotationsModified = function(annotation_self, items)
+        local results = { original(annotation_self, items) }
+        self:_captureLocalAnnotationSnapshot(items)
+        return unpack(results)
+    end
+    return true
+end
+
+function M:_removeNativeAnnotationGuard()
+    local annotation = self._native_annotation_guard_target
+    local original = self._native_annotation_original
+    if annotation and original and annotation.onAnnotationsModified ~= original then
+        annotation.onAnnotationsModified = original
+    end
+    self._native_annotation_guard_target = nil
+    self._native_annotation_original = nil
+end
+
 function M:onShowWeRead()
     self:showAccountStatus()
 end
@@ -83,6 +111,19 @@ function M:handleEndOfBook(status_self)
     local current_idx, current_ch, is_full_book = self:getChapterInfoFromFile(book, file)
     local next_ch = (not is_full_book) and current_idx and book.chapters[current_idx + 1]
 
+    -- Automatic prefetch means the user's forward page turn is enough to keep
+    -- reading. A ready cache is activated behind the stable reader path; an
+    -- in-flight prefetch is promoted and opens as soon as its worker finishes.
+    local next_uid = next_ch and tostring(
+        next_ch.chapterUid or next_ch.chapterId or "") or nil
+    local next_cached = next_uid and book.cached_chapters
+        and book.cached_chapters[next_uid]
+    if next_ch and (file_exists(next_cached)
+        or self.downloader:isPrefetching(book, next_ch)) then
+        self:openChapter(book, next_ch)
+        return true
+    end
+
     if action == "next_file" then
         if next_ch then
             self:openChapter(book, next_ch)
@@ -109,6 +150,7 @@ function M:onReaderReady()
     local opened = perf("reader_ready_begin", nil, "session=", self._reader_session_gen)
     self:_teardownThoughtInterception()
     self:_installReaderHighlightTapGuard()
+    self:_installNativeAnnotationGuard()
 
     local weread_book_id = self:detectWeReadBook()
     -- Cache it so the per-tap handler (_onThoughtTap) does not have to re-scan
@@ -153,7 +195,23 @@ function M:onReaderReady()
     if self.onUnifiedAnnotationsReady then self:onUnifiedAnnotationsReady() end
 
     local annotations_ready = perf("annotations_ready", opened)
+    if weread_book_id and self._pending_incremental_chapter_uid then
+        local pending_uid = self._pending_incremental_chapter_uid
+        local pending_book = self.settings:get("books", {})[tostring(weread_book_id)]
+        if pending_book and self:_gotoIncrementalChapter(
+            pending_book, pending_uid, self.ui) then
+            self._pending_incremental_chapter_uid = nil
+        end
+    end
     self.progress_sync:on_reader_ready()
+    if weread_book_id then
+        local baseline_session = self._reader_session_gen
+        UIManager:scheduleIn(0.3, function()
+            if baseline_session == self._reader_session_gen then
+                self:_captureLocalAnnotationSnapshot(nil)
+            end
+        end)
+    end
     local prefetch_session_gen = self._reader_session_gen
     UIManager:scheduleIn(0.2, function()
         if prefetch_session_gen ~= self._reader_session_gen then return end
@@ -173,6 +231,64 @@ function M:onPageUpdate()
     if self._refreshAnnotationOverlay then self:_refreshAnnotationOverlay() end
 end
 
+function M:_offlineAnnotationCoordinator()
+    if self.offline_annotations then return self.offline_annotations end
+    if not self.library_db or not self.client or not self.prefetch_worker then
+        return nil
+    end
+    local ok_position, UploadPosition = pcall(
+        require, "weread.lib.annotation_upload_position")
+    if not ok_position then return nil end
+    local OfflineAnnotations = require("weread.lib.offline_annotations")
+    self.offline_annotations = OfflineAnnotations:new {
+        library_db = self.library_db,
+        settings = self.settings,
+        client = self.client,
+        worker = self.prefetch_worker,
+        scheduler = UIManager,
+        resolver = UploadPosition,
+        is_online = function() return self:isNetworkConnected() end,
+        get_document = function()
+            return self.ui and self.ui.document
+        end,
+        get_book = function(book_id)
+            return self.settings:get("books", {})[tostring(book_id)]
+        end,
+        get_store = function()
+            return self._annotationStore and self:_annotationStore() or nil
+        end,
+    }
+    return self.offline_annotations
+end
+
+function M:_captureLocalAnnotationSnapshot(modified_items)
+    local book_id = self._current_weread_book_id or self:detectWeReadBook()
+    local document = self.ui and self.ui.document
+    local path = document and document.file
+    local annotations = self.ui and self.ui.annotation
+        and self.ui.annotation.annotations
+    if not book_id or not path or type(annotations) ~= "table" then
+        return false
+    end
+    local coordinator = self:_offlineAnnotationCoordinator()
+    if coordinator then
+        return coordinator:capture(
+            tostring(book_id), tostring(path), annotations, modified_items)
+    end
+    if self.library_db
+        and type(self.library_db.putLocalAnnotationSnapshot) == "function" then
+        return self.library_db:putLocalAnnotationSnapshot(
+            tostring(book_id), tostring(path), annotations)
+    end
+    return false
+end
+
+-- KOReader emits this event for highlight creation, note edits and removals.
+-- An empty snapshot records the removal of the last managed annotation too.
+function M:onAnnotationsModified(items)
+    self:_captureLocalAnnotationSnapshot(items)
+end
+
 function M:onPosUpdate()
     if self._refreshAnnotationOverlay then self:_refreshAnnotationOverlay() end
 end
@@ -182,6 +298,7 @@ function M:onCloseDocument()
     -- The network upload is scheduled; stopping ReadReport below also frees any
     -- in-flight report slot before that scheduled upload begins.
     self.progress_sync:on_close_document()
+    self:_captureLocalAnnotationSnapshot()
     self._reader_session_gen = (self._reader_session_gen or 0) + 1
     self.downloader:cancelPrefetch("document_closed")
     if self._cancelUnifiedAnnotationSync then self:_cancelUnifiedAnnotationSync() end
@@ -191,6 +308,7 @@ function M:onCloseDocument()
     self:_teardownThoughtInterception()
     self:_teardownXPointerOverlayPrototype()
     self:_removeReaderHighlightTapGuard()
+    self:_removeNativeAnnotationGuard()
 
     if self._orig_onEndOfBook and self.ui.status then
         self.ui.status.onEndOfBook = self._orig_onEndOfBook
@@ -198,6 +316,20 @@ function M:onCloseDocument()
     end
 
     self.read_report:on_close_document()
+end
+
+function M:onNetworkConnected()
+    self:_captureLocalAnnotationSnapshot(nil)
+    if self.progress_sync and self.progress_sync.on_network_connected then
+        self.progress_sync:on_network_connected()
+    end
+    if self.read_report and self.read_report.on_network_connected then
+        self.read_report:on_network_connected()
+    end
+    local offline_annotations = self:_offlineAnnotationCoordinator()
+    if offline_annotations then
+        offline_annotations:on_network_connected()
+    end
 end
 
 function M:showPrefetchNotice(text, timeout)
@@ -421,6 +553,7 @@ function M:getFullBookCachePath(book)
     end
     local legacy = book.cached_file
     if type(legacy) ~= "string" or legacy == "" then return nil end
+    if legacy == book.incremental_reader_file then return nil end
     local mapped_count = 0
     for _uid, path in pairs(book.cached_chapters or {}) do
         if path == legacy then mapped_count = mapped_count + 1 end
@@ -442,6 +575,45 @@ end
 function M:getChapterInfoFromFile(book, file_path)
     if not book or not file_path or not book.chapters then
         return nil, nil, false
+    end
+
+    if file_path == book.incremental_reader_file then
+        local descriptor = book.annotation_documents
+            and book.annotation_documents[file_path]
+        local document = self.ui and self.ui.document
+        local page = document and document.getCurrentPage
+            and document:getCurrentPage() or nil
+        local toc_index = self.ui and self.ui.toc and page
+            and self.ui.toc.getTocIndexByPage
+            and self.ui.toc:getTocIndexByPage(page) or nil
+        local item = toc_index and descriptor and descriptor.chapters
+            and descriptor.chapters[toc_index] or nil
+        local active_uid = item and (item.chapterUid or item.chapterId)
+            or book.active_chapter_uid
+        for index, chapter in ipairs(book.chapters) do
+            if tostring(chapter.chapterUid or chapter.chapterId)
+                == tostring(active_uid) then
+                local toc = document and document.getToc
+                    and document:getToc() or nil
+                local start_page = toc_index and toc and toc[toc_index]
+                    and tonumber(toc[toc_index].page) or nil
+                local stop_page = toc_index and toc and toc[toc_index + 1]
+                    and tonumber(toc[toc_index + 1].page) or nil
+                if not stop_page and document and document.getPageCount then
+                    stop_page = tonumber(document:getPageCount()) and
+                        tonumber(document:getPageCount()) + 1 or nil
+                end
+                local chapter_fraction
+                if page and start_page and stop_page and stop_page > start_page then
+                    chapter_fraction = math.max(0, math.min(1,
+                        (page - start_page) / (stop_page - start_page)))
+                end
+                return index, chapter, false, {
+                    incremental = true,
+                    chapter_fraction = chapter_fraction,
+                }
+            end
+        end
     end
 
     local mapped_count = 0

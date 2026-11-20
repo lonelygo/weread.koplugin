@@ -12,6 +12,7 @@ local WeRead = require("weread.lib.protocol")
 local PluginUtil = require("weread.lib.plugin_util")
 local _ = PluginUtil.tr
 local T = PluginUtil.T
+local project_url = "https://github.com/lonelygo/weread.koplugin"
 
 local icons_dir = debug.getinfo(1, "S").source:match("^@(.*/)") .. "../../icons/"
 
@@ -96,9 +97,10 @@ end
 function M:getMainMenuItems()
     local items = {
         {
-            text = _("Upgrade to a fuller WeRead experience?"),
-            keep_menu_open = true,
-            callback = function() self:showClosedSourceInfo() end,
+            text = _("Bookshelf"),
+            callback = self:safeCallback(_("Bookshelf"), function()
+                self:showBookshelf()
+            end),
         },
         {
             text_func = function()
@@ -124,12 +126,6 @@ function M:getMainMenuItems()
             end),
         },
         {
-            text = _("Bookshelf"),
-            callback = self:safeCallback(_("Bookshelf"), function()
-                self:showBookshelf()
-            end),
-        },
-        {
             text = _("WeRead favorites"),
             callback = self:safeCallback(_("WeRead favorites"), function()
                 self:showWereadCollection()
@@ -141,6 +137,10 @@ function M:getMainMenuItems()
             callback = self:safeCallback(_("Search"), function()
                 self:showSearch()
             end),
+        },
+        {
+            text = _("Offline sync"),
+            sub_item_table_func = function() return self:getOfflineSyncMenuItems() end,
         },
         {
             text = _("Reading time report"),
@@ -220,6 +220,55 @@ function M:getMainMenuItems()
     end
 
     return items
+end
+
+function M:getOfflineSyncMenuItems()
+    return {
+        {
+            text = _("Sync status"),
+            keep_menu_open = true,
+            callback = self:safeCallback(_("Sync status"), function()
+                local time = self.library_db:readTimeStatus()
+                local states = self.library_db:localAnnotationStatus()
+                local unknown = (states.unknown or 0) + (states.delete_unknown or 0)
+                    + (states.replace_delete_unknown or 0)
+                local pending = (states.local_only or 0) + (states.update_pending or 0)
+                    + (states.delete_pending or 0) + (states.replace_delete_pending or 0)
+                    + (states.inflight or 0)
+                local lines = {
+                    T(_("Reading time pending: %1 s"), time.pending),
+                    T(_("Highlights and notes pending: %1"), pending),
+                }
+                local account = self.settings:get("account", {})
+                for _, book in pairs(self.settings:get("books", {})) do
+                    if account.user_vid and tostring(book.pending_upload_account) == tostring(account.user_vid)
+                        and book.pending_upload_blocked then
+                        lines[#lines + 1] = T(_("Progress conflict: %1. Open the book and select Sync progress now."),
+                            book.title or book.book_id)
+                    end
+                end
+                if time.unknown > 0 or unknown > 0 then
+                    lines[#lines + 1] = T(_("Unconfirmed by WeRead: %1 s, %2 annotations"), time.unknown, unknown)
+                    lines[#lines + 1] = _("Check these records in WeRead.")
+                end
+                self:showInfo(table.concat(lines, "\n"))
+            end),
+        },
+        {
+            text = _("Sync new highlights and private notes"),
+            keep_menu_open = true,
+            check_callback_updates_menu = true,
+            checked_func = function() return self.settings:get("sync", {}).upload_annotations ~= false end,
+            callback = function(menu)
+                local sync = self.settings:get("sync", {})
+                sync.upload_annotations = sync.upload_annotations == false
+                self.settings:set("sync", sync)
+                self.settings:flush()
+                if sync.upload_annotations and self:isNetworkConnected() then self:onNetworkConnected() end
+                if menu then menu:updateItems() end
+            end,
+        },
+    }
 end
 
 function M:getSettingsMenuItems()
@@ -828,7 +877,7 @@ end
 
 function M:showAbout()
     UIManager:show(InfoMessage:new{
-        text = T(_("WeRead Plugin v%1\n\nDisclaimer: This project is for personal learning and technical research only, not for commercial use. All consequences arising from the use of this project (including but not limited to account bans, data loss, etc.) are borne by the user. The project author assumes no responsibility. Please comply with WeRead's user agreement and applicable laws and regulations.\n\nhttps://github.com/finlater/weread.koplugin"), self.version),
+        text = T(_("WeRead Plugin v%1\n\nDisclaimer: This project is for personal learning and technical research only, not for commercial use. All consequences arising from the use of this project (including but not limited to account bans, data loss, etc.) are borne by the user. The project author assumes no responsibility. Please comply with WeRead's user agreement and applicable laws and regulations.\n\n%2"), self.version, project_url),
     })
 end
 
@@ -907,11 +956,6 @@ end
 function M:getAboutMenuItems()
     local items = {
         {
-            text = _("Upgrade to a fuller WeRead experience?"),
-            keep_menu_open = true,
-            callback = function() self:showClosedSourceInfo() end,
-        },
-        {
             text = T(_("Version %1"), self.version),
             keep_menu_open = true,
             callback = function()
@@ -919,13 +963,18 @@ function M:getAboutMenuItems()
             end,
         },
         {
-            text = T(_("Author: %1"), "finlater"),
+            text = T(_("Fork maintainer: %1"), "kevin"),
             keep_menu_open = true,
             callback = function()
                 UIManager:show(InfoMessage:new{
-                    text = "finlater\n\nhttps://github.com/finlater",
+                    text = T(_("Fork maintainer: %1\n%2\n\nUpstream author: %3"), "kevin", project_url, "finlater"),
                 })
             end,
+        },
+        {
+            text = _("Upstream closed-source edition"),
+            keep_menu_open = true,
+            callback = function() self:showClosedSourceInfo() end,
         },
     }
     for _, item in ipairs(self:getUpdateMenuItems()) do

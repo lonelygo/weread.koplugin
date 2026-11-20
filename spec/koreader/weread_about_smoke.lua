@@ -93,8 +93,14 @@ for _, size in ipairs({ { 600, 800 }, { 800, 600 }, { 1072, 1448 } }) do
         local menu = TouchMenu:new{ width = width, tab_item_table = { items } }
         UIManager:show(menu)
         draw(mode .. "-menu-" .. width .. "x" .. height)
-        assert(items[1].text == "升级到更完整的微信读书？")
-        tap(menu.item_group[2])
+        if mode == "about" then
+            assert(items[2].text:find("kevin", 1, true))
+            assert(items[3].text == "上游作者的闭源版")
+            items[3].callback()
+        else
+            assert(items[1].text == "书架")
+            host:showClosedSourceInfo()
+        end
         local introduction = top()
         assert(introduction.title == "weread闭源版(全平台搜 finlater)")
         tap(findButton(introduction.button_table, introduction.buttons_table[1][1].text))

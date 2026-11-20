@@ -190,9 +190,10 @@ jobs:
         run: |
           release_preface="$(cat dist/release-preface.md)"
           gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             "$ARCHIVE" \
             "$ARCHIVE.sha256" \
             --target "$TARGET_SHA" \
-            --title "Version $VERSION" \
+            --title "WeRead v$VERSION · kevin" \
             --notes "$release_preface" \
             --generate-notes

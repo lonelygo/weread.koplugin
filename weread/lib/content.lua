@@ -130,6 +130,27 @@ function Content.load_catalog_cache(client, settings, book)
     return chapters
 end
 
+function Content.ensure_catalog(client, settings, book)
+    if type(book.chapters) == "table" and #book.chapters > 0 then
+        return book.chapters
+    end
+    local chapters = Content.load_catalog_cache(client, settings, book)
+    if type(chapters) == "table" and #chapters > 0 then
+        return chapters
+    end
+    chapters = Content.fetch_catalog(client, book)
+    if type(chapters) ~= "table" or #chapters == 0 then
+        return nil, "chapter catalog is unavailable"
+    end
+    local saved, save_err = Content.save_catalog_cache(
+        client, settings, book, chapters)
+    if not saved then
+        logger.warn("save refreshed chapter catalog failed:", tostring(save_err))
+    end
+    book.chapters = chapters
+    return chapters
+end
+
 local function filename_safe(value)
     value = tostring(value or ""):gsub("[%z%c/\\:%*%?\"<>|]", "_")
     value = value:gsub("^%s+", ""):gsub("%s+$", "")
@@ -244,7 +265,8 @@ local function remove_tree(path)
     if type(path) ~= "string"
         or (not path:match("/%.weread%-download%-%d+%-%d+$")
             and not path:match("/%.weread%-download%-resume%-full$")
-            and not path:match("/%.weread%-download%-resume%-full/rendered%-text$")) then
+            and not path:match("/%.weread%-download%-resume%-full/rendered%-text$")
+            and not path:match("/%.weread%-incremental%-build%-%d+%-%d+%-%d+$")) then
         return nil, "refusing to remove an invalid download workspace"
     end
     local ok, ffiutil = pcall(require, "ffi/util")
@@ -627,17 +649,22 @@ local function write_epub(path, entries)
 end
 
 local function append_asset_entries(entries, assets)
-    local disk_dir
+    local disk_groups = {}
     for _, asset in ipairs(assets or {}) do
         if asset.path then
             local parent = asset.path:match("^(.*)/[^/]+$")
             if not parent then
                 error("invalid file-backed asset path: " .. tostring(asset.path))
             end
-            if disk_dir and disk_dir ~= parent then
-                error("file-backed EPUB assets must share one directory")
+            local href_parent = tostring(asset.href or ""):match("^(.*)/[^/]+$")
+            if not href_parent then
+                error("invalid file-backed EPUB href: " .. tostring(asset.href))
             end
-            disk_dir = parent
+            local group = disk_groups[href_parent]
+            if group and group ~= parent then
+                error("file-backed EPUB assets in one href directory must share one directory")
+            end
+            disk_groups[href_parent] = parent
         else
             table.insert(entries, {
                 name = "OEBPS/" .. asset.href,
@@ -646,14 +673,16 @@ local function append_asset_entries(entries, assets)
             })
         end
     end
-    if disk_dir then
+    local roots = {}
+    for href_parent in pairs(disk_groups) do roots[#roots + 1] = href_parent end
+    table.sort(roots)
+    for _, href_parent in ipairs(roots) do
         -- KOReader's libarchive wrapper is reliable for a directory tree, but
         -- some Kindle builds fail when addPath is given an individual file.
-        -- All disk-backed images are staged together, so stream the directory
-        -- into the EPUB with one reader lifecycle.
+        -- Stream each staged href directory with one reader lifecycle.
         table.insert(entries, {
-            name = "OEBPS/images",
-            path = disk_dir,
+            name = "OEBPS/" .. href_parent,
+            path = disk_groups[href_parent],
             recursive = true,
         })
     end
@@ -835,7 +864,8 @@ function Content.normalize_chapters(payload, book_id)
     end
     for record_index, record in ipairs(records) do
         if tostring(record.bookId or "") == tostring(book_id) then
-            return record.updated or record.chapterInfos or record.chapters or {}
+            return record.updated or record.chapterInfos or record.chapters or {},
+                tonumber(record.bookVersion or record.version)
         end
     end
     return {}
@@ -938,7 +968,11 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     os.execute("mkdir -p " .. string.format("%q", dir))
     book.cache_dir = dir
     local book_title = book.title or "WeRead"
-    local path = dir .. "/" .. filename_safe(book_title .. " - " .. (chapter.title or tostring(chapter.chapterUid or "chapter"))) .. ".epub"
+    local chapter_cache_dir = dir .. "/.weread-chapters"
+    make_path(chapter_cache_dir)
+    local uid = basename_safe(chapter.chapterUid or chapter.chapterId or "chapter")
+    local path = chapter_cache_dir .. "/chapter-" .. uid .. ".epub"
+    local chapter_href = "text/chapter-" .. uid .. ".xhtml"
     local title = chapter.title or book.title or "WeRead"
     local author = book.author or "WeRead"
     local manifest_assets = {}
@@ -970,7 +1004,7 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
 <manifest>
 <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
 <item id="style" href="style.css" media-type="text/css"/>
-<item id="chapter" href="text/chapter.xhtml" media-type="application/xhtml+xml"/>
+<item id="chapter" href="]] .. xml_escape(chapter_href) .. [[" media-type="application/xhtml+xml"/>
 ]] .. table.concat(manifest_assets, "\n") .. [[
 </manifest>
 <spine>
@@ -982,7 +1016,7 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
 <head><title>Navigation</title></head>
 <body>
 <nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops">
-<ol><li><a href="text/chapter.xhtml">]] .. xml_escape(title) .. [[</a></li></ol>
+<ol><li><a href="]] .. xml_escape(chapter_href) .. [[">]] .. xml_escape(title) .. [[</a></li></ol>
 </nav>
 </body>
 </html>]]
@@ -993,7 +1027,7 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
         { name = "OEBPS/content.opf", data = opf },
         { name = "OEBPS/nav.xhtml", data = nav },
         { name = "OEBPS/style.css", data = css },
-        { name = "OEBPS/text/chapter.xhtml", data = chapter_xhtml },
+        { name = "OEBPS/" .. chapter_href, data = chapter_xhtml },
     }
     append_asset_entries(entries, assets)
     write_epub(path, entries)
@@ -1001,13 +1035,382 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     return path
 end
 
-function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix, assets, css, cover_data)
+function Content.incremental_reader_path(settings, book)
+    local book_id = book.book_id or book.bookId
+    local dir = Content.book_resolved_dir(settings, book_id, book)
+    make_path(dir)
+    book.cache_dir = dir
+    return dir .. "/" .. filename_safe((book.title or "WeRead")
+        .. " - offline") .. ".epub"
+end
+
+local function read_chapter_package(path, uid, workspace)
+    local Archiver = require("ffi/archiver")
+    local archive = Archiver.Reader:new()
+    if not archive:open(path) then
+        return nil, archive.err or "could not open cached chapter"
+    end
+    local body, css
+    local assets = {}
+    local prefix = basename_safe(uid) .. "-"
+    local ok, err = xpcall(function()
+        for entry in archive:iterate() do
+            local name = tostring(entry.path or "")
+            if name == "OEBPS/style.css" then
+                css = archive:extractToMemory(name)
+            elseif name:match("^OEBPS/text/[^/]+%.xhtml$") then
+                body = archive:extractToMemory(name)
+            elseif name:match("^OEBPS/images/[^/]+$") then
+                local original = basename(name)
+                local renamed = prefix .. original
+                local output_path = workspace.image_dir .. "/" .. renamed
+                local extracted, extract_err = archive:extractToPath(name, output_path)
+                if not extracted then
+                    error(extract_err or archive.err or "could not extract cached image")
+                end
+                local _, media_type = media_type_for_file(output_path)
+                assets[#assets + 1] = {
+                    href = "images/" .. renamed,
+                    media_type = media_type,
+                    path = output_path,
+                }
+            end
+        end
+    end, debug.traceback)
+    archive:close()
+    if not ok then return nil, err end
+    if not body then return nil, "cached chapter text is missing" end
+    body = body:gsub("%.%./images/([^\"'%?#]+)", function(name)
+        return "../images/" .. prefix .. basename(name)
+    end)
+    return { body = body, css = css, assets = assets }
+end
+
+local function open_incremental_workspace(settings, book)
+    local book_id = book.book_id or book.bookId
+    local book_dir = Content.book_resolved_dir(settings, book_id, book)
+    make_path(book_dir)
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs or type(lfs.mkdir) ~= "function" then
+        ok_lfs, lfs = pcall(require, "lfs")
+    end
+    if not ok_lfs or type(lfs.mkdir) ~= "function" then
+        error("incremental workspace locking is unavailable")
+    end
+    local pid = 0
+    pcall(function()
+        local ffi = require("ffi")
+        require("ffi/posix_h")
+        pid = tonumber(ffi.C.getpid()) or 0
+    end)
+    local path
+    for _attempt = 1, 10 do
+        local candidate = string.format(
+            "%s/.weread-incremental-build-%d-%d-%d",
+            book_dir, os.time(), pid, math.random(100000, 999999))
+        if lfs.mkdir(candidate) then
+            path = candidate
+            break
+        end
+    end
+    if not path then error("could not reserve incremental workspace") end
+    local workspace = {
+        path = path,
+        text_dir = path .. "/text",
+        image_dir = path .. "/images",
+        style_dir = path .. "/styles",
+    }
+    make_path(workspace.text_dir)
+    make_path(workspace.image_dir)
+    make_path(workspace.style_dir)
+    return workspace
+end
+
+local function incremental_manifest_path(settings, book)
+    local book_id = book.book_id or book.bookId
+    return Content.book_resolved_dir(settings, book_id, book)
+        .. "/incremental-spine.meta"
+end
+
+local function read_incremental_manifest(settings, book)
+    local file = io.open(incremental_manifest_path(settings, book), "rb")
+    if not file then return { generation = "", uids = {} } end
+    local generation = (file:read("*l") or ""):match("^generation=(.*)$") or ""
+    local uids = {}
+    for line in file:lines() do
+        local length, uid = line:match("^uid=(%d+):(.*)$")
+        if length and #uid == tonumber(length) then uids[#uids + 1] = uid end
+    end
+    file:close()
+    return { generation = generation, uids = uids }
+end
+
+local function write_incremental_manifest(settings, book, generation, uids)
+    local lines = { "generation=" .. tostring(generation or "") }
+    for _, uid in ipairs(uids or {}) do
+        uid = tostring(uid)
+        lines[#lines + 1] = "uid=" .. tostring(#uid) .. ":" .. uid
+    end
+    return atomic_write(incremental_manifest_path(settings, book),
+        table.concat(lines, "\n") .. "\n")
+end
+
+local function path_exists(path)
+    local file = type(path) == "string" and io.open(path, "rb") or nil
+    if not file then return false end
+    file:close()
+    return true
+end
+
+local function valid_published_epub(path)
+    local file = type(path) == "string" and io.open(path, "rb") or nil
+    if not file then return false end
+    local signature = file:read(2)
+    file:close()
+    return signature == "PK"
+end
+
+function Content.incremental_contains_chapter(settings, book, uid)
+    local path = book.incremental_reader_file
+        or Content.incremental_reader_path(settings, book)
+    if not valid_published_epub(path) then return false end
+    local manifest = read_incremental_manifest(settings, book)
+    local included = #manifest.uids > 0
+        and manifest.uids or book.incremental_chapter_uids or {}
+    for _, current in ipairs(included) do
+        if tostring(current) == tostring(uid) then
+            return true, path, included
+        end
+    end
+    return false, path, included
+end
+
+local function incremental_lock_path(settings, book)
+    local book_id = book.book_id or book.bookId
+    return Content.book_resolved_dir(settings, book_id, book)
+        .. "/.weread-incremental-publish-lock"
+end
+
+local function acquire_incremental_lock(settings, book)
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs or type(lfs.lock) ~= "function" then
+        ok_lfs, lfs = pcall(require, "lfs")
+    end
+    if not ok_lfs or type(lfs.lock) ~= "function" then
+        return nil, "incremental publish lock is unavailable"
+    end
+    local path = incremental_lock_path(settings, book)
+    local file, open_err = io.open(path, "a+b")
+    if not file then return nil, open_err or "could not open incremental lock" end
+    local locked, lock_err = lfs.lock(file, "w")
+    if not locked then
+        file:close()
+        return nil, lock_err or "incremental publish is busy"
+    end
+    return { file = file, lfs = lfs }
+end
+
+local function release_incremental_lock(lock)
+    if not lock then return end
+    pcall(lock.lfs.unlock, lock.file)
+    pcall(lock.file.close, lock.file)
+end
+
+function Content.save_incremental_book_epub(settings, book)
+    local catalog = type(book.chapters) == "table" and book.chapters or {}
+    local selected, assets = {}, {}
+    local included = {}
+    local linear_by_uid = {}
+    local base_manifest = read_incremental_manifest(settings, book)
+    if #base_manifest.uids == 0
+        and path_exists(book.incremental_reader_file)
+        and type(book.incremental_chapter_uids) == "table" then
+        for _, uid in ipairs(book.incremental_chapter_uids) do
+            base_manifest.uids[#base_manifest.uids + 1] = tostring(uid)
+        end
+    end
+    if #base_manifest.uids > 0 then
+        book.incremental_chapter_uids = base_manifest.uids
+    end
+    local workspace = open_incremental_workspace(settings, book)
+    local catalog_by_uid, catalog_index_by_uid = {}, {}
+    for index, chapter in ipairs(catalog) do
+        local uid = tostring(chapter.chapterUid or chapter.chapterId or index)
+        catalog_by_uid[uid] = chapter
+        catalog_index_by_uid[uid] = index
+    end
+    book.cached_chapters = book.cached_chapters or {}
+    local book_id = book.book_id or book.bookId
+    local book_dir = Content.book_resolved_dir(settings, book_id, book)
+    local base_uids = {}
+    for _, uid in ipairs(base_manifest.uids) do
+        uid = tostring(uid)
+        base_uids[uid] = true
+        if not path_exists(book.cached_chapters[uid]) then
+            local hidden = book_dir .. "/.weread-chapters/chapter-"
+                .. basename_safe(uid) .. ".epub"
+            if path_exists(hidden) then book.cached_chapters[uid] = hidden end
+        end
+    end
+    local source_counts = {}
+    for _uid, source in pairs(book.cached_chapters or {}) do
+        source_counts[source] = (source_counts[source] or 0) + 1
+    end
+    local order, seen = {}, {}
+    for _, uid in ipairs(book.incremental_chapter_uids or {}) do
+        uid = tostring(uid)
+        if catalog_by_uid[uid] and not seen[uid] then
+            order[#order + 1] = uid
+            seen[uid] = true
+        end
+    end
+    for index, chapter in ipairs(catalog) do
+        local uid = tostring(chapter.chapterUid or chapter.chapterId or index)
+        if not seen[uid] then
+            order[#order + 1] = uid
+            seen[uid] = true
+        end
+    end
+    local ok, result = xpcall(function()
+        local highest_catalog_index = 0
+        for _, uid in ipairs(order) do
+            local chapter = catalog_by_uid[uid]
+            local source = book.cached_chapters and book.cached_chapters[uid]
+            if base_uids[uid] and (not source
+                or source_counts[source] ~= 1) then
+                error("published incremental chapter cache is unavailable: " .. uid, 0)
+            end
+            if source and source ~= book.incremental_reader_file
+                and source ~= book.cached_full_book
+                and source_counts[source] == 1 then
+                local package, err = read_chapter_package(source, uid, workspace)
+                if not package then error(err, 0) end
+                local chapter_name = "chapter-" .. basename_safe(uid) .. ".xhtml"
+                local chapter_body = package.body
+                if package.css then
+                    local style_name = "chapter-" .. basename_safe(uid) .. ".css"
+                    local style_path = workspace.style_dir .. "/" .. style_name
+                    local saved, save_err = atomic_write(style_path, package.css)
+                    if not saved then error(save_err or "could not stage chapter CSS") end
+                    chapter_body = chapter_body:gsub(
+                        "%.%./style%.css", "../styles/" .. style_name)
+                    assets[#assets + 1] = {
+                        href = "styles/" .. style_name,
+                        media_type = "text/css",
+                        path = style_path,
+                    }
+                end
+                local saved, save_err = atomic_write(
+                    workspace.text_dir .. "/" .. chapter_name, chapter_body)
+                if not saved then error(save_err or "could not stage chapter text") end
+                selected[#selected + 1] = chapter
+                included[#included + 1] = uid
+                local catalog_index = catalog_index_by_uid[uid]
+                linear_by_uid[uid] = catalog_index == nil
+                    or catalog_index >= highest_catalog_index
+                highest_catalog_index = math.max(
+                    highest_catalog_index, catalog_index or 0)
+                for _, asset in ipairs(package.assets) do
+                    assets[#assets + 1] = asset
+                end
+            end
+        end
+        if #selected == 0 then error("no cached chapters are available") end
+        local candidate = workspace.path .. "/candidate.epub"
+        Content.save_book_epub(settings, book, selected,
+            {
+                __workspace_text_dir = workspace.text_dir,
+                __linear_by_uid = linear_by_uid,
+            },
+            "offline", assets, nil, nil, candidate)
+        return candidate
+    end, debug.traceback)
+    if not ok then
+        Content.cleanup_download_workspace(workspace)
+        return nil, result
+    end
+
+    local lock, lock_err = acquire_incremental_lock(settings, book)
+    if not lock then
+        Content.cleanup_download_workspace(workspace)
+        return nil, lock_err or "incremental publish is busy"
+    end
+    local published_path
+    local publish_ok, publish_err = xpcall(function()
+        local current = read_incremental_manifest(settings, book)
+        if current.generation ~= base_manifest.generation then
+            error("incremental publish conflict", 0)
+        end
+        published_path = Content.incremental_reader_path(settings, book)
+        local backup = published_path .. ".weread-backup"
+        pcall(os.remove, backup)
+        local had_previous = path_exists(published_path)
+        if had_previous then
+            local backed_up, backup_err = os.rename(published_path, backup)
+            if not backed_up then error(backup_err or "could not protect published EPUB") end
+        end
+        local committed, commit_err = os.rename(result, published_path)
+        if not committed then
+            if had_previous then os.rename(backup, published_path) end
+            error(commit_err or "could not publish incremental EPUB")
+        end
+        local generation = string.format("%d-%d", os.time(),
+            math.random(100000, 999999))
+        local saved, manifest_err = write_incremental_manifest(
+            settings, book, generation, included)
+        if not saved then
+            pcall(os.remove, published_path)
+            if had_previous then os.rename(backup, published_path) end
+            error(manifest_err or "could not publish incremental manifest")
+        end
+        pcall(os.remove, backup)
+        Content.register_annotation_document(book, published_path, selected)
+    end, debug.traceback)
+    release_incremental_lock(lock)
+    Content.cleanup_download_workspace(workspace)
+    if not publish_ok then return nil, publish_err end
+    book.incremental_reader_file = published_path
+    book.incremental_chapter_uids = included
+    return published_path, included
+end
+
+-- Add a cached package to the book-local aggregate and atomically rebuild the
+-- one visible EPUB. Existing chapter XHTML keeps its UID-derived internal path,
+-- so KOReader annotations retain unambiguous anchors as the spine grows.
+function Content.activate_chapter_epub(settings, book, chapter, source_path)
+    book.cached_chapters = book.cached_chapters or {}
+    local uid = tostring(chapter.chapterUid or chapter.chapterId or "")
+    book.cached_chapters[uid] = source_path
+    local is_included, published_path, published_uids =
+        Content.incremental_contains_chapter(settings, book, uid)
+    if is_included then
+        book.incremental_reader_file = published_path
+        book.incremental_chapter_uids = published_uids
+        book.active_chapter_uid = uid
+        return published_path, published_uids, true
+    end
+    local path, included
+    for attempt = 1, 2 do
+        path, included = Content.save_incremental_book_epub(settings, book)
+        if path or not tostring(included):find(
+            "incremental publish conflict", 1, true) then
+            break
+        end
+    end
+    if not path then return nil, included end
+    book.active_chapter_uid = uid
+    return path, included, false
+end
+
+function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix,
+    assets, css, cover_data, output_path)
     local book_id = book.book_id or book.bookId
     local dir = Content.book_resolved_dir(settings, book_id, book)
     os.execute("mkdir -p " .. string.format("%q", dir))
     book.cache_dir = dir
     local book_title = book.title or "WeRead"
-    local path = dir .. "/" .. filename_safe(book_title .. " - " .. (suffix or "book")) .. ".epub"
+    local path = output_path or (dir .. "/"
+        .. filename_safe(book_title .. " - " .. (suffix or "book")) .. ".epub")
     local author = book.author or "WeRead"
     local description_meta = ""
     local description = xml_escape(book.intro)
@@ -1020,11 +1423,14 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
         [[<item id="style" href="style.css" media-type="text/css"/>]],
     }
     local spine_items = {}
+    local chapter_filenames = {}
     -- Resumable full-book jobs checkpoint ready-to-package XHTML files.  The
     -- archiver can stream that directory directly, avoiding one large Lua
     -- string table for the entire book at the final packaging step.
     local workspace_text_dir = type(chapter_bodies) == "table"
         and chapter_bodies.__workspace_text_dir or nil
+    local linear_by_uid = type(chapter_bodies) == "table"
+        and chapter_bodies.__linear_by_uid or nil
     local entries = {
         { name = "mimetype", data = "application/epub+zip" },
         { name = "META-INF/container.xml", data = [[<?xml version="1.0" encoding="utf-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>]] },
@@ -1057,7 +1463,10 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 
     for chapter_index, chapter in ipairs(chapters or {}) do
         local uid = tostring(chapter.chapterUid or chapter_index)
-        local filename = string.format("text/chapter-%03d.xhtml", chapter_index)
+        local filename = suffix == "offline"
+            and ("text/chapter-" .. basename_safe(uid) .. ".xhtml")
+            or string.format("text/chapter-%03d.xhtml", chapter_index)
+        chapter_filenames[chapter_index] = filename
         local id = item_id("chapter_", uid)
         local title = chapter.title or ("Chapter " .. uid)
         if not workspace_text_dir then
@@ -1075,7 +1484,10 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
             table.insert(entries, { name = "OEBPS/" .. filename, data = chapter_xhtml })
         end
         table.insert(manifest_items, [[<item id="]] .. id .. [[" href="]] .. filename .. [[" media-type="application/xhtml+xml"/>]])
-        table.insert(spine_items, [[<itemref idref="]] .. id .. [["/>]])
+        local linear = linear_by_uid and linear_by_uid[uid] == false
+            and [[ linear="no"]] or ""
+        table.insert(spine_items,
+            [[<itemref idref="]] .. id .. [["]] .. linear .. [[/>]])
     end
 
     local opf = [[<?xml version="1.0" encoding="utf-8"?>
@@ -1097,7 +1509,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 </spine>
 </package>]]
     local ncx_points = build_ncx_points(chapters, function(chapter_index)
-        return string.format("text/chapter-%03d.xhtml", chapter_index)
+        return chapter_filenames[chapter_index]
     end)
     local ncx = [[<?xml version="1.0" encoding="utf-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
@@ -1119,7 +1531,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 <nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops">
 <ol>
 ]] .. build_nav_items(chapters, function(chapter_index)
-        return string.format("text/chapter-%03d.xhtml", chapter_index)
+        return chapter_filenames[chapter_index]
     end) .. [[
 </ol>
 </nav>
@@ -1515,7 +1927,9 @@ function Content.fetch_catalog(client, book)
     local catalog = client:post_json("https://weread.qq.com/web/book/chapterInfos", {
         bookIds = { tostring(book_id) },
     }, { referer = reader_url })
-    local chapters = Content.readable_chapters(Content.normalize_chapters(catalog, book_id))
+    local records, version = Content.normalize_chapters(catalog, book_id)
+    local chapters = Content.readable_chapters(records)
+    book.book_version = version or book.book_version
     book.chapters = chapters
     return chapters
 end
@@ -1719,10 +2133,13 @@ function Content.cache_annotation_source(settings, book, chapter, xhtml, raw_tex
     if book._content_format == "txt" and not raw_text then return end
     local ok, err = pcall(function()
         local Source = require("weread.lib.annotation_source")
-        require("weread.lib.annotation_store"):new(settings):put(
-            book.book_id or book.bookId, "original", tostring(chapter.chapterUid or chapter.chapterId),
-            raw_text and Source.plain(xhtml) or Source.index(xhtml),
-            tostring(chapter.chapterUid or chapter.chapterId))
+        local uid = tostring(chapter.chapterUid or chapter.chapterId)
+        local version = tonumber(book.book_version or book.bookVersion or book.version)
+        require("weread.lib.annotation_store"):new(settings):write(book.book_id or book.bookId, {
+            { kind = "original", key = uid, uid = uid,
+                value = raw_text and Source.plain(xhtml) or Source.index(xhtml) },
+            { kind = "original_version", key = uid, uid = uid, value = version or (raw_text and 0 or nil) },
+        })
     end)
     -- A cache failure must not turn a successful text download into a failure.
     if not ok then logger.warn("annotation source cache:", tostring(err)) end

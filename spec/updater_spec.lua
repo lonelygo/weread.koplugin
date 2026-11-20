@@ -65,16 +65,16 @@ local release, release_err = Updater.parse_release({
     draft = false,
     prerelease = false,
     body = "## What's Changed\n\n**Added** `updates`",
-    html_url = "https://github.com/finlater/weread.koplugin/releases/tag/v0.7.0",
+    html_url = "https://github.com/lonelygo/weread.koplugin/releases/tag/v0.7.0",
     assets = {
         {
             name = "weread.koplugin-v0.7.0.zip",
-            browser_download_url = "https://github.com/finlater/weread.koplugin/releases/download/v0.7.0/weread.koplugin-v0.7.0.zip",
+            browser_download_url = "https://github.com/lonelygo/weread.koplugin/releases/download/v0.7.0/weread.koplugin-v0.7.0.zip",
             size = 1234,
         },
         {
             name = "weread.koplugin-v0.7.0.zip.sha256",
-            browser_download_url = "https://github.com/finlater/weread.koplugin/releases/download/v0.7.0/weread.koplugin-v0.7.0.zip.sha256",
+            browser_download_url = "https://github.com/lonelygo/weread.koplugin/releases/download/v0.7.0/weread.koplugin-v0.7.0.zip.sha256",
         },
     },
 })
@@ -157,7 +157,14 @@ package.loaded["socket/http"] = {
     end,
 }
 
-local update_state = { prefer_proxy = false }
+local old_asset = "https://github.com/finlater/weread.koplugin/releases/download/v9.0.0/stale.zip"
+expect(Updater.API_URL == "https://api.github.com/repos/lonelygo/weread.koplugin/releases/latest"
+    and #Updater.candidate_urls(old_asset, true) == 0,
+    "updater must only look for this fork's releases")
+local update_state = {
+    prefer_proxy = false, auto_check = true, last_check = os.time(),
+    available_version = "9.0.0", archive_url = old_asset, skipped_version = "0.7.0",
+}
 local updater = Updater:new{
     settings = {
         get = function() return update_state end,
@@ -167,6 +174,10 @@ local updater = Updater:new{
     current_version = "0.6.0",
     plugin_dir = "/tmp/weread.koplugin",
 }
+expect(not updater:has_update() and updater:cached_release() == nil
+    and update_state.last_check == 0 and update_state.skipped_version == ""
+    and update_state.auto_check and update_state.prefer_proxy == false,
+    "switching from upstream must discard pending updates while preserving preferences")
 updater:cache_release(release)
 expect(updater:should_notify("0.7.0"), "new release should notify by default")
 expect(not updater:should_notify("0.6.0") and not updater:should_notify("0.5.0"),

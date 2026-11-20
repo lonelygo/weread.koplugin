@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import posixpath
 import shlex
 import shutil
 import struct
@@ -24,6 +25,7 @@ import subprocess
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 
@@ -36,7 +38,7 @@ QUOTE = "窗外的风穿过树梢，带来远处山谷的回声。"
 BOOKS = [dict(bookId=str(900001 + i), title=("山谷来信 · 离线测试" if i == 0 else f"合成读物 {i:02d}：用于长标题与分页验证"),
               author="测试作者", cover="https://weread.qq.com/mock/cover.png",
               category="文学", intro="自写合成内容，用于 KOReader 集成测试。", wordCount=12000,
-              totalChapter=6, type=0, updateTime=1700000000 + i) for i in range(26)]
+              totalChapter=6, bookVersion=17, type=0, updateTime=1700000000 + i) for i in range(26)]
 CHAPTERS = [dict(chapterUid=i, chapterIdx=i, title=f"第{i}章 {title}", level=1,
                  wordCount=1800) for i, title in enumerate(TITLES, 1)]
 
@@ -102,6 +104,11 @@ class MockServer(ThreadingHTTPServer):
         self.log_path = log_path
         self.events = deque(maxlen=500)
         self.progress = {}
+        self.read_reports = []
+        self.bookmarks = {}
+        self.private_reviews = {}
+        self.annotation_writes = []
+        self.next_annotation_id = 1
         self.control = dict(delay=0, match="", status=503, times=0,
                             empty_shelf=False, empty_annotations=False)
 
@@ -182,6 +189,48 @@ class MockServer(ThreadingHTTPServer):
                 return 200, shards("p { line-height: 1.5; } img { max-width: 100%; }", 1)[0]
             if part in {"e_0", "e_1", "e_3"}:
                 return 200, shards(chapter_html(uid))[["e_0", "e_1", "e_3"].index(part)]
+        if path in {"/web/book/addBookmark", "/web/review/add"} and method == "POST":
+            uid = int(data["chapterUid"])
+            if not 1 <= uid <= len(CHAPTERS) or book_id not in {b["bookId"] for b in BOOKS}:
+                raise ValueError("unknown annotation book/chapter")
+            if data.get("bookVersion") != 17 or data.get("chapterIdx") != uid:
+                raise ValueError("annotation edition/chapter mismatch")
+            bounds = data.get("range", "").split("-")
+            if len(bounds) != 2 or not all(part.isdigit() for part in bounds):
+                raise ValueError("annotation range must be half-open rune offsets")
+            start, end = map(int, bounds)
+            source = chapter_html(uid)
+            if not 0 <= start < end <= len(source):
+                raise ValueError("annotation range out of bounds")
+            is_review = path == "/web/review/add"
+            if is_review:
+                if data.get("isPrivate") != 1 or not isinstance(data.get("content"), str):
+                    raise ValueError("only private text reviews are accepted")
+                quote = data.get("abstract")
+            else:
+                try:
+                    quote = base64.b64decode(data["markText"], validate=True).decode("utf-8")
+                except (ValueError, UnicodeError) as exc:
+                    raise ValueError("invalid bookmark base64") from exc
+            if source[start:end] != quote:
+                raise ValueError("annotation range does not match original markText")
+            with self.lock:
+                identifier = ("review-" if is_review else "bookmark-") + str(self.next_annotation_id)
+                self.next_annotation_id += 1
+                record = dict(data, decoded_mark_text=quote)
+                (self.private_reviews if is_review else self.bookmarks)[identifier] = record
+                self.annotation_writes.append(dict(path=path, id=identifier, payload=record))
+            return 200, {"reviewId" if is_review else "bookmarkId": identifier, "succ": 1}
+        if path in {"/web/book/removeBookmark", "/web/review/delete"} and method == "POST":
+            is_review = path == "/web/review/delete"
+            identifier = data["reviewId" if is_review else "bookmarkId"]
+            with self.lock:
+                records = self.private_reviews if is_review else self.bookmarks
+                if identifier not in records:
+                    raise ValueError("unknown annotation id")
+                del records[identifier]
+                self.annotation_writes.append(dict(path=path, id=identifier, payload=dict(data)))
+            return 200, dict(succ=1)
         if path == "/web/review/single" and method == "GET":
             return 200, dict(review=review(), comments=[
                 dict(commentId=f"mock-comment-{i}", content=f"合成回复 {i}", author={"nick": "测试读者"}, createTime=1700000000)
@@ -192,6 +241,8 @@ class MockServer(ThreadingHTTPServer):
             book_id = next(b["bookId"] for b in BOOKS if weread_e(b["bookId"]) == data["b"])
             uid = next(c["chapterUid"] for c in CHAPTERS if weread_e(c["chapterUid"]) == data["c"])
             with self.lock:
+                self.read_reports.append(dict(bookId=book_id, chapterUid=uid, rt=data.get("rt", 0),
+                                              chapterOffset=data["co"], progress=data["pr"]))
                 self.progress[book_id] = dict(chapterUid=uid, chapterIdx=data["ci"],
                                               chapterOffset=data["co"], progress=data["pr"], summary=data.get("sm", ""))
             return 200, dict(succ=1)
@@ -231,7 +282,9 @@ class Handler(BaseHTTPRequestHandler):
                 status, result = 200, dict(service="weread-mock", fixture_version=1)
             elif path.path == "/__state" and self.command == "GET":
                 with self.server.lock:
-                    status, result = 200, dict(control=self.server.control.copy(), requests=list(self.server.events), progress=self.server.progress.copy())
+                    status, result = 200, dict(control=self.server.control.copy(), requests=list(self.server.events), progress=self.server.progress.copy(),
+                                              bookmarks=self.server.bookmarks.copy(), private_reviews=self.server.private_reviews.copy(),
+                                              annotation_writes=list(self.server.annotation_writes), read_reports=list(self.server.read_reports))
             elif path.path == "/__control" and self.command == "POST":
                 self.set_control(data)
                 status, result = 200, dict(ok=True)
@@ -336,9 +389,13 @@ def main():
     parser.add_argument("--koreader", type=Path, help="built KOReader runtime directory (not source root)")
     parser.add_argument("--log", type=Path, help="JSONL request log, without headers or private data")
     parser.add_argument("--smoke", action="store_true", help="run real KOReader offscreen smoke, save evidence, then exit")
+    parser.add_argument("--scenario", choices=("basic", "continuous", "offline", "reading"), default="basic",
+                        help="offscreen integration scenario (requires --smoke)")
     args = parser.parse_args()
     if bool(args.run_dir) != bool(args.koreader):
         parser.error("--run-dir and --koreader must be provided together")
+    if args.scenario != "basic" and not args.smoke:
+        parser.error("--scenario requires --smoke")
     if args.smoke and not args.run_dir:
         parser.error("--smoke requires a fresh --run-dir and --koreader")
     if args.run_dir and args.bind not in ("127.0.0.1", "0.0.0.0"):
@@ -354,13 +411,13 @@ def main():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         env = os.environ | dict(KO_HOME=str(args.run_dir / "profile"),
-                                EMULATE_READER="1", EMULATE_READER_W="600", EMULATE_READER_H="800", EMULATE_READER_DPI="167")
+                                EMULATE_READER="1", EMULATE_READER_W="600", EMULATE_READER_H="800", EMULATE_READER_DPI="167", KO_DYLD_PREFIX=str(args.koreader.resolve()))
         log = args.run_dir / "evidence/smoke.log"
         try:
             with log.open("w") as out:
-                result = subprocess.run(["./luajit", str(REPO / "spec/koreader/weread_mock_smoke.lua")],
-                                        cwd=args.koreader, env=env, stdout=out, stderr=subprocess.STDOUT, timeout=90)
-            if result.returncode == 0:
+                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua"}[args.scenario])],
+                                        cwd=args.koreader, env=env, stdout=out, stderr=subprocess.STDOUT, timeout=180)
+            if result.returncode == 0 and args.scenario == "basic":
                 full_books = list((args.run_dir / "profile/weread-mock/cache").rglob("* - full.epub"))
                 assert len(full_books) == 1, "expected one completed full EPUB"
                 with zipfile.ZipFile(full_books[0]) as epub:
@@ -369,9 +426,33 @@ def main():
                     for uid in range(1, 7):
                         assert any(f"这是第{uid}章的第1段" in page for page in pages), f"missing chapter {uid}"
                     assert any("images/" in name for name in epub.namelist()), "missing image asset"
+            if result.returncode == 0 and args.scenario == "continuous":
+                books = list((args.run_dir / "profile/weread-mock/cache").glob("*/* - offline.epub"))
+                assert len(books) == 1, "expected one continuous EPUB"
+                images = []
+                with zipfile.ZipFile(books[0]) as epub:
+                    assert epub.testzip() is None, "corrupt continuous EPUB"
+                    names = epub.namelist()
+                    for name in names:
+                        if name.startswith("OEBPS/text/") and name.endswith(".xhtml"):
+                            for element in ET.fromstring(epub.read(name)).iter():
+                                if element.tag.split("}")[-1] == "img":
+                                    target = posixpath.normpath(posixpath.join(posixpath.dirname(name), element.attrib["src"]))
+                                    assert target in names, "missing chapter image: " + target
+                                    images.append(target)
+                assert len(images) >= 3, "expected images from at least three chapters"
+                events = [json.loads(line) for line in server.log_path.read_text().splitlines()]
+                offline_at = next(i for i, event in enumerate(events) if event["path"] == "/__control")
+                assert not events[offline_at + 1:], "offline return unexpectedly used HTTP"
+                (args.run_dir / "evidence/archive-check.json").write_text(json.dumps(dict(
+                    valid_zip=True, image_references=images, offline_requests=0), indent=2))
             print(("PASS" if result.returncode == 0 else "FAIL") + f": {log}")
             raise SystemExit(result.returncode)
         finally:
+            with server.lock:
+                (args.run_dir / "evidence/server-state.json").write_text(json.dumps(dict(
+                    bookmarks=server.bookmarks, private_reviews=server.private_reviews,
+                    annotation_writes=server.annotation_writes, progress=server.progress, read_reports=server.read_reports), ensure_ascii=False, indent=2))
             server.shutdown()
             server.server_close()
             thread.join()

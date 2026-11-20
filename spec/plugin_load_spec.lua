@@ -33,7 +33,7 @@ package.preload["logger"] = function()
     }
 end
 package.preload["ui/uimanager"] = function()
-    return {}
+    return { scheduleIn = function() end }
 end
 package.preload["ui/widget/container/widgetcontainer"] = function()
     local base = {

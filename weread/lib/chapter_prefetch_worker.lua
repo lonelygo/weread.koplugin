@@ -15,6 +15,9 @@ function M.run(settings, client, book, chapter, context)
     local ok, result = xpcall(function()
         context.emit { stage = "reader" }
         Content.ensure_reader_state(client, book)
+        local chapters, catalog_err = Content.ensure_catalog(
+            client, settings, book)
+        if not chapters then error(catalog_err or "chapter catalog is unavailable") end
         context.checkCancelled()
 
         local cache = settings:get("cache", {})
@@ -69,12 +72,18 @@ function M.run(settings, client, book, chapter, context)
         context.checkCancelled()
 
         context.emit { stage = "epub" }
-        local path = Content.save_chapter_epub(settings, book, chapter,
+        local cache_path = Content.save_chapter_epub(settings, book, chapter,
             finalized, assets, state.css)
+        book.cached_chapters = book.cached_chapters or {}
+        book.cached_chapters[uid] = cache_path
+        local path, included = Content.save_incremental_book_epub(settings, book)
+        if not path then error(included or "could not build incremental EPUB") end
         local descriptor = book.annotation_documents
             and book.annotation_documents[path] or nil
         return {
             path = path,
+            cache_path = cache_path,
+            incremental_chapter_uids = included,
             chapter_uid = uid,
             cache_dir = book.cache_dir,
             reader_url = book.reader_url,

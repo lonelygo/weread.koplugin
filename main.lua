@@ -26,7 +26,7 @@ local _ = PluginUtil.tr
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
-    version = "1.7.1",
+    version = "1.8.0",
 }
 
 -- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
@@ -79,6 +79,7 @@ function WeReadPlugin:init()
         refresh_ui      = function() self:refreshUI() end,
         refresh_shelf   = function() self:refreshShelfCacheIndicators() end,
         open_file       = function(path) self:openFile(path) end,
+        open_chapter    = function(book, chapter, path) return self:openCachedChapter(book, chapter, path) end,
         safe_callback   = function(label, fn) return self:safeCallback(label, fn) end,
         require_login   = function(cookie, api_key) return self:requireLogin(cookie, api_key) end,
         run_online_task = function(label, fn)
@@ -214,6 +215,11 @@ function WeReadPlugin:init()
         self.read_report:maybe_start("plugin_start")
     end
     self._reader_session_gen = 0
+    -- On restart Wi-Fi may already be up, so KOReader need not emit another
+    -- NetworkConnected event. Resume pending work in the file manager too.
+    UIManager:scheduleIn(1, function()
+        if self:isNetworkConnected() then self:onNetworkConnected() end
+    end)
     self.updater:schedule_auto_check()
     logger.info("initialized:", "version=", self.version)
     updater:cleanup_backup()

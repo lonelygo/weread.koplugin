@@ -8,6 +8,15 @@ if not ok_ffiutil then
     ffiutil = nil
 end
 
+local ok_time, monotonic_time = pcall(require, "ui/time")
+
+local function default_active_now()
+    if ok_time and monotonic_time and type(monotonic_time.now) == "function" then
+        return tonumber(monotonic_time.now()) / 1000000
+    end
+    return os.clock()
+end
+
 local DEFAULT_INTERVAL_SECONDS = 30
 local MIN_INTERVAL_SECONDS = 10
 local CONTEXT_TTL_SECONDS = 15 * 60
@@ -16,6 +25,7 @@ local JOB_POLL_INITIAL_SECONDS = 0.25
 local JOB_POLL_MAX_SECONDS = 2
 local JOB_TIMEOUT_SECONDS = 180
 local JOB_COLLECT_INTERVAL_SECONDS = 2
+local OFFLINE_REPLAY_INTERVAL_SECONDS = 30
 
 -- Context fields that the subprocess sends back for the parent to persist.
 -- Mirrors the scalar reading-state fields stored by BookStore; the chapter
@@ -181,6 +191,7 @@ function ReadReport:new(options)
         position_provider = options.position_provider,
         is_online = options.is_online or function() return true end,
         now = options.now or os.time,
+        active_now = options.active_now or options.now or default_active_now,
         session_id = tostring({}) .. ":" .. tostring((options.now or os.time)()),
         subprocess = options.subprocess or make_subprocess_runner(),
         state = "stopped",
@@ -189,6 +200,11 @@ function ReadReport:new(options)
         failure_count = 0,
         consecutive_failures = 0,
     }
+    if object.library_db
+        and type(object.library_db.recoverStaleReadTimeClaims) == "function" then
+        object.library_db:recoverStaleReadTimeClaims(
+            object.now() - JOB_TIMEOUT_SECONDS - 30)
+    end
     return setmetatable(object, self)
 end
 
@@ -230,6 +246,15 @@ function ReadReport:resolve_target()
     end
 
     if not has_document then
+        local queued = self.library_db
+            and type(self.library_db.nextReadTime) == "function"
+            and self.library_db:nextReadTime() or nil
+        if queued then
+            local book = book_record(self.settings:get("books", {}), queued.book_id)
+            return tostring(queued.book_id),
+                type(book) == "table" and book.title or tostring(queued.book_id),
+                "offline_queue"
+        end
         return nil, nil, "no_document"
     end
 
@@ -330,6 +355,9 @@ function ReadReport:start(reason)
     self.state = "waiting"
     self.stop_reason = nil
     self.last_skip = nil
+    if self.get_document() ~= nil then
+        self.last_accounted_at = self.active_now()
+    end
 
     local task
     task = function()
@@ -361,6 +389,7 @@ function ReadReport:stop(reason)
     self.state = reason == "suspend" and "suspended"
         or "stopped"
     self.stop_reason = reason
+    self.last_accounted_at = nil
     if had_task then
         log("info", "reading time report stopped:",
             "reason=", reason,
@@ -392,25 +421,55 @@ function ReadReport:on_reader_ready()
 end
 
 function ReadReport:on_suspend()
+    self:_capture_active_time()
     self.suspended = true
     self:stop("suspend")
 end
 
 function ReadReport:on_resume()
     self.suspended = false
+    self.last_accounted_at = self.get_document() and self.active_now() or nil
     return self:maybe_start("resume")
 end
 
 function ReadReport:on_close_document()
+    self:_capture_active_time()
     local config = self:_config()
     if config.report_on_open ~= false or config.mode == "auto" then
         self:stop("document_closed")
         self.current_book_id = nil
         self.current_book_title = nil
         self.current_book_source = nil
+        if self.library_db
+            and type(self.library_db.nextReadTime) == "function"
+            and self.library_db:nextReadTime() then
+            self:maybe_start("offline_queue")
+        end
         return
     end
     self:maybe_start("document_closed_background")
+end
+
+function ReadReport:_capture_active_time(position)
+    if self.suspended or self.get_document() == nil or not self.last_accounted_at then
+        return 0
+    end
+    local now = self.active_now()
+    local elapsed = math.max(0, math.floor(now - self.last_accounted_at))
+    if elapsed <= 0 then return 0 end
+    if not position and type(self.position_provider) == "function"
+        and self.current_book_id then
+        position = self.position_provider(self.current_book_id)
+    end
+    if self.library_db and type(self.library_db.enqueueReadTime) == "function"
+        and self.current_book_id then
+        if not self.library_db:enqueueReadTime(
+            self.current_book_id, elapsed, position) then
+            return 0
+        end
+    end
+    self.last_accounted_at = now
+    return elapsed
 end
 
 -- ------------------------------------------------------------------
@@ -418,28 +477,29 @@ end
 -- pipeline to a subprocess (or run it inline as a fallback).
 -- ------------------------------------------------------------------
 
-function ReadReport:_schedule_next(generation, task)
+function ReadReport:_schedule_next(generation, task, delay)
     if self.generation == generation and self.task == task then
-        self.scheduler:scheduleIn(self:_interval(), task)
+        self.scheduler:scheduleIn(delay or self:_interval(), task)
     end
 end
 
 function ReadReport:_tick(generation, task)
     local ok, err = pcall(function()
-        local proceed, book_id, position = self:_precheck()
-        if not proceed then
-            self:_schedule_next(generation, task)
+        if self.job then
+            -- The job poller owns the next schedule. Never claim another
+            -- durable item while an earlier report is still in flight.
             return
         end
-        if self.job then
-            -- Previous report is still in flight; keep the cadence and let
-            -- the poller reschedule once it completes.
+        local proceed, book_id, position, queued = self:_precheck()
+        if not proceed then
             self:_schedule_next(generation, task)
             return
         end
         local allow_renewal = self:_renewal_allowed()
         local spawned, spawn_err = self:_start_job(
-            book_id, allow_renewal, generation, task, position)
+            book_id, allow_renewal, generation, task,
+            queued and nil or position,
+            queued and queued.elapsed_seconds or nil, queued)
         if spawned then
             return
         end
@@ -450,10 +510,13 @@ function ReadReport:_tick(generation, task)
         end
         local outcome = self:_run_pipeline(book_id, {
             allow_renewal = allow_renewal,
-            position = position,
+            position = queued and nil or position,
+            elapsed_seconds = queued and queued.elapsed_seconds or nil,
+            force_context = queued ~= nil,
         })
-        self:_apply_outcome(outcome)
-        self:_schedule_next(generation, task)
+        self:_apply_queued_outcome(queued, outcome)
+        self:_schedule_next(generation, task,
+            queued and OFFLINE_REPLAY_INTERVAL_SECONDS or nil)
     end)
     if not ok then
         self:_set_error(err, "task", "read report task failed:")
@@ -492,22 +555,38 @@ function ReadReport:_precheck()
         self:_set_error("cookie not configured", "authentication", "read report skipped:")
         return false
     end
+    local position
+    local position_reason
+    local position_applies
+    if type(self.position_provider) == "function" then
+        position, position_reason, position_applies = self.position_provider(book_id)
+    end
+    local elapsed = self:_capture_active_time(position)
     if not self.is_online() then
         self.state = "offline"
         self:_log_skip("offline")
         return false
     end
-    local position
-    if type(self.position_provider) == "function" then
-        local provided, reason, applies = self.position_provider(book_id)
-        if applies and not provided then
-            self.state = "waiting_for_progress"
-            self:_log_skip(reason or "progress_unverified")
-            return false
+    if self.library_db and type(self.library_db.claimReadTime) == "function" then
+        if type(self.library_db.recoverStaleReadTimeClaims) == "function" then
+            self.library_db:recoverStaleReadTimeClaims(
+                self.now() - JOB_TIMEOUT_SECONDS - 30)
         end
-        position = provided
+        local queued = self.library_db:claimReadTime(self.session_id)
+        if queued then
+            return true, queued.book_id, nil, queued
+        end
+        self.state = "waiting"
+        return false
     end
-    return true, book_id, position
+    if position_applies and not position then
+            self.state = "waiting_for_progress"
+            self:_log_skip(position_reason or "progress_unverified")
+            return false
+    end
+    return true, book_id, position, elapsed > 0 and {
+        elapsed_seconds = elapsed,
+    } or nil
 end
 
 function ReadReport:_renewal_allowed()
@@ -543,13 +622,15 @@ end
 -- Subprocess job management (parent side)
 -- ------------------------------------------------------------------
 
-function ReadReport:_start_job(book_id, allow_renewal, generation, task, position)
+function ReadReport:_start_job(book_id, allow_renewal, generation, task, position,
+        elapsed_seconds, queued)
     local runner = self.subprocess
     if not runner then
         return false, "no subprocess support"
     end
     local pid, read_fd = runner.run(function(_pid, child_write_fd)
-        local outcome = self:_child_report(book_id, allow_renewal, position)
+        local outcome = self:_child_report(
+            book_id, allow_renewal, position, elapsed_seconds, queued ~= nil)
         local ok, encoded = pcall(function()
             return self.client:json_encode(outcome)
         end)
@@ -571,6 +652,7 @@ function ReadReport:_start_job(book_id, allow_renewal, generation, task, positio
         poll_interval = JOB_POLL_INITIAL_SECONDS,
         auth_fingerprint = self:_auth_fingerprint(),
         context_fingerprint = self:_context_fingerprint(book_id),
+        queued = queued,
     }
     job.poll = function()
         self:_poll_job(job, generation, task)
@@ -600,14 +682,16 @@ function ReadReport:_poll_job(job, generation, task)
             self:_collect_pid(job.pid)
         end
         self:_apply_job_outcome(job, self:_decode_outcome(payload))
-        self:_schedule_next(generation, task)
+        self:_schedule_next(generation, task,
+            job.queued and OFFLINE_REPLAY_INTERVAL_SECONDS or nil)
         return
     end
     if self.now() - job.started_at > JOB_TIMEOUT_SECONDS then
         log("warn", "read report job timed out, terminating:", "pid=", job.pid)
         self:_abandon_job(job)
         self:_set_error("report job timed out", "transport", "read report job failed:")
-        self:_schedule_next(generation, task)
+        self:_schedule_next(generation, task,
+            job.queued and OFFLINE_REPLAY_INTERVAL_SECONDS or nil)
         return
     end
     job.poll_interval = math.min(job.poll_interval * 2, JOB_POLL_MAX_SECONDS)
@@ -623,6 +707,12 @@ function ReadReport:_abandon_job(job)
     end
     if self.job == job then
         self.job = nil
+    end
+    if job.queued and not job.queued_finalized
+        and self.library_db
+        and type(self.library_db.quarantineReadTime) == "function" then
+        self.library_db:quarantineReadTime(job.queued, "report_abandoned")
+        job.queued_finalized = true
     end
     local runner = self.subprocess
     if job.poll then
@@ -708,7 +798,26 @@ function ReadReport:_apply_job_outcome(job, outcome)
             end
         end
     end
-    return self:_apply_outcome(outcome)
+    local accepted = self:_apply_queued_outcome(job.queued, outcome)
+    job.queued_finalized = true
+    return accepted
+end
+
+function ReadReport:_apply_queued_outcome(queued, outcome)
+    local accepted = self:_apply_outcome(outcome)
+    if not queued or not self.library_db then return accepted end
+    if accepted and type(self.library_db.ackReadTime) == "function" then
+        self.library_db:ackReadTime(queued)
+    elseif (type(outcome) ~= "table"
+            or outcome.error_kind == "transport"
+            or outcome.error_kind == "job"
+            or outcome.error_kind == "task")
+        and type(self.library_db.quarantineReadTime) == "function" then
+        self.library_db:quarantineReadTime(
+            queued,
+            type(outcome) == "table" and outcome.error or "missing_result")
+    end
+    return accepted
 end
 
 function ReadReport:_apply_outcome(outcome)
@@ -768,7 +877,8 @@ end
 -- Child entry point. Neuters settings persistence inside the fork and
 -- captures auth changes (Set-Cookie merges, cookie renewal) so the parent
 -- can persist them from the outcome.
-function ReadReport:_child_report(book_id, allow_renewal, position)
+function ReadReport:_child_report(book_id, allow_renewal, position, elapsed_seconds,
+        force_context)
     self._no_persist = true
     self.settings.flush = function() end
     local auth_changed = false
@@ -784,6 +894,8 @@ function ReadReport:_child_report(book_id, allow_renewal, position)
         return self:_run_pipeline(book_id, {
             allow_renewal = allow_renewal,
             position = position,
+            elapsed_seconds = elapsed_seconds,
+            force_context = force_context == true,
         })
     end)
     if not ok then
@@ -812,7 +924,7 @@ function ReadReport:_run_pipeline(book_id, opts)
     local outcome = { accepted = false, renew_attempted = false }
 
     local context_ok, book = pcall(function()
-        return self:ensure_context(book_id, false)
+        return self:ensure_context(book_id, opts.force_context == true)
     end)
     if not context_ok then
         outcome.error = tostring(book)
@@ -916,15 +1028,28 @@ end
 
 -- Inline (blocking) report used when subprocess support is unavailable.
 function ReadReport:report_once()
-    local proceed, book_id, position = self:_precheck()
+    local proceed, book_id, position, queued = self:_precheck()
     if not proceed then
         return false
     end
     local outcome = self:_run_pipeline(book_id, {
         allow_renewal = self:_renewal_allowed(),
-        position = position,
+        position = queued and nil or position,
+        elapsed_seconds = queued and queued.elapsed_seconds or nil,
+        force_context = queued ~= nil,
     })
-    return self:_apply_outcome(outcome)
+    return self:_apply_queued_outcome(queued, outcome)
+end
+
+function ReadReport:on_network_connected()
+    if not self.task then
+        return self:maybe_start("network_connected")
+    end
+    if self.job then return false end
+    self.scheduler:unschedule(self.task)
+    self.scheduler:scheduleIn(0.5, self.task)
+    self.state = "waiting"
+    return true
 end
 
 -- ------------------------------------------------------------------

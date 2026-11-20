@@ -51,7 +51,7 @@ package.preload["weread.lib.plugin_util"] = function()
 end
 
 local UpdaterUI = require("weread.ui.updater")
-local state = { available_version = "0.7.0" }
+local state = { repository = "lonelygo/weread.koplugin", available_version = "0.7.0" }
 local settings = {
     data_dir = "/tmp",
     get = function() return state end,

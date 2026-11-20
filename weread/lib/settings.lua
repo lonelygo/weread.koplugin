@@ -24,6 +24,7 @@ local defaults = {
     books = {},
     downloads = {},
     sync = {
+        upload_annotations = true,
         pull_on_open = false,
         upload_on_close = false,
         ask_on_conflict = true,

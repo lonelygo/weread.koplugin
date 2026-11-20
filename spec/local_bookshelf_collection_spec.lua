@@ -77,8 +77,14 @@ package.preload["ffi/util"] = function()
 end
 package.preload["weread.lib.content"] = function()
     return {
+        ensure_catalog = function(_client, _settings, book)
+            return book.chapters or {}
+        end,
         save_chapter_epub = function(_settings, _book, chapter)
             return "/cache/book/chapter-" .. tostring(chapter.chapterUid) .. ".epub"
+        end,
+        save_incremental_book_epub = function()
+            return "/cache/book/offline.epub", { "22", "33" }
         end,
         save_book_epub = function()
             return "/cache/book/full.epub"

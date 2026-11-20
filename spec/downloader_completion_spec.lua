@@ -47,8 +47,15 @@ local full_book_save_count = 0
 local saved_cover_data
 package.preload["weread.lib.content"] = function()
     return {
+        ensure_catalog = function(_client, _settings, book)
+            return book.chapters or { { chapterUid = 22 } }
+        end,
         save_chapter_epub = function(_settings, _book, chapter)
             return "/cache/book/chapter-" .. tostring(chapter.chapterUid) .. ".epub"
+        end,
+        save_incremental_book_epub = function(_settings, book)
+            local chapter = book.cached_chapters and book.cached_chapters["22"]
+            return chapter or "/cache/book/chapter-22.epub", { "22" }
         end,
         save_book_epub = function(_settings, _book, _chapters, _bodies, _suffix, _assets, _css, cover_data)
             full_book_save_count = full_book_save_count + 1

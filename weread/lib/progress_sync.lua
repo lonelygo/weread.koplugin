@@ -86,6 +86,11 @@ function ProgressSync:_config()
     return self.settings:get("sync", {})
 end
 
+function ProgressSync:_account_id()
+    local account = self.settings:get("account", {})
+    return type(account) == "table" and tostring(account.user_vid or "") or ""
+end
+
 function ProgressSync:_persist(book_id, patch)
     book_id = tostring(book_id or "")
     if book_id == "" or type(patch) ~= "table" then return false end
@@ -155,11 +160,21 @@ function ProgressSync:capture_local()
     local chapters
     local current_chapter
     local is_full_book
+    local file_context
     if cached and cached.book_id == book_id and cached.path == path then
         book = cached.book
         chapters = cached.chapters
         current_chapter = cached.current_chapter
         is_full_book = cached.is_full_book
+        file_context = cached.file_context
+        if file_context and file_context.incremental then
+            local _index
+            _index, current_chapter, is_full_book, file_context =
+                self.get_file_context(book, path)
+            cached.current_chapter = current_chapter
+            cached.is_full_book = is_full_book == true
+            cached.file_context = file_context
+        end
     else
         book = self.get_book(book_id)
         if type(book) ~= "table" then return nil, "book_not_found" end
@@ -168,7 +183,7 @@ function ProgressSync:capture_local()
             return nil, "catalog_unavailable"
         end
         local _index
-        _index, current_chapter, is_full_book =
+        _index, current_chapter, is_full_book, file_context =
             self.get_file_context(book, path)
         self.document_context = {
             book_id = book_id,
@@ -177,11 +192,13 @@ function ProgressSync:capture_local()
             position_catalog = PositionMapper.catalog(chapters),
             current_chapter = current_chapter,
             is_full_book = is_full_book == true,
+            file_context = file_context,
             path = path,
         }
         cached = self.document_context
     end
-    local fraction = self:_local_fraction()
+    local fraction = file_context and file_context.chapter_fraction
+        or self:_local_fraction()
     if fraction == nil then return nil, "position_unavailable" end
     local position, reason = PositionMapper.local_to_remote(
         chapters,
@@ -347,10 +364,18 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
     self:_persist(book_id, {
         pending_upload_position = position,
         pending_upload_reason = reason or "unspecified",
+        pending_upload_account = self:_account_id(),
     })
     if not self.is_online() then
         self.state = "offline"
         if show_result then self.notify("offline", {}) end
+        return false
+    end
+    if not self.verified and reason ~= "network_restored" then
+        self.state = "pending_reconcile"
+        self.scheduler:scheduleIn(0.5, function()
+            self:on_network_connected()
+        end)
         return false
     end
     self.uploading = true
@@ -382,6 +407,7 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
                 last_upload_at = self.now(),
                 pending_upload_position = false,
                 pending_upload_reason = false,
+                pending_upload_account = false,
                 last_sync_error = false,
             })
             log("info", "upload accepted:",
@@ -391,6 +417,9 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
             if show_result then
                 self.notify("upload_success", { position = position })
             end
+            self.scheduler:scheduleIn(1, function()
+                self:on_network_connected()
+            end)
             return
         end
         local error_message = ok and type(outcome) == "table"
@@ -404,6 +433,11 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
             self.notify("upload_failed", {
                 error = tostring(error_message or "upload_failed"),
             })
+        end
+        if self.is_online() then
+            self.scheduler:scheduleIn(30, function()
+                self:on_network_connected()
+            end)
         end
     end
     local started = self.run_online("progress_upload", attempt)
@@ -690,6 +724,21 @@ function ProgressSync:on_reader_ready()
     self.dirty = false
     self.state = "waiting"
 
+    -- Establish a position baseline as soon as ReaderReady fires. Without
+    -- this, a quick first page turn inside OPEN_DELAY_SECONDS becomes the
+    -- delayed baseline and is never marked dirty.
+    local immediate_book_id = self.detect_book()
+    if immediate_book_id and not is_mp_book(immediate_book_id) then
+        self.current_book_id = tostring(immediate_book_id)
+        local initial_position = self:capture_local()
+        if initial_position then
+            self.local_position = initial_position
+            self:_persist(self.current_book_id, {
+                last_local_position = initial_position,
+            })
+        end
+    end
+
     self.scheduler:scheduleIn(OPEN_DELAY_SECONDS, function()
         if generation ~= self.generation then return end
         local book_id = self.detect_book()
@@ -706,6 +755,10 @@ function ProgressSync:on_reader_ready()
             self.state = "unsafe"
             log("warn", "local position unavailable:", tostring(reason))
             return
+        end
+        if self.local_position
+            and not PositionMapper.same_position(local_position, self.local_position) then
+            self.dirty = true
         end
         self.local_position = local_position
         self:_persist(book_id, { last_local_position = local_position })
@@ -730,12 +783,14 @@ end
 
 function ProgressSync:on_close_document()
     local position = self:capture_local() or self.local_position
-    if position and self.verified
-        and self:_config().upload_on_close == true then
+    if position and self:_config().upload_on_close == true then
         if not self.local_position
             or not PositionMapper.same_position(position, self.local_position) then
             self.dirty = true
         end
+        -- Always preserve a dirty close snapshot. Unverified snapshots are
+        -- reconciled against the cloud before upload, even if link state still
+        -- appears online while the document is closing.
         if self.dirty then
             self:_upload_snapshot(position, "document_close", false)
         end
@@ -755,7 +810,7 @@ function ProgressSync:on_suspend()
         and not PositionMapper.same_position(position, self.local_position) then
         self.dirty = true
     end
-    if position and self.verified and self.dirty
+    if position and self.dirty
         and self:_config().upload_on_close == true then
         self:_upload_snapshot(position, "suspend", false)
     end
@@ -769,6 +824,71 @@ function ProgressSync:on_resume()
         self:_clear_verified("resume_recheck")
         self:_pull({ manual = false })
     end
+end
+
+function ProgressSync:on_network_connected()
+    if self.uploading or self.reconnect_checking or not self.is_online() then
+        return false
+    end
+    local account_id = self:_account_id()
+    if account_id == "" then return false end
+    local selected
+    for book_id, book in pairs(self.settings:get("books", {})) do
+        local position = type(book) == "table" and book.pending_upload_position or nil
+        if type(position) == "table"
+            and tostring(book.pending_upload_account or "") == account_id
+            and book.pending_upload_blocked ~= true then
+            local captured_at = tonumber(position.captured_at) or math.huge
+            if not selected or captured_at < selected.captured_at then
+                selected = {
+                    book_id = tostring(book_id),
+                    position = position,
+                    reason = book.pending_upload_reason,
+                    captured_at = captured_at,
+                }
+            end
+        end
+    end
+    if not selected then return false end
+    selected.position.book_id = selected.position.book_id or selected.book_id
+    local book = self.get_book(selected.book_id)
+    local chapters = type(book) == "table" and self.get_chapters(book) or nil
+    if type(chapters) ~= "table" or #chapters == 0 then return false end
+    self.reconnect_checking = true
+    local started = self.run_online("progress_reconcile", function()
+        local remote, fetch_error = self:_fetch_remote(selected.book_id, chapters)
+        self.reconnect_checking = false
+        if not remote then
+            self:_persist(selected.book_id, {
+                last_sync_error = tostring(fetch_error or "remote_unavailable"),
+            })
+            self.scheduler:scheduleIn(30, function()
+                self:on_network_connected()
+            end)
+            return
+        end
+        local relation = PositionMapper.compare(selected.position, remote,
+            SOURCE_CONFLICT_THRESHOLD_PERCENT)
+        if relation == "remote_ahead" or relation == "different" then
+            self:_persist(selected.book_id, {
+                pending_upload_blocked = true,
+                pending_upload_remote = remote,
+                last_sync_error = "offline_progress_conflict",
+            })
+            self.state = "conflict"
+            log("warn", "offline progress held for conflict:",
+                "book=", selected.book_id,
+                "relation=", relation)
+            return
+        end
+        self:_upload_snapshot(
+            selected.position,
+            "network_restored",
+            false
+        )
+    end)
+    if not started then self.reconnect_checking = false end
+    return started == true
 end
 
 function ProgressSync:sync_now()

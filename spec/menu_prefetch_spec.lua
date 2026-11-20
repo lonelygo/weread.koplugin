@@ -266,12 +266,12 @@ for index, item in ipairs(about_items or {}) do
     expect(item.keep_menu_open == true,
         "about item " .. index .. " keeps the menu open")
 end
-expect(about_items[1] and about_items[1].text == "Upgrade to a fuller WeRead experience?",
-    "edition introduction is the first about item")
-expect(about_items[2] and about_items[2].text == "Version %1",
-    "version follows the introduction")
-expect(about_items[3] and about_items[3].text == "Author: %1",
-    "author follows the version")
+expect(about_items[1] and about_items[1].text == "Version %1",
+    "the fork version is the first about item")
+expect(about_items[2] and about_items[2].text == "Fork maintainer: %1",
+    "the fork maintainer is identified")
+expect(about_items[3] and about_items[3].text == "Upstream closed-source edition",
+    "upstream information is attributed")
 expect(about_items[4] and about_items[4].text == "Check for updates"
         and about_items[5].text == "Automatically check once an hour"
         and about_items[6].text == "Prefer proxy for updates",
@@ -282,10 +282,10 @@ expect(#update_available_items == 6
         and update_available_items[4].text == "Update to v%1",
     "available update replaces the check item without adding another item")
 available_version = nil
-about_items[2].callback()
+about_items[1].callback()
 expect(shown_widget and shown_widget.text:find("Disclaimer", 1, true),
     "version item preserves the previous about dialog behavior")
-about_items[1].callback()
+about_items[3].callback()
 local recommendation = shown_widget
 expect(recommendation.title == "weread closed-source edition (search finlater on all platforms)"
         and recommendation.text:find("contact finlater on Xianyu", 1, true),
@@ -309,11 +309,8 @@ expect(closed_widget == recommendation, "return closes the recommendation")
 local main_items = host:getMainMenuItems()
 expect(main_items[#main_items] and main_items[#main_items].text == "Settings",
     "about is no longer present in the outer menu")
-expect(main_items[1].text == "Upgrade to a fuller WeRead experience?" and main_items[1].keep_menu_open,
-    "introduction is first in the file-manager menu")
-main_items[1].callback()
-expect(shown_widget.title == "weread closed-source edition (search finlater on all platforms)",
-    "top-level introduction opens without requiring an account")
+expect(main_items[1].text == "Bookshelf",
+    "the file manager opens with the bookshelf action")
 for _, item in ipairs(main_items) do
     if item.text == "Search" or item.text == "Reading statistics" then
         expect(item.keep_menu_open == true,
@@ -334,8 +331,8 @@ expect(menu_has(main_items, "WeRead favorites"),
 host.ui.document = { file = "/books/local.epub" }
 host.detectWeReadBook = function() return nil end
 local local_reader_items = host:getMainMenuItems()
-expect(local_reader_items[1].text == "Upgrade to a fuller WeRead experience?",
-    "introduction stays first while reading a local book")
+expect(local_reader_items[1].text == "Bookshelf",
+    "the bookshelf is reachable while reading a local book")
 for _, item in ipairs(local_reader_items) do
     expect(not (item.text and item.text:find("(closed-source)", 1, true)),
         "reader menu does not include separate feature promotions")

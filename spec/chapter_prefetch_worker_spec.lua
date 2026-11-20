@@ -7,6 +7,12 @@ package.preload["weread.lib.content"] = function()
             calls[#calls + 1] = "reader"
             book.reader_url = "https://reader/book"
         end,
+        ensure_catalog = function(_client, _settings, book)
+            book.chapters = book.chapters or {
+                { chapterUid = "2", title = "Two" },
+            }
+            return book.chapters
+        end,
         create_download_workspace = function()
             calls[#calls + 1] = "workspace"
             return { path = "/tmp/work", incoming_dir = "/tmp/work/in",
@@ -31,6 +37,14 @@ package.preload["weread.lib.content"] = function()
                 [path] = { clean = true, chapters = { { chapterUid = "2" } } },
             }
             return path
+        end,
+        save_incremental_book_epub = function(_settings, book)
+            calls[#calls + 1] = "aggregate"
+            local path = "/tmp/cache/book/Book - offline.epub"
+            book.annotation_documents[path] = {
+                clean = true, chapters = { { chapterUid = "2" } },
+            }
+            return path, { "2" }
         end,
         cleanup_download_workspace = function()
             calls[#calls + 1] = "cleanup"
@@ -76,13 +90,14 @@ local Worker = require("weread.lib.chapter_prefetch_worker")
 local result = Worker.run(settings, {}, { book_id = "book" },
     { chapterUid = "2", title = "Two" }, context)
 
-assert(result.path == "/tmp/book-chapter.epub")
+assert(result.path == "/tmp/cache/book/Book - offline.epub")
+assert(result.cache_path == "/tmp/book-chapter.epub")
 assert(result.chapter_uid == "2" and result.cache_dir == "/tmp/cache/book")
 assert(result.annotation_document and result.annotation_document.clean)
 assert(result.auth and result.auth.wr_ticket == "renewed")
 assert(flushes == 0, "child worker must not flush parent LuaSettings")
 assert(table.concat(calls, ",")
-    == "reader,workspace,source,images,epub,cleanup")
+    == "reader,workspace,source,images,epub,aggregate,cleanup")
 assert(table.concat(progress, ",")
     == "reader,source,images,footnotes,epub")
 

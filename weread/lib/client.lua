@@ -317,7 +317,9 @@ function Client:request(opts)
     end
 
     local code = tonumber(raw_code)
-    if code and code >= 400 then
+    if opts.private_response and (not code or code >= 400) then
+        logger.warn("private annotation request failed:", "status=", tostring(code or "transport"))
+    elseif code and code >= 400 then
         log_response("HTTP response failed:", {
             method = req_opts.method,
             url = req_opts.url,
@@ -766,6 +768,74 @@ function Client:report_read(payload, referer)
     return self:post_json("https://weread.qq.com/web/book/read", payload, {
         referer = referer or "https://weread.qq.com/",
     })
+end
+
+-- All mutations use the existing reader login. A lost reply can follow a
+-- committed write, so the caller reconciles it before considering a retry.
+local function write_annotation(client, path, payload, context, id_field)
+    local ok, body, code = pcall(function()
+        return client:request{
+            url = "https://weread.qq.com/web/" .. path,
+            method = "POST",
+            headers = {
+                ["Content-Type"] = "application/json;charset=UTF-8",
+                Origin = "https://weread.qq.com",
+                Referer = WeRead.reader_url(context.bookId, context.chapterUid),
+            },
+            body = client:json_encode(payload),
+            timeout = { 10, 18 },
+            private_response = true,
+            persist_response_cookies = false,
+        }
+    end)
+    if not ok or not code or code >= 500 or code == 408 then return nil, "unknown" end
+    if code < 200 or code >= 300 then return nil, "rejected" end
+    local decoded, result = pcall(client.json_decode, client, body)
+    if not decoded or type(result) ~= "table" then return nil, "unknown" end
+    for _, node in ipairs({ result, result.data }) do
+        if type(node) ~= "table" then break end
+        local err = node.errCode or node.errcode
+        if (err ~= nil and tonumber(err) ~= 0)
+                or (node.succ ~= nil and node.succ ~= true and tonumber(node.succ) ~= 1) then
+            return nil, "rejected"
+        end
+    end
+    local data = type(result.data) == "table" and result.data or result
+    if id_field then
+        local id = data[id_field]
+        if (type(id) == "string" or type(id) == "number") and tostring(id) ~= ""
+                and tostring(id) ~= "0" then return tostring(id) end
+    elseif data.succ == true or tonumber(data.succ) == 1 then
+        return true
+    end
+    return nil, "unknown"
+end
+
+function Client:add_bookmark(p)
+    return write_annotation(self, "book/addBookmark", {
+        bookId = p.bookId, chapterUid = p.chapterUid, chapterIdx = p.chapterIdx,
+        bookVersion = p.bookVersion, range = p.range, type = 1,
+        style = p.style or 1, colorStyle = 0, markText = require("mime").b64(p.markText),
+    }, p, "bookmarkId")
+end
+
+function Client:add_private_review(p)
+    return write_annotation(self, "review/add", {
+        type = 1, isPrivate = 1, bookId = p.bookId, chapterUid = tostring(p.chapterUid),
+        chapterIdx = p.chapterIdx, bookVersion = p.bookVersion, range = p.range,
+        abstract = p.markText, content = p.content,
+    }, p, "reviewId")
+end
+
+function Client:remove_bookmark(id, context)
+    return write_annotation(self, "book/removeBookmark", { bookmarkId = id }, context)
+end
+
+function Client:remove_private_review(id, context)
+    return write_annotation(self, "review/delete", {
+        reviewId = id, bookId = context.bookId, chapterUid = context.chapterUid,
+        chapterIdx = context.chapterIdx, range = context.range, bookVersion = context.bookVersion,
+    }, context)
 end
 
 function Client:get_chapter_underlines(book_id, chapter_uid)

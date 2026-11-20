@@ -24,6 +24,7 @@ function ReaderState.extract(html, json_decode)
         book_id = book_info.bookId
             or html:match([["bookId"%s*:%s*"([^"]+)"]])
             or html:match([["bookId"%s*:%s*(%d+)]]),
+        book_version = tonumber(book_info.bookVersion or book_info.version or reader.bookVersion),
         title = book_info.title or html:match([["title"%s*:%s*"([^"]+)"]]),
         author = book_info.author or html:match([["author"%s*:%s*"([^"]+)"]]),
         psvts = reader.psvts or html:match([["psvts"%s*:%s*"([^"]+)"]]),
@@ -35,6 +36,7 @@ function ReaderState.extract(html, json_decode)
 end
 
 function ReaderState.apply_to_book(book, state)
+    book.book_version = state.book_version or book.book_version
     local current_chapter = state.current_chapter or {}
     local progress = state.progress or {}
     book.chapter_uid = current_chapter.chapterUid or progress.chapterUid or book.chapter_uid

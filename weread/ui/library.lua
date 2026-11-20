@@ -38,6 +38,9 @@ local local_cache_fields = {
     cached_file = true,
     cached_full_book = true,
     cached_chapters = true,
+    incremental_reader_file = true,
+    incremental_chapter_uids = true,
+    active_chapter_uid = true,
 }
 
 local function keep_local_cache(record)
@@ -842,6 +845,9 @@ function M:showBookMenu(book)
                     book.cached_file = nil
                     book.cached_full_book = nil
                     book.cached_chapters = nil
+                    book.incremental_reader_file = nil
+                    book.incremental_chapter_uids = nil
+                    book.active_chapter_uid = nil
                     book.cache_dir = nil
                     if view then UIManager:close(view) end
                     self:showBookMenu(book)
@@ -1460,6 +1466,100 @@ function M:openCachedBook(book)
     self:openFile(self:getFullBookCachePath(book))
 end
 
+function M:_gotoIncrementalChapter(book, chapter_uid, reader)
+    reader = reader or self.ui
+    local path = book and book.incremental_reader_file
+    local descriptor = path and book.annotation_documents
+        and book.annotation_documents[path]
+    local target_index
+    for index, item in ipairs(descriptor and descriptor.chapters or {}) do
+        if tostring(item.chapterUid or item.chapterId) == tostring(chapter_uid) then
+            target_index = index
+            break
+        end
+    end
+    local document = reader and reader.document
+    local ok, toc = false, nil
+    if document and document.getToc then
+        ok, toc = pcall(document.getToc, document)
+    end
+    local xpointer = ok and target_index and type(toc) == "table"
+        and toc[target_index] and toc[target_index].xpointer
+    if xpointer and reader.rolling and reader.rolling.onGotoXPointer then
+        reader.rolling:onGotoXPointer(xpointer)
+        return true
+    end
+    return false
+end
+
+function M:openCachedChapter(book, chapter, cache_path)
+    if type(book) ~= "table" or type(chapter) ~= "table"
+        or not file_exists(cache_path) then
+        self:showInfo(_("No cached file."))
+        return false
+    end
+    if type(book.chapters) ~= "table"
+        or #book.chapters == 0 then
+        local chapters = self:ensureChaptersLoaded(book)
+        if type(chapters) ~= "table" or #chapters == 0 then
+            self:showInfo(_("No chapters."))
+            return false
+        end
+    end
+
+    local reader_path = Content.incremental_reader_path(self.settings, book)
+    local activation_error
+    local chapter_uid = tostring(chapter.chapterUid or chapter.chapterId or "")
+    local function activate()
+        local path, err = Content.activate_chapter_epub(
+            self.settings, book, chapter, cache_path)
+        if not path then
+            activation_error = err or "could not activate cached chapter"
+            return false
+        end
+        local book_id = tostring(book.book_id or book.bookId or "")
+        if book_id ~= "" then
+            local books = self.settings:get("books", {})
+            local record = books[book_id] or book
+            record.incremental_reader_file = book.incremental_reader_file
+            record.incremental_chapter_uids = book.incremental_chapter_uids
+            record.active_chapter_uid = book.active_chapter_uid
+            record.annotation_documents = book.annotation_documents
+            record.cache_dir = book.cache_dir or record.cache_dir
+            books[book_id] = record
+            self.settings:set("books", books)
+            self.settings:flush()
+        end
+        return true
+    end
+
+    local current_file = self.ui and self.ui.document
+        and self.ui.document.file or nil
+    if current_file == reader_path and self.ui.reloadDocument then
+        self:closeWeReadUI()
+        self.ui:reloadDocument(function()
+            activate()
+        end, true, function(reader)
+            self:_gotoIncrementalChapter(book, chapter_uid, reader)
+        end)
+        if activation_error then
+            self:showInfo(T(_("Open cached chapter failed:\n%1"),
+                display_error(activation_error)))
+            return false
+        end
+        return true
+    end
+
+    if not activate() then
+        self:showInfo(T(_("Open cached chapter failed:\n%1"),
+            display_error(activation_error)))
+        return false
+    end
+    self._pending_incremental_chapter_uid = chapter_uid
+    self:openFile(reader_path)
+    return true
+end
+
 -- Read offline from the best available cache. A complete EPUB wins. Otherwise
 -- choose the cached chapter nearest to the last known chapter/progress, with a
 -- slight preference for the preceding chapter when distances are equal.
@@ -1487,7 +1587,9 @@ function M:openBookForReading(book)
             local uid = tostring(chapter.chapterUid or chapter.chapterId or index)
             local path = book.cached_chapters and book.cached_chapters[uid]
             if file_exists(path) then
-                candidates[#candidates + 1] = { index = index, path = path }
+                candidates[#candidates + 1] = {
+                    index = index, path = path, chapter = chapter,
+                }
             end
             if book.chapter_uid ~= nil
                 and uid == tostring(book.chapter_uid) then
@@ -1514,16 +1616,31 @@ function M:openBookForReading(book)
             if left_precedes ~= right_precedes then return left_precedes end
             return left.index < right.index
         end)
-        self:openFile(candidates[1].path)
-        return true
+        return self:openCachedChapter(
+            book, candidates[1].chapter, candidates[1].path)
     end
 
     local fallback_paths = {}
     for uid, path in pairs(book.cached_chapters or {}) do
-        if file_exists(path) then fallback_paths[#fallback_paths + 1] = { uid = tostring(uid), path = path } end
+        if file_exists(path) then
+            local chapter
+            for _, candidate in ipairs(chapters or {}) do
+                if tostring(candidate.chapterUid or candidate.chapterId) == tostring(uid) then
+                    chapter = candidate
+                    break
+                end
+            end
+            fallback_paths[#fallback_paths + 1] = {
+                uid = tostring(uid), path = path, chapter = chapter,
+            }
+        end
     end
     table.sort(fallback_paths, function(left, right) return left.uid < right.uid end)
     if fallback_paths[1] then
+        if fallback_paths[1].chapter then
+            return self:openCachedChapter(book, fallback_paths[1].chapter,
+                fallback_paths[1].path)
+        end
         self:openFile(fallback_paths[1].path)
         return true
     end
@@ -1536,7 +1653,7 @@ function M:openChapter(book, chapter, on_downloaded)
     local chapter_uid = chapter.chapterUid or chapter.chapterId
     local cached = book.cached_chapters and book.cached_chapters[tostring(chapter_uid)]
     if cached and file_exists(cached) then
-        self:openFile(cached)
+        self:openCachedChapter(book, chapter, cached)
     elseif self.downloader:promotePrefetch(book, chapter) then
         -- The downloader promotes the background task to a visible progress
         -- dialog and opens the chapter as soon as the same task completes.
