@@ -39,14 +39,19 @@ from `_meta.lua`. A custom output path may be passed as the first argument.
 
 ## Manual GitHub package / 手动打包
 
-Open **Actions → Release → Run workflow**. The optional `package_label` input
+Open **Actions → Release → Run workflow**. To publish from the fork, select
+`main` and enable `publish`. Both basic CI and the pinned KOReader integration
+run on the selected commit. After they pass, the workflow creates the stable
+release and uploads its ZIP and SHA-256 checksum when the version tag is new.
+
+Leave `publish` unchecked to build a preview. The optional `package_label` input
 controls the filename:
 
 - leave it empty to use the first eight characters of the selected commit ID;
 - enter a label such as `preview-1` to create
   `weread.koplugin-preview-1.zip`.
 
-A manual run validates the current version, builds the zip and SHA-256
+A preview run validates the current version, builds the zip and SHA-256
 checksum, and uploads them as two separate workflow artifacts retained for 14
 days. It does not create a tag or GitHub Release.
 

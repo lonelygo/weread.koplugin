@@ -3,6 +3,10 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
+      publish:
+        description: Publish a stable release from main after CI and KOReader integration pass
+        type: boolean
+        default: false
       package_label:
         description: Optional package label; defaults to the first 8 characters of the commit ID
         required: false
@@ -24,9 +28,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  basic-ci:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  koreader-integration:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/koreader-integration.yml
+    permissions:
+      contents: read
+
   package-and-release:
     name: Package plugin
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    needs: [basic-ci, koreader-integration]
+    if: |
+      always() && !cancelled() && (
+        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+        (github.event_name == 'workflow_dispatch' && (!inputs.publish ||
+          (needs.basic-ci.result == 'success' && needs.koreader-integration.result == 'success'))))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -39,6 +60,7 @@ jobs:
         id: version
         env:
           EVENT_NAME: ${{ github.event_name }}
+          PUBLISH: ${{ inputs.publish }}
           MANUAL_LABEL: ${{ inputs.package_label }}
           TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
@@ -58,7 +80,7 @@ jobs:
           automatic_release=false
           tag="v$current"
           package_label="$tag"
-          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_run" || "$PUBLISH" == "true" ]]; then
             if ! git rev-parse --verify --quiet "refs/tags/$tag"; then
               automatic_release=true
             fi
@@ -72,19 +94,21 @@ jobs:
 
           echo "current=$current"
           echo "automatic_release=$automatic_release"
-          echo "version=$current" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=weread.koplugin-$package_label" >> "$GITHUB_OUTPUT"
-          echo "archive=dist/weread.koplugin-$package_label.zip" >> "$GITHUB_OUTPUT"
-          echo "automatic_release=$automatic_release" >> "$GITHUB_OUTPUT"
-          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$current"
+            echo "tag=$tag"
+            echo "artifact_name=weread.koplugin-$package_label"
+            echo "archive=dist/weread.koplugin-$package_label.zip"
+            echo "automatic_release=$automatic_release"
+            echo "target_sha=$TARGET_SHA"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Explain existing release
         if: github.event_name == 'workflow_run' && steps.version.outputs.automatic_release != 'true'
         run: echo "Tag ${{ steps.version.outputs.tag }} already exists; no package was published."
 
       - name: Verify basic CI passed
-        if: steps.version.outputs.automatic_release == 'true'
+        if: github.event_name == 'workflow_run' && steps.version.outputs.automatic_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_SHA: ${{ steps.version.outputs.target_sha }}
