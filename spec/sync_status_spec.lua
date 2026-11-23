@@ -152,16 +152,21 @@ SyncStatus.invalidate(second_settings)
 assert(SyncStatus.get(second_plugin).last_confirmed_at == 1235,
     "second host instance did not reload the account confirmation")
 
-local unavailable = SyncStatus.get({
+local storage_ready = false
+local recovering_plugin = {
     settings = {
         data_dir = "/broken",
         get = settings.get,
     },
     library_db = { accountKey = function() return "broken" end,
-        offlineStatus = function() return { available = false } end },
-})
+        offlineStatus = function() return { available = storage_ready } end },
+}
+local unavailable = SyncStatus.get(recovering_plugin)
 assert(unavailable.state == "unavailable" and unavailable.signed_in,
     "storage failure was confused with signed-out state")
+storage_ready = true
+assert(SyncStatus.get(recovering_plugin).state == "idle",
+    "a temporary SQLite lock was cached after storage became readable")
 
 local function fixed_settings(user_vid)
     local own = { account = { user_vid = user_vid }, books = {} }

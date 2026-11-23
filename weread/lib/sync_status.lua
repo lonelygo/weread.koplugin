@@ -136,14 +136,14 @@ local function read_offline_status(plugin, entry)
     local library_db = plugin and plugin.library_db
     entry.offline = library_db and type(library_db.offlineStatus) == "function"
         and library_db:offlineStatus() or { available = false }
-    entry.offline_loaded = true
+    entry.offline_loaded = entry.offline.available == true
     return entry.offline
 end
 
 local function read_cached_progress(settings, id, entry)
     if not entry.progress_loaded then
         entry.pending_progress, entry.conflicts = read_progress_status(settings, id)
-        entry.progress_loaded = true
+        entry.progress_loaded = entry.pending_progress ~= nil
     end
     return entry.pending_progress, entry.conflicts
 end
@@ -240,7 +240,7 @@ function SyncStatus.noteAck(plugin, timestamp)
     local offline = type(plugin.library_db.offlineStatus) == "function"
         and plugin.library_db:offlineStatus() or { available = false }
     entry.offline = offline
-    entry.offline_loaded = true
+    entry.offline_loaded = offline.available == true
     if not offline.available or offline_work(offline) then
         request_refresh()
         return false
