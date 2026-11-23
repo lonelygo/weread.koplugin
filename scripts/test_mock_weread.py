@@ -45,7 +45,7 @@ class MockTests(unittest.TestCase):
 
     def setUp(self):
         self.request("/__control", dict(delay=0, match="", status=503, times=0,
-                                        empty_shelf=False, empty_annotations=False))
+                                        empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1))
 
     def test_contract_and_real_reference_decoder(self):
         status, shelf = self.gateway("/shelf/sync")
@@ -109,6 +109,30 @@ class MockTests(unittest.TestCase):
         self.assertNotIn(added["bookmarkId"], state["bookmarks"])
         self.assertNotIn(review["reviewId"], state["private_reviews"])
         self.assertEqual(self.request("/web/review/delete", dict(reviewId="unknown"))[0], 400)
+
+    def test_readonly_progress_probe_and_failure_do_not_mutate(self):
+        before = self.request("/__state")[1]
+        status, body = self.request("/web/book/getProgress?bookId=" + BOOK_ID)
+        self.assertEqual(status, 200)
+        self.assertIn("book", body)
+        self.request("/__control", dict(match="/web/book/getProgress", times=1, status=503))
+        self.assertEqual(self.request("/web/book/getProgress?bookId=" + BOOK_ID)[0], 503)
+        after = self.request("/__state")[1]
+        for key in ("progress", "read_reports", "annotation_writes", "bookmarks", "private_reviews"):
+            self.assertEqual(after[key], before[key])
+
+    def test_successful_probe_followed_by_failed_progress_sources(self):
+        before = self.request("/__state")[1]
+        self.request("/__control", dict(progress_successes_before_failure=1))
+        self.assertEqual(self.request("/web/book/getProgress?bookId=" + BOOK_ID)[0], 200)
+        self.assertEqual(self.gateway("/book/getprogress", bookId=BOOK_ID)[0], 503)
+        self.assertEqual(self.request("/web/book/getProgress?bookId=" + BOOK_ID)[0], 503)
+        after = self.request("/__state")[1]
+        self.assertEqual(after["read_reports"], before["read_reports"])
+        self.assertEqual(after["annotation_writes"], before["annotation_writes"])
+        self.request("/__control", dict(progress_successes_before_failure=-1))
+        self.assertEqual(self.gateway("/book/getprogress", bookId=BOOK_ID)[0], 200)
+        self.assertEqual(self.request("/web/book/getProgress?bookId=" + BOOK_ID)[0], 200)
 
     def test_fault_once_delay_and_recovery(self):
         self.request("/__control", dict(match="/book/info", times=1, status=503, delay=0.02))

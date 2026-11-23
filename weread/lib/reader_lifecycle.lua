@@ -247,6 +247,8 @@ function M:_offlineAnnotationCoordinator()
         worker = self.prefetch_worker,
         scheduler = UIManager,
         resolver = UploadPosition,
+        gate = function(kind, context) return self.offline_sync:gate(kind, context) end,
+        request_sync = function(reason, context) return self.offline_sync:request(reason, context) end,
         is_online = function() return self:isNetworkConnected() end,
         get_document = function()
             return self.ui and self.ui.document
@@ -316,20 +318,23 @@ function M:onCloseDocument()
     end
 
     self.read_report:on_close_document()
+    if self.offline_sync:deactivate() then
+        -- ReaderUI:showFileManager may reuse an existing manager.
+        local module = package.loaded["apps/filemanager/filemanager"]
+        local manager = type(module) == "table" and module.instance
+        if manager and manager.weread and manager.weread.offline_sync then
+            manager.weread.offline_sync:activate()
+        end
+    end
 end
 
 function M:onNetworkConnected()
     self:_captureLocalAnnotationSnapshot(nil)
-    if self.progress_sync and self.progress_sync.on_network_connected then
-        self.progress_sync:on_network_connected()
-    end
-    if self.read_report and self.read_report.on_network_connected then
-        self.read_report:on_network_connected()
-    end
-    local offline_annotations = self:_offlineAnnotationCoordinator()
-    if offline_annotations then
-        offline_annotations:on_network_connected()
-    end
+    self.offline_sync:request("network_connected")
+end
+
+function M:onNetworkDisconnected()
+    self.offline_sync:disconnected()
 end
 
 function M:showPrefetchNotice(text, timeout)
@@ -459,6 +464,7 @@ function M:stopReadReport(reason)
 end
 
 function M:onSuspend()
+    self.offline_sync:pause()
     if self._cancelUnifiedAnnotationSync then self:_cancelUnifiedAnnotationSync() end
     self._annotation_pending_prefetch = nil
     self.progress_sync:on_suspend()
@@ -466,6 +472,7 @@ function M:onSuspend()
 end
 
 function M:onResume()
+    self.offline_sync:resume()
     self.progress_sync:on_resume()
     self.read_report:on_resume()
 end
@@ -562,6 +569,34 @@ function M:getFullBookCachePath(book)
     return legacy
 end
 
+-- An incremental EPUB can contain several cached chapters. Its progress
+-- fraction is relative to the current chapter's TOC interval.
+function M:gotoProgressFraction(fraction, context)
+    local ui = self.ui
+    local document = ui and ui.document
+    if not document then return false, "document_unavailable" end
+    fraction = math.max(0, math.min(1, tonumber(fraction) or 0))
+    local book = context and context.book
+    if book and context.path and book.incremental_reader_file == context.path then
+        if document.file ~= context.path then return false, "document_changed" end
+        local _, _, _, bounds = self:getChapterInfoFromFile(book, context.path)
+        if not bounds or not bounds.start_page or not bounds.stop_page
+            or bounds.stop_page <= bounds.start_page then
+            return false, "chapter_pages_unavailable"
+        end
+        local page = math.min(bounds.stop_page - 1, bounds.start_page
+            + math.floor(fraction * (bounds.stop_page - bounds.start_page)))
+        if not ui.rolling or not ui.rolling.onGotoPage then return false, "reader_unavailable" end
+        return pcall(ui.rolling.onGotoPage, ui.rolling, page)
+    end
+    if ui.rolling and ui.rolling.onGotoPercent then
+        return pcall(ui.rolling.onGotoPercent, ui.rolling, fraction * 100)
+    end
+    return pcall(function()
+        ui:handleEvent(require("ui/event"):new("GotoPercent", fraction * 100))
+    end)
+end
+
 -- Retrieves chapter information for the given file path.
 --
 -- Parameters:
@@ -611,6 +646,8 @@ function M:getChapterInfoFromFile(book, file_path)
                 return index, chapter, false, {
                     incremental = true,
                     chapter_fraction = chapter_fraction,
+                    start_page = start_page,
+                    stop_page = stop_page,
                 }
             end
         end

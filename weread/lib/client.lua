@@ -659,13 +659,15 @@ function Client:get_progress(book_id)
     return self:gateway("/book/getprogress", { bookId = book_id })
 end
 
-function Client:get_web_progress(book_id)
+function Client:get_web_progress(book_id, options)
     local url = "https://weread.qq.com/web/book/getProgress?bookId="
         .. WeRead.urlencode(book_id)
         .. "&_=" .. tostring(os.time() * 1000)
     local text, code, headers = self:get_text(url, {
         accept = "application/json, text/plain, */*",
         referer = WeRead.reader_url(book_id),
+        timeout = options and options.timeout,
+        persist_response_cookies = options and options.persist_response_cookies,
     })
     return self:decode_http_json(text, {
         method = "GET",
@@ -673,6 +675,27 @@ function Client:get_web_progress(book_id)
         code = code,
         headers = headers,
     })
+end
+
+-- A saved Wi-Fi link or a captive portal can look connected to KOReader.
+-- Verify the normal read endpoint before claiming anything from the outbox.
+function Client:probe_sync(book_id)
+    local ok, response = pcall(self.get_web_progress, self, book_id, {
+        timeout = { 3, 6 }, persist_response_cookies = false,
+    })
+    if not ok or type(response) ~= "table" then return false end
+    local data = type(response.data) == "table" and response.data or response
+    local book = type(data.book) == "table" and data.book or data
+    local function rejected(node)
+        local err = node.errCode or node.errcode or node.errorCode
+        return (err ~= nil and tonumber(err) ~= 0)
+            or (node.succ ~= nil and node.succ ~= true and tonumber(node.succ) ~= 1)
+    end
+    local progress, chapter = tonumber(book.progress), tonumber(book.chapterUid)
+    return not rejected(response) and not rejected(data) and not rejected(book)
+        and (book.bookId == nil or tostring(book.bookId) == tostring(book_id))
+        and ((progress ~= nil and progress >= 0 and progress <= 100)
+            or (chapter ~= nil and chapter > 0))
 end
 
 -- Reading statistics detail.

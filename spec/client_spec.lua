@@ -380,4 +380,24 @@ end)
 expect(not ok and io.open(download_path .. ".part", "rb") == nil,
     "oversized file download did not remove its partial output")
 
+local probe_response
+local probe_client = setmetatable({
+    get_web_progress = function(_, book, options)
+        assert(book == "book" and options.timeout[2] == 6
+            and options.persist_response_cookies == false)
+        return probe_response
+    end,
+}, { __index = Client })
+probe_response = { data = { book = { bookId = "book", progress = 0 } } }
+expect(probe_client:probe_sync("book"), "a confirmed zero progress is a healthy service response")
+for _, invalid in ipairs({
+    {}, { succ = 0, progress = 2 }, { book = { errCode = -1, progress = 2 } },
+    { book = { bookId = "other", progress = 10 } }, { chapterUid = false }, "login page",
+}) do
+    probe_response = invalid
+    expect(not probe_client:probe_sync("book"), "an unrecognized response authorized a write")
+end
+probe_client.get_web_progress = function() error("503") end
+expect(not probe_client:probe_sync("book"), "a failed service probe authorized a write")
+
 print(("client_spec: %d checks"):format(checks))

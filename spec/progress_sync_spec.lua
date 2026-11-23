@@ -51,6 +51,7 @@ local function fixture(remote, options)
         },
     }
     local values = {
+        account = { user_vid = "100" },
         sync = {
             pull_on_open = true,
             upload_on_close = true,
@@ -78,6 +79,7 @@ local function fixture(remote, options)
     local choices = {}
     local uploads = {}
     local jumps = {}
+    local jump_contexts = {}
     local notifications = {}
     local client = {
         get_progress = function()
@@ -103,13 +105,15 @@ local function fixture(remote, options)
             callback()
             return true
         end,
+        request_sync = options.request_sync,
         upload_position = function(_book_id, position, elapsed)
             uploads[#uploads + 1] = position
             eq(elapsed, 0, "progress upload has zero reading time")
             return true, { accepted = true }
         end,
-        goto_fraction = function(fraction)
+        goto_fraction = function(fraction, navigation_context)
             jumps[#jumps + 1] = fraction
+            jump_contexts[#jump_contexts + 1] = navigation_context
             document.page = math.floor(fraction * 100 + 0.5)
             return true
         end,
@@ -144,12 +148,33 @@ local function fixture(remote, options)
         choices = choices,
         uploads = uploads,
         jumps = jumps,
+        jump_contexts = jump_contexts,
         notifications = notifications,
         queue = queue,
         step = step,
         drain = drain,
     }
 end
+
+test("request_sync delegates to the root coordinator when injected", function()
+    local requested
+    local completion = function() end
+    local f = fixture({}, {
+        request_sync = function(reason, context, done)
+            requested = { reason = reason, context = context, done = done }
+            return true
+        end,
+    })
+    eq(f.sync:request_sync("manual_sync", {
+        book_id = "book",
+        manual = true,
+    }, completion), true, "coordinator accepted request")
+    eq(requested.reason, "manual_sync", "request reason delegated")
+    eq(requested.context.book_id, "book", "request book delegated")
+    eq(requested.context.manual, true, "manual intent delegated")
+    eq(requested.done, completion, "completion callback delegated")
+    eq(#f.queue, 0, "delegated request bypasses local probe scheduling")
+end)
 
 test("page turns reuse word counts and document changes rebuild them", function()
     local word_reads = 0
@@ -278,6 +303,39 @@ test("page change uploads once on close", function()
         "successful upload clears pending snapshot")
 end)
 
+test("reconnect capture persists an open dirty page exactly once", function()
+    local f = fixture({})
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 40
+    f.sync:on_page_update()
+    local saved, reason = f.sync:capture_for_reconnect()
+    eq(saved, true, "dirty open page captured")
+    eq(reason, "captured", "first capture reason")
+    local identity = f.values.books.book.pending_upload_id
+    saved, reason = f.sync:capture_for_reconnect()
+    eq(saved, true, "same page remains pending")
+    eq(reason, "already_pending", "same page is not enqueued again")
+    eq(f.values.books.book.pending_upload_id, identity,
+        "same pending page keeps its conflict identity")
+end)
+
+test("reconnect capture respects disabled automatic progress upload", function()
+    local f = fixture({})
+    f.values.sync.pull_on_open = false
+    f.values.sync.upload_on_close = false
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 40
+    f.sync:on_page_update()
+    local saved, reason = f.sync:capture_for_reconnect()
+    eq(saved, false, "disabled automatic upload does not capture")
+    eq(reason, "upload_disabled", "disabled capture reason")
+    eq(f.values.books.book.pending_upload_position, nil,
+        "disabled automatic upload does not create a queue")
+end)
+
 test("remote choice jumps and verifies before reporting", function()
     local f = fixture({
         bookId = "book",
@@ -293,9 +351,28 @@ test("remote choice jumps and verifies before reporting", function()
     f.drain()
     eq(#f.jumps, 1, "one jump")
     eq(f.jumps[1], 0.5, "jump fraction")
+    eq(f.jump_contexts[1].book_id, "book", "jump receives reader context")
     eq(f.sync:status().verified, true, "remote choice verifies")
     local position = f.sync:position_for_report("book")
     eq(position.percent, 50, "report sees jumped position")
+end)
+
+test("closed-book cloud choice is applied on the next matching open", function()
+    local f = fixture({})
+    f.values.sync.pull_on_open = false
+    f.values.books.book.pending_remote_position = {
+        book_id = "book",
+        percent = 50,
+        chapter_uid = 33,
+        chapter_offset = 100,
+    }
+    f.values.books.book.pending_remote_account = "100"
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.jumps, 1, "saved cloud decision jumps once")
+    eq(f.jumps[1], 0.5, "saved cloud fraction")
+    eq(f.values.books.book.pending_remote_position, nil,
+        "successful saved cloud decision is consumed")
 end)
 
 test("busy read report is retried with the immutable snapshot", function()
@@ -604,9 +681,9 @@ test("queued automatic retry does not duplicate a manual conflict", function()
     online = true
     f.sync:sync_now()
     eq(#f.choices, 1, "manual sync opens one conflict")
-    f.step()
+    f.drain()
     eq(#f.choices, 1, "stale automatic retry does not reopen conflict")
-    eq(#f.queue, 0, "stale retry chain ends")
+    eq(#f.queue, 0, "stale retry and completion wake chains end")
 end)
 
 test("a fresh automatic pull replaces an older retry chain", function()

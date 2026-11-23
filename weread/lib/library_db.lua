@@ -399,6 +399,58 @@ function LibraryDB:readTimeStatus()
     return ok and status or { pending = 0, unknown = 0 }
 end
 
+-- Return the first book that has replayable offline work.  This intentionally
+-- excludes unknown writes: they may already have reached WeRead and must not
+-- be used to trigger a blind retry.  The query only reads indexed queue
+-- columns and does not decode payloads, so the coordinator can call it before
+-- deciding whether a network probe is worthwhile.
+function LibraryDB:pendingOfflineBook(include_time, include_annotations)
+    include_time = include_time ~= false
+    include_annotations = include_annotations ~= false
+    if not include_time and not include_annotations then return nil end
+
+    local queries = {}
+    if include_time then
+        queries[#queries + 1] = [[
+            SELECT book_id, 0 AS work_order, id AS item_order
+              FROM read_time_outbox
+             WHERE state='pending'
+        ]]
+    end
+    if include_annotations then
+        queries[#queries + 1] = [[
+            SELECT book_id, 1 AS work_order, updated_at AS item_order
+              FROM local_annotation_outbox
+             WHERE sync_state IN (
+                    'local_only','update_pending','delete_pending',
+                    'replace_delete_pending'
+                  )
+               AND upload_payload IS NOT NULL AND upload_payload<>''
+               AND (last_attempt_at=0 OR last_attempt_at<=strftime('%s','now')-60)
+        ]]
+    end
+
+    local db = self:open()
+    if not db then return nil end
+    local stmt
+    local book_id
+    local ok, err = pcall(function()
+        stmt = db:prepare("SELECT book_id FROM ("
+            .. table.concat(queries, " UNION ALL ")
+            .. ") ORDER BY work_order, item_order LIMIT 1")
+        local row = stmt:reset():step()
+        if row then book_id = tostring(row[1]) end
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if not ok then logger.warn("library_db pending work query failed:", err) end
+    return ok and book_id or nil
+end
+
+function LibraryDB:hasPendingOfflineWork(include_time, include_annotations)
+    return self:pendingOfflineBook(include_time, include_annotations) ~= nil
+end
+
 local function annotation_scalar(value)
     local kind = type(value)
     if kind == "string" or kind == "number" or kind == "boolean" then

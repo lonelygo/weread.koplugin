@@ -110,7 +110,7 @@ class MockServer(ThreadingHTTPServer):
         self.annotation_writes = []
         self.next_annotation_id = 1
         self.control = dict(delay=0, match="", status=503, times=0,
-                            empty_shelf=False, empty_annotations=False)
+                            empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1)
 
     def record(self, event):
         with self.lock:
@@ -132,6 +132,13 @@ class MockServer(ThreadingHTTPServer):
             fail = matches and control["times"] != 0
             if fail and control["times"] > 0:
                 self.control["times"] -= 1
+            progress_read = (method == "GET" and path == "/web/book/getProgress") or api == "/book/getprogress"
+            progress_budget = control["progress_successes_before_failure"]
+            if progress_read and not fail and progress_budget >= 0:
+                if progress_budget == 0:
+                    fail = True
+                else:
+                    self.control["progress_successes_before_failure"] -= 1
         if matches:
             time.sleep(control["delay"])
         if fail:
@@ -329,6 +336,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("delay must be 0..60 seconds")
             if type(candidate["times"]) is not int or candidate["times"] < -1:
                 raise ValueError("times must be -1 (always) or a non-negative integer")
+            if type(candidate["progress_successes_before_failure"]) is not int or candidate["progress_successes_before_failure"] < -1:
+                raise ValueError("progress_successes_before_failure must be -1 or a non-negative integer")
             if type(candidate["status"]) is not int or not 400 <= candidate["status"] <= 599:
                 raise ValueError("status must be 400..599")
             if not isinstance(candidate["match"], str):
@@ -389,7 +398,7 @@ def main():
     parser.add_argument("--koreader", type=Path, help="built KOReader runtime directory (not source root)")
     parser.add_argument("--log", type=Path, help="JSONL request log, without headers or private data")
     parser.add_argument("--smoke", action="store_true", help="run real KOReader offscreen smoke, save evidence, then exit")
-    parser.add_argument("--scenario", choices=("basic", "continuous", "offline", "reading"), default="basic",
+    parser.add_argument("--scenario", choices=("basic", "continuous", "offline", "reading", "unified", "chunks"), default="basic",
                         help="offscreen integration scenario (requires --smoke)")
     args = parser.parse_args()
     if bool(args.run_dir) != bool(args.koreader):
@@ -415,7 +424,7 @@ def main():
         log = args.run_dir / "evidence/smoke.log"
         try:
             with log.open("w") as out:
-                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua"}[args.scenario])],
+                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
                                         cwd=args.koreader, env=env, stdout=out, stderr=subprocess.STDOUT, timeout=180)
             if result.returncode == 0 and args.scenario == "basic":
                 full_books = list((args.run_dir / "profile/weread-mock/cache").rglob("* - full.epub"))

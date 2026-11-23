@@ -1,4 +1,3 @@
-local Event = require("ui/event")
 local logger = require("weread.lib.logger")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -12,6 +11,7 @@ local Integrations = require("integrations.init")
 local LibraryDB = require("weread.lib.library_db")
 local Mixin = require("weread.lib.mixin")
 local Migrations = require("weread.lib.migrations")
+local OfflineSync = require("weread.lib.offline_sync")
 local PluginUtil = require("weread.lib.plugin_util")
 local ProgressSync = require("weread.lib.progress_sync")
 local ProgressSyncDialog = require("weread.ui.progress_sync_dialog")
@@ -26,7 +26,7 @@ local _ = PluginUtil.tr
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
-    version = "1.8.0",
+    version = "1.8.1",
 }
 
 -- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
@@ -95,7 +95,15 @@ function WeReadPlugin:init()
         self.downloader:recover()
     end
     self.qr_login = QRLogin:new(self, self.client, self.settings)
+    self.offline_sync = OfflineSync:new(self, UIManager, BackgroundWorker:new{
+        temp_dir = self.settings.data_dir .. "/sync-probes",
+    })
+    local function request_sync(reason, context)
+        return self.offline_sync:request(reason, context)
+    end
     self.read_report = ReadReport:new{
+        gate = function(kind, context) return self.offline_sync:gate(kind, context) end,
+        request_sync = request_sync,
         settings = self.settings,
         client = self.client,
         library_db = self.library_db,
@@ -119,6 +127,7 @@ function WeReadPlugin:init()
         end,
     }
     self.progress_sync = ProgressSync:new{
+        request_sync = request_sync,
         settings = self.settings,
         client = self.client,
         scheduler = UIManager,
@@ -175,20 +184,8 @@ function WeReadPlugin:init()
             return self.read_report:upload_position(
                 book_id, position, elapsed_seconds)
         end,
-        goto_fraction = function(fraction)
-            local percent = math.floor(
-                math.max(0, math.min(1, tonumber(fraction) or 0))
-                    * 100 + 0.5)
-            return pcall(function()
-                if self.ui and self.ui.rolling
-                    and self.ui.rolling.onGotoPercent then
-                    self.ui.rolling:onGotoPercent(percent)
-                elseif self.ui then
-                    self.ui:handleEvent(Event:new("GotoPercent", percent))
-                else
-                    error("reader unavailable")
-                end
-            end)
+        goto_fraction = function(fraction, context)
+            return self:gotoProgressFraction(fraction, context)
         end,
         open_chapter = function(book, chapter)
             return self:openProgressTargetChapter(book, chapter)
@@ -207,6 +204,7 @@ function WeReadPlugin:init()
     self.ui.menu:registerToMainMenu(self)
     self.integrations = Integrations
     self.integrations.register(self)
+    self.offline_sync:activate()
     local read_report = self.settings:get("read_report")
     if read_report.enabled
         and read_report.mode == "manual"
@@ -215,11 +213,6 @@ function WeReadPlugin:init()
         self.read_report:maybe_start("plugin_start")
     end
     self._reader_session_gen = 0
-    -- On restart Wi-Fi may already be up, so KOReader need not emit another
-    -- NetworkConnected event. Resume pending work in the file manager too.
-    UIManager:scheduleIn(1, function()
-        if self:isNetworkConnected() then self:onNetworkConnected() end
-    end)
     self.updater:schedule_auto_check()
     logger.info("initialized:", "version=", self.version)
     updater:cleanup_backup()

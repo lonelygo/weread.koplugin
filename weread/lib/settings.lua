@@ -24,6 +24,7 @@ local defaults = {
     books = {},
     downloads = {},
     sync = {
+        heartbeat_minutes = 10,
         upload_annotations = true,
         pull_on_open = false,
         upload_on_close = false,
@@ -258,11 +259,12 @@ function Settings:get(key, default)
     return books
 end
 
-function Settings:set(key, value)
+function Settings:set(key, value, progress_book_id)
     if key == "books" and type(value) == "table" then
         local indexes = {}
         for book_id, book in pairs(value) do
-            local ok, index_or_err = BookStore.save(self, book_id, book)
+            local ok, index_or_err = BookStore.save(self, book_id, book,
+                progress_book_id ~= nil and tostring(progress_book_id) == tostring(book_id))
             if not ok then
                 error("Could not save book data: " .. tostring(index_or_err))
             end

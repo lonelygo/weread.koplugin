@@ -33,14 +33,29 @@ function ProgressSyncDialog.show_choice(context)
             percent(context.remote_position))
     end
 
-    UIManager:show(ConfirmBox:new{
+    local dialog
+    dialog = ConfirmBox:new{
         title = _("Reading progress sync"),
         text = message,
-        ok_text = _("Use WeRead progress"),
-        cancel_text = _("Keep KOReader progress"),
-        ok_callback = context.use_remote,
-        cancel_callback = context.keep_local,
-    })
+        ok_text = _("Keep KOReader progress"),
+        cancel_text = _("Use WeRead progress"),
+        ok_callback = context.keep_local,
+        cancel_callback = context.use_remote,
+        other_buttons = {{ {
+            text = _("Later"),
+            callback = context.later,
+        } }},
+    }
+    -- KOReader's ConfirmBox:onClose calls cancel_callback by default. Since
+    -- cancel is the explicit cloud choice here, Back and outside-tap must be
+    -- overridden to defer instead of silently selecting WeRead progress.
+    dialog.onClose = function(self)
+        context.later()
+        UIManager:close(self)
+        return true
+    end
+    UIManager:show(dialog)
+    return dialog
 end
 
 function ProgressSyncDialog.notify(code, data)

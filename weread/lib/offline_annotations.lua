@@ -36,6 +36,9 @@ function OfflineAnnotations:new(options)
         scheduler = assert(options.scheduler, "offline annotation scheduler required"),
         resolver = assert(options.resolver, "offline annotation resolver required"),
         is_online = options.is_online or function() return false end,
+        gate = options.gate,
+        request_sync = options.request_sync or function() end,
+        has_request_sync = type(options.request_sync) == "function",
         get_document = options.get_document or function() return nil end,
         get_book = options.get_book or function() return nil end,
         get_store = options.get_store or function() return nil end,
@@ -45,6 +48,58 @@ function OfflineAnnotations:new(options)
         object.library_db:recoverLocalAnnotationInflight(object.now() - 90)
     end
     return object
+end
+
+function OfflineAnnotations:_request_sync(reason, context)
+    local ok, err = pcall(self.request_sync, reason, context or {})
+    if not ok then logger.warn("annotation sync request failed:", tostring(err)) end
+end
+
+function OfflineAnnotations:_acquire_gate(book_id)
+    if self.network_lease ~= nil then return false, "annotation_inflight" end
+    local context = {
+        source = "offline_annotations",
+        operation = "annotation",
+        book_id = tostring(book_id or ""),
+    }
+    local allowed, lease_or_reason
+    if type(self.gate) == "function" then
+        local ok, first, second = pcall(self.gate, "annotation_write", context)
+        if not ok then
+            local denial = "gate_error:" .. tostring(first)
+            if self.last_gate_denial ~= denial then
+                self.last_gate_denial = denial
+                self:_request_sync("gate_error", context)
+            end
+            return false, tostring(first)
+        end
+        allowed, lease_or_reason = first == true, second
+    else
+        allowed = self.is_online() == true
+        lease_or_reason = allowed and true or "offline"
+    end
+    if not allowed then
+        local reason = lease_or_reason or "gate_denied"
+        local denial = tostring(book_id or "") .. ":" .. tostring(reason)
+        if self.last_gate_denial ~= denial then
+            self.last_gate_denial = denial
+            self:_request_sync(reason, context)
+        end
+        return false, reason
+    end
+    self.last_gate_denial = nil
+    self.network_lease = lease_or_reason or true
+    return true, self.network_lease
+end
+
+function OfflineAnnotations:_release_gate(lease, outcome)
+    if lease == nil then return end
+    if self.network_lease == lease then self.network_lease = nil end
+    if type(lease) == "function" then
+        pcall(lease, outcome)
+    elseif type(lease) == "table" and type(lease.release) == "function" then
+        pcall(lease.release, lease, outcome)
+    end
 end
 
 function OfflineAnnotations:capture(book_id, path, annotations, modified_items)
@@ -80,7 +135,12 @@ function OfflineAnnotations:capture(book_id, path, annotations, modified_items)
 
     local saved = self.library_db:putLocalAnnotationSnapshot(
         book_id, path, snapshot, { changed = modified })
-    if saved then self:wake() end
+    if saved and self:_has_pending() then
+        self:_request_sync("annotation_captured", {
+            source = "offline_annotations", book_id = book_id,
+        })
+        if not self.has_request_sync then self:wake() end
+    end
     return saved
 end
 
@@ -89,6 +149,7 @@ function OfflineAnnotations:status()
     return {
         counts = counts,
         busy = self.request ~= nil,
+        network_busy = self.network_lease ~= nil,
         unknown = (counts.unknown or 0)
             + (counts.delete_unknown or 0)
             + (counts.replace_delete_unknown or 0),
@@ -109,8 +170,7 @@ function OfflineAnnotations:_schedule_retry(delay)
     task = function()
         if self.retry_task ~= task then return end
         self.retry_task = nil
-        if self.settings:get("sync", {}).upload_annotations ~= false
-            and self.is_online() then
+        if self.settings:get("sync", {}).upload_annotations ~= false then
             self:wake()
         end
     end
@@ -120,6 +180,9 @@ function OfflineAnnotations:_schedule_retry(delay)
 end
 
 function OfflineAnnotations:_has_pending()
+    if type(self.library_db.hasPendingOfflineWork) == "function" then
+        return self.library_db:hasPendingOfflineWork(false, true)
+    end
     local counts = self.library_db:localAnnotationStatus()
     return (counts.local_only or 0) + (counts.update_pending or 0)
         + (counts.delete_pending or 0) + (counts.replace_delete_pending or 0) > 0
@@ -245,16 +308,28 @@ function OfflineAnnotations:wake()
         self:_cancel_retry()
         return false
     end
-    if self.request or not self.is_online() then
+    if self.request or self.network_lease ~= nil then
+        return false
+    end
+    self.library_db:recoverLocalAnnotationInflight(self.now() - 90)
+    if not self:_has_pending() then
+        self:_cancel_retry()
         return false
     end
     if self.worker:busy() then
         if self:_has_pending() then self:_schedule_retry(2) end
         return false
     end
-    self.library_db:recoverLocalAnnotationInflight(self.now() - 90)
+    local book_id = type(self.library_db.pendingOfflineBook) == "function"
+        and self.library_db:pendingOfflineBook(false, true) or nil
+    local allowed, lease_or_reason = self:_acquire_gate(book_id)
+    if not allowed then return false end
     local row = self.library_db:claimLocalAnnotationWork("offline-annotations")
     if not row then
+        self:_release_gate(lease_or_reason, {
+            accepted = false, write_attempted = false,
+            error_kind = "empty_queue",
+        })
         self:_cancel_retry()
         return false
     end
@@ -269,6 +344,21 @@ function OfflineAnnotations:wake()
         end,
         on_done = function(result)
             local delay = self:_finish(row, result)
+            local value = result and result.ok and result.value or nil
+            self:_release_gate(lease_or_reason, {
+                accepted = type(value) == "table" and value.accepted == true,
+                write_attempted = true,
+                error_kind = not (result and result.ok) and "task"
+                    or (type(value) == "table" and value.reason == "unknown"
+                        and "transport" or nil),
+                error = not (result and result.ok) and result.error
+                    or (type(value) == "table" and value.reason or nil),
+            })
+            if self:_has_pending() then
+                self:_request_sync("annotation_remaining", {
+                    source = "offline_annotations", book_id = row.book_id,
+                })
+            end
             self:_schedule_retry(delay or 1)
         end,
     }
@@ -279,11 +369,19 @@ function OfflineAnnotations:wake()
             last_error = request_or_error,
         })
         logger.info("annotation upload worker unavailable:", tostring(request_or_error))
+        self:_release_gate(lease_or_reason, {
+            accepted = false, write_attempted = false,
+            error_kind = "worker_unavailable", error = request_or_error,
+        })
         self:_schedule_retry(5)
         return false
     end
     self.request = request_or_error
     return true
+end
+
+function OfflineAnnotations:drain()
+    return self:wake()
 end
 
 function OfflineAnnotations:on_network_connected()

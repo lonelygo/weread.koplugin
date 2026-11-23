@@ -93,6 +93,41 @@ expect(loaded.title == "Metadata only"
     and loaded.progress == nil and loaded.mp_articles == nil,
     "removed split state reappeared after reload")
 
+-- A previously released version split the owner and position across files.
+local account = "bob"
+settings.get = function(_, key) if key == "account" then return { user_vid = account } end end
+local fake_json = require("json")
+local function write(path, value)
+    local file = assert(io.open(index.cache_dir .. "/" .. path, "wb"))
+    assert(file:write(fake_json.encode(value)))
+    file:close()
+end
+write("metadata.json", { book_id = "book/42", pending_upload_account = "alice",
+    pending_upload_id = "first", pending_upload_blocked = true })
+write("reading_state.json", { pending_upload_position = { percent = 15 } })
+loaded = BookStore.load(settings, "book/42", index)
+expect(not loaded.pending_upload_position, "legacy pending position leaked across logins")
+-- showBookRecord() retains only cache fields on account change.
+expect(BookStore.save(settings, "book/42", { cache_dir = index.cache_dir }), "shelf update failed")
+loaded = BookStore.load(settings, "book/42", index)
+loaded.pending_upload_position, loaded.pending_upload_account = { percent = 8 }, account
+expect(BookStore.save(settings, "book/42", loaded, true), "new account's position was not saved")
+account = "alice"
+loaded = BookStore.load(settings, "book/42", index)
+expect(loaded.pending_upload_position.percent == 15 and loaded.pending_upload_id == "first"
+    and loaded.pending_upload_blocked, "account switch lost original conflict identity or position")
+local stale_shelf_book = deepcopy(loaded)
+loaded.pending_upload_position, loaded.pending_upload_account = nil, nil
+loaded.pending_upload_blocked, loaded.pending_upload_id = nil, nil
+expect(BookStore.save(settings, "book/42", loaded, true), "ack failed")
+expect(BookStore.save(settings, "book/42", stale_shelf_book), "ordinary shelf refresh failed")
+expect(not BookStore.load(settings, "book/42", index).pending_upload_position,
+    "stale library record resurrected acknowledged work")
+account = "bob"
+expect(BookStore.load(settings, "book/42", index).pending_upload_position.percent == 8,
+    "acknowledging another account changed this account's position")
+os.remove(index.cache_dir .. "/reading_state.json")
+
 os.remove(index.cache_dir .. "/metadata.json")
 os.remove(index.cache_dir)
 os.remove(root)

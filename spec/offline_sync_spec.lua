@@ -20,6 +20,10 @@ local db = LibraryDB:new(settings)
 local first_path = db:databasePath()
 
 assert(db:enqueueReadTime("book", 65, { chapter_uid = 7, percent = 12 }))
+assert(db:hasPendingOfflineWork(true, false)
+    and db:pendingOfflineBook(true, false) == "book"
+    and not db:hasPendingOfflineWork(false, true),
+    "lightweight pending-work query did not isolate reading time")
 local first = assert(db:claimReadTime("test"))
 assert(first.elapsed_seconds == 30 and first.position.chapter_uid == 7,
     "reading time was not split into a 30-second positioned chunk")
@@ -37,6 +41,9 @@ assert(third.elapsed_seconds == 5,
 local time_status = db:readTimeStatus()
 assert(time_status.pending == 5 and time_status.unknown == 30,
     "reading-time status did not separate pending and uncertain seconds")
+assert(db:ackReadTime(assert(db:claimReadTime("test"))))
+assert(not db:hasPendingOfflineWork(true, false),
+    "unknown reading-time write incorrectly triggered a network probe")
 
 local annotations = {
     {
@@ -73,6 +80,9 @@ assert(db:putLocalAnnotationSnapshot("book", "/books/queue.epub", created, {
     changed = { ["ko:new"] = true },
 }))
 local work = assert(db:nextLocalAnnotationWork())
+assert(db:hasPendingOfflineWork(false, true)
+    and db:pendingOfflineBook(false, true) == "book",
+    "lightweight pending-work query did not find annotation work")
 assert(work.local_id == "ko:new" and work.sync_state == "local_only"
     and work.upload.range == "1-3",
     "newly created annotation did not enter the single-item upload queue")

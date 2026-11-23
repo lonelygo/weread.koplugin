@@ -225,6 +225,41 @@ end
 function M:getOfflineSyncMenuItems()
     return {
         {
+            text = _("Sync now"),
+            callback = self:safeCallback(_("Sync now"), function()
+                if not self:requireLogin(true, false) then return end
+                local book_id = self:detectWeReadBook()
+                if book_id and not WeRead.is_mp_book(book_id) then
+                    self.progress_sync:sync_now()
+                else
+                    self.offline_sync:request("manual_sync", { manual = true })
+                end
+            end),
+        },
+        {
+            text_func = function()
+                return T(_("Check connection every %1 min"), self.offline_sync:interval_seconds() / 60)
+            end,
+            sub_item_table_func = function()
+                local items = {}
+                for _, minutes in ipairs({ 1, 2, 5, 10, 30, 60 }) do
+                    table.insert(items, {
+                        text = T(_("%1 min"), minutes),
+                        checked_func = function() return self.offline_sync:interval_seconds() == minutes * 60 end,
+                        callback = function(menu)
+                            local preferences = self.settings:get("sync", {})
+                            preferences.heartbeat_minutes = minutes
+                            self.settings:set("sync", preferences)
+                            self.settings:flush()
+                            self.offline_sync:reschedule_heartbeat()
+                            if menu then menu:updateItems() end
+                        end,
+                    })
+                end
+                return items
+            end,
+        },
+        {
             text = _("Sync status"),
             keep_menu_open = true,
             callback = self:safeCallback(_("Sync status"), function()
@@ -243,7 +278,7 @@ function M:getOfflineSyncMenuItems()
                 for _, book in pairs(self.settings:get("books", {})) do
                     if account.user_vid and tostring(book.pending_upload_account) == tostring(account.user_vid)
                         and book.pending_upload_blocked then
-                        lines[#lines + 1] = T(_("Progress conflict: %1. Open the book and select Sync progress now."),
+                        lines[#lines + 1] = T(_("Progress conflict: %1. Select Sync now to review."),
                             book.title or book.book_id)
                     end
                 end
@@ -264,7 +299,7 @@ function M:getOfflineSyncMenuItems()
                 sync.upload_annotations = sync.upload_annotations == false
                 self.settings:set("sync", sync)
                 self.settings:flush()
-                if sync.upload_annotations and self:isNetworkConnected() then self:onNetworkConnected() end
+                if sync.upload_annotations then self.offline_sync:request("settings_changed") end
                 if menu then menu:updateItems() end
             end,
         },

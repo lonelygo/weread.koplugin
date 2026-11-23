@@ -85,6 +85,11 @@ python3 scripts/test_mock_weread.py
 | `WEREAD_START_CHAPTER=3` 配合 `--scenario continuous` | 从第三章起读，补下更早的章节，再检查原笔记对应的文本。 |
 | `--scenario offline` | 离线新建划线和笔记、重开、重连、编辑和删除，验证服务端收到的写入次数、文本范围与私密标志。 |
 | `--scenario reading` | 计时后休眠或关书，模拟手机继续阅读，再从文件管理器重连。核对实际上报秒数和云端进度。 |
+| `--scenario unified` | 保持断网、模拟服务端不可用，再恢复连接且省略联网事件。等待真实心跳回调，验证进度选择、时长、私密笔记和第二次离线阅读。 |
+
+分片回归使用 `--scenario chunks`。它推进可控的阅读时钟积累 65 秒，验证服务端按 30、30、5 秒确认，每次发送至少间隔 30 秒。
+
+统一同步场景通过 `WEREAD_SYNC_SURFACE=reader` 或 `filemanager` 选择读书中或关书后的界面。用 `WEREAD_SYNC_CHOICE=local`、`remote` 或 `default` 分别验证保留本地、采用云端和确认默认按钮。设置 `WEREAD_COMPARE_FAILURE=1` 可模拟首次探测成功后，读取进度时服务不可用。
 
 ## 划线想法专项回归
 
