@@ -60,7 +60,7 @@ config.show_annotations = false
 plugin.settings:set("cache", config)
 local sync = plugin.settings:get("sync")
 sync.upload_on_close = true
-sync.ask_on_conflict = os.getenv("WEREAD_SYNC_CHOICE") ~= "default"
+sync.ask_on_conflict = os.getenv("WEREAD_SYNC_CHOICE") ~= "auto"
 plugin.settings:set("sync", sync)
 local report_config = plugin.settings:get("read_report")
 report_config.enabled = true
@@ -111,7 +111,7 @@ local FileManager = require("apps/filemanager/filemanager")
 local Protocol = require("weread.lib.protocol")
 local choice = os.getenv("WEREAD_SYNC_CHOICE") or "local"
 local surface = os.getenv("WEREAD_SYNC_SURFACE") or "reader"
-assert(choice == "local" or choice == "remote" or choice == "default", "valid choice")
+assert(choice == "local" or choice == "remote" or choice == "default" or choice == "auto", "valid choice")
 local wake_calls = 0
 for _, name in ipairs({ "turnOnWifi", "enableWifi", "restoreWifiAsync", "turnOnWifiAndWaitForConnection", "promptWifiOn" }) do
     NetworkMgr[name] = function() wake_calls = wake_calls + 1; error("synchronization must not wake Wi-Fi") end
@@ -158,6 +158,9 @@ local function select_conflict()
     for _, entry in ipairs(UIManager._window_stack) do
         local widget = entry.widget
         local wanted = choice == "remote" and "Use WeRead progress" or "Keep KOReader progress"
+        if choice == "auto" and (widget.ok_text == wanted or widget.cancel_text == wanted) then
+            error("disabled conflict prompts must keep the local position automatically")
+        end
         if choice == "default" and widget.cancel_text == wanted then
             error("local choice must be the default primary button")
         end
@@ -259,7 +262,12 @@ end
 heartbeat()
 local selected = false
 wait_for("unified heartbeat drains queues", function()
-    if not selected then selected = select_conflict() or false end
+    if choice == "auto" then
+        select_conflict()
+        selected = true
+    elseif not selected then
+        selected = select_conflict() or false
+    end
     local state = api("/__state")
     return selected and #state.annotation_writes == 1
         and positive_seconds(state) >= expected_seconds
@@ -312,7 +320,12 @@ connected = true
 active():handleEvent(Event:new("NetworkConnected"))
 selected = false
 wait_for("second session sync after choice", function()
-    if not selected then selected = select_conflict() or false end
+    if choice == "auto" then
+        select_conflict()
+        selected = true
+    elseif not selected then
+        selected = select_conflict() or false
+    end
     local state = api("/__state")
     return #state.annotation_writes == 2
         and positive_seconds(state) >= positive_seconds(first) + second_pending

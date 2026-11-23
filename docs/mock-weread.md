@@ -89,7 +89,7 @@ python3 scripts/test_mock_weread.py
 
 分片回归使用 `--scenario chunks`。它推进可控的阅读时钟积累 65 秒，验证服务端按 30、30、5 秒确认，每次发送至少间隔 30 秒。
 
-统一同步场景通过 `WEREAD_SYNC_SURFACE=reader` 或 `filemanager` 选择读书中或关书后的界面。用 `WEREAD_SYNC_CHOICE=local`、`remote` 或 `default` 分别验证保留本地、采用云端和确认默认按钮。设置 `WEREAD_COMPARE_FAILURE=1` 可模拟首次探测成功后，读取进度时服务不可用。
+统一同步场景通过 `WEREAD_SYNC_SURFACE=reader` 或 `filemanager` 选择读书中或关书后的界面。用 `WEREAD_SYNC_CHOICE=local`、`remote`、`default` 或 `auto` 分别验证保留本地、采用云端、确认默认按钮和关闭冲突提示后自动保留本地。设置 `WEREAD_COMPARE_FAILURE=1` 可模拟首次探测成功后，读取进度时服务不可用。
 
 ## 划线想法专项回归
 
