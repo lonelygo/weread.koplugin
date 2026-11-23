@@ -263,30 +263,7 @@ function M:getOfflineSyncMenuItems()
             text = _("Sync status"),
             keep_menu_open = true,
             callback = self:safeCallback(_("Sync status"), function()
-                local time = self.library_db:readTimeStatus()
-                local states = self.library_db:localAnnotationStatus()
-                local unknown = (states.unknown or 0) + (states.delete_unknown or 0)
-                    + (states.replace_delete_unknown or 0)
-                local pending = (states.local_only or 0) + (states.update_pending or 0)
-                    + (states.delete_pending or 0) + (states.replace_delete_pending or 0)
-                    + (states.inflight or 0)
-                local lines = {
-                    T(_("Reading time pending: %1 s"), time.pending),
-                    T(_("Highlights and notes pending: %1"), pending),
-                }
-                local account = self.settings:get("account", {})
-                for _, book in pairs(self.settings:get("books", {})) do
-                    if account.user_vid and tostring(book.pending_upload_account) == tostring(account.user_vid)
-                        and book.pending_upload_blocked then
-                        lines[#lines + 1] = T(_("Progress conflict: %1. Select Sync now to review."),
-                            book.title or book.book_id)
-                    end
-                end
-                if time.unknown > 0 or unknown > 0 then
-                    lines[#lines + 1] = T(_("Unconfirmed by WeRead: %1 s, %2 annotations"), time.unknown, unknown)
-                    lines[#lines + 1] = _("Check these records in WeRead.")
-                end
-                self:showInfo(table.concat(lines, "\n"))
+                self:showOfflineSyncStatus()
             end),
         },
         {

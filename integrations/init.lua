@@ -4,6 +4,7 @@ local logger = require("weread.lib.logger")
 
 local Integrations = {}
 local modules = {
+    require("integrations.simpleui"),
     require("integrations.zenui"),
 }
 
@@ -15,6 +16,20 @@ function Integrations.register(plugin)
         if not ok then
             logger.warn("weread: failed to register integration:",
                 integration.name, tostring(err))
+        end
+    end
+end
+
+function Integrations.refreshSyncStatus()
+    for _i, integration in ipairs(modules) do
+        if integration.refresh then
+            local ok, err = pcall(function()
+                integration:refresh()
+            end)
+            if not ok then
+                logger.warn("weread: integration refresh failed:",
+                    integration.name, tostring(err))
+            end
         end
     end
 end

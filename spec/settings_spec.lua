@@ -65,6 +65,14 @@ end
 
 local saved_books = {}
 local minimal_index_checked = false
+local account_invalidations = 0
+package.preload["weread.lib.sync_status"] = function()
+    return {
+        invalidateAccount = function()
+            account_invalidations = account_invalidations + 1
+        end,
+    }
+end
 package.preload["weread.lib.book_store"] = function()
     return {
         load = function(_settings, book_id, index)
@@ -193,10 +201,13 @@ expect(values.device_fingerprint == fingerprint and flush_count == before_finger
 expect(Settings:new():get_device_fingerprint() == fingerprint and random_reads == 1,
     "reopening settings should reuse the existing fingerprint")
 
+local invalidations_before_reset = account_invalidations
 settings:reset_account()
 expect(values.api_key == "" and next(values.cookies) == nil
     and values.account.name == "",
     "account reset left credentials behind")
+expect(account_invalidations == invalidations_before_reset + 1,
+    "account reset did not invalidate the mounted sync status")
 expect(settings:get_device_fingerprint() == fingerprint and random_reads == 1,
     "logout must not rotate the device fingerprint")
 

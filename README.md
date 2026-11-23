@@ -67,9 +67,17 @@ koreader/plugins/weread.koplugin/
 
 ## SimpleUI / Zen_UI 集成
 
-插件提供统一的“微信读书书架”入口并支持集成到 SimpleUI和 ZenUI的快捷按钮中。(需要安装最新版 [SimpleUI](https://github.com/doctorhetfield-cmd/simpleui.koplugin) 和 [ZenUI](https://github.com/AnthonyGress/zen_ui.koplugin)插件)。
+**SimpleUI 首页同步状态（v1.8.2）。** 在 SimpleUI 3.1.0 上，升级并重启 KOReader 后，插件首次会在「正在阅读」书卡所在行的下方加入「微信读书同步状态」。点书卡继续阅读，点状态行查看这个账号在本机的待传进度、阅读时长、划线和私密笔记。查看详情可以离线完成。
 
-- **SimpleUI**：进入 `快捷操作` 新建操作，类型选择 `插件 → 微信读书`，再把该操作加入底部栏即可。如需使用本项目图标，将 `icons/weread-w-book.svg` 或 `icons/weread-ink.png` 复制到 SimpleUI 的自定义图标目录`koreader/setting/simpleui/sui_icons`后，在快捷操作中选中它。
+有记录待传时会显示「待传 8 分钟 · 2 条标注」。需要选择阅读进度或核对上报结果时，首页会优先提示。本轮待办全部获确认后显示「已同步」和确认时间。首次使用或从旧版升级时，空队列显示「暂无待传记录」。
+
+在 SimpleUI 的 **设置 → 主页 → 编辑主页布局** 中，可以移动或移除状态行。首页没有启用「正在阅读」时，也可在这里选择 **添加模块 → 附加功能 → 微信读书同步状态** 放到喜欢的位置。原生 KOReader 可通过 **工具 → 微信读书 → 离线同步 → 同步状态** 查看同一份详情。[SimpleUI 首页布局说明](https://github.com/doctorhetfield-cmd/simpleui.koplugin/blob/3.1.0/docs/HOME_SCREEN.md)
+
+| 书卡下方的同步状态 | 点开后的详情 |
+| --- | --- |
+| <img src="screenshots/simpleui-sync-home.png" width="240" alt="正在阅读书卡下显示待传时长和标注数量"> | <img src="screenshots/simpleui-sync-details.png" width="240" alt="当前账号的阅读时长、标注和进度明细"> |
+
+- **SimpleUI 书架快捷按钮**：进入 `快捷操作` 新建操作，类型选择 `插件 → 微信读书`，再把该操作加入底部栏即可。如需使用本项目图标，将 `icons/weread-w-book.svg` 或 `icons/weread-ink.png` 复制到 SimpleUI 的自定义图标目录`koreader/setting/simpleui/sui_icons`后，在快捷操作中选中它。
 - **Zen_UI 底栏**：进入 `控件 → 按钮 → ➕ → 插件 → 微信读书`，点击后直接打开微信读书书架。注册时会把 `weread-w-book.svg` 同步到 KOReader 用户图标目录，供 ZenUI 自动匹配或手动选择；不会自动修改、添加或启用 Tab。
 - **Zen_UI 首页**：进入 `主页 → 小组件`，启用“微信读书”组件。组件默认关闭，可由用户自行排序。
 

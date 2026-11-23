@@ -998,7 +998,10 @@ function ReadReport:_apply_queued_outcome(queued, outcome)
     end
     if queued and self.library_db then
         if accepted and type(self.library_db.ackReadTime) == "function" then
-            self.library_db:ackReadTime(queued)
+            local acknowledged = self.library_db:ackReadTime(queued)
+            if acknowledged then
+                require("weread.lib.sync_status").noteAck(self, self.now())
+            end
         elseif (type(outcome) ~= "table"
                 or outcome.error_kind == "transport"
                 or outcome.error_kind == "job"

@@ -66,6 +66,7 @@ function ProgressSync:new(options)
 
     local object = {
         settings = options.settings,
+        library_db = options.library_db,
         client = options.client,
         scheduler = options.scheduler,
         get_document = options.get_document,
@@ -136,6 +137,13 @@ function ProgressSync:_clear_pending_if_matches(book_id, identity, patch)
     patch.pending_upload_decision = false
     patch.pending_upload_retry_after = false
     return self:_persist(book_id, patch)
+end
+
+function ProgressSync:_note_sync_ack()
+    require("weread.lib.sync_status").noteAck({
+        settings = self.settings,
+        library_db = self.library_db,
+    }, self.now())
 end
 
 function ProgressSync:_save_pending(position, reason)
@@ -214,6 +222,12 @@ function ProgressSync:_persist(book_id, patch)
     books[book_id] = book
     self.settings:set("books", books, book_id)
     self.settings:flush()
+    for key in pairs(patch) do
+        if tostring(key):match("^pending_upload_") then
+            require("weread.lib.sync_status").invalidateProgress(self.settings)
+            break
+        end
+    end
     return true
 end
 
@@ -539,6 +553,7 @@ function ProgressSync:_upload_snapshot(position, reason, show_result, options)
                 self.state = "verified"
                 self.dirty = false
                 self.last_uploaded_position = copy(position)
+                self:_note_sync_ack()
             else
                 self.state = "pending_reconcile"
             end
@@ -1243,6 +1258,7 @@ function ProgressSync:_present_pending_conflict(candidate, remote, relation)
                 remote_patch
             )
             if not cleared then return false end
+            self:_note_sync_ack()
             continue_sync("remote_choice_finished", true)
             return true
         end,
@@ -1366,11 +1382,12 @@ function ProgressSync:reconcile_pending(done, options)
         local relation = PositionMapper.compare(selected.position, remote,
             SOURCE_CONFLICT_THRESHOLD_PERCENT)
         if relation == "same" and remote.conflict ~= true then
-            self:_clear_pending_if_matches(selected.book_id, selected.identity, {
+            local cleared = self:_clear_pending_if_matches(selected.book_id, selected.identity, {
                 last_local_position = selected.position,
                 last_remote_position = remote,
                 last_sync_error = false,
             })
+            if cleared then self:_note_sync_ack() end
             self.state = "verified"
             finish({ status = "synced", book_id = selected.book_id })
             self:request_sync("matching_progress_finished")

@@ -26,7 +26,7 @@ local _ = PluginUtil.tr
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
-    version = "1.8.1",
+    version = "1.8.2",
 }
 
 -- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
@@ -129,6 +129,7 @@ function WeReadPlugin:init()
     self.progress_sync = ProgressSync:new{
         request_sync = request_sync,
         settings = self.settings,
+        library_db = self.library_db,
         client = self.client,
         scheduler = UIManager,
         get_document = function()
@@ -221,6 +222,7 @@ end
 Mixin.apply(WeReadPlugin, {
     (require("weread.ui.common")),
     (require("weread.ui.menu")),
+    (require("weread.ui.sync_status")),
     (require("weread.ui.cache")),
     (require("weread.ui.read_report")),
     (require("weread.ui.library")),

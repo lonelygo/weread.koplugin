@@ -13,6 +13,11 @@ end
 local LibraryDB = {}
 LibraryDB.__index = LibraryDB
 
+local function status_changed(self)
+    local ok, SyncStatus = pcall(require, "weread.lib.sync_status")
+    if ok then SyncStatus.invalidateOffline(self.settings) end
+end
+
 local function getSQ3()
     local ok, SQ3 = pcall(require, "lua-ljsqlite3/init")
     return ok and SQ3 or nil
@@ -36,6 +41,13 @@ end
 
 local function close_statement(stmt)
     if stmt then pcall(function() stmt:close() end) end
+end
+
+local function changed_rows(db)
+    local stmt = db:prepare("SELECT changes()")
+    local row = stmt:reset():step()
+    close_statement(stmt)
+    return row and tonumber(row[1]) or 0
 end
 
 function LibraryDB:new(settings)
@@ -152,6 +164,12 @@ function LibraryDB:open()
                 , claimed_at    INTEGER NOT NULL DEFAULT 0
             ) WITHOUT ROWID
         ]])
+        db:exec([[
+            CREATE TABLE IF NOT EXISTS sync_status_meta (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            ) WITHOUT ROWID
+        ]])
         pcall(function()
             db:exec("ALTER TABLE local_annotation_outbox ADD COLUMN replacement_id TEXT NOT NULL DEFAULT ''")
         end)
@@ -215,7 +233,8 @@ function LibraryDB:enqueueReadTime(book_id, elapsed_seconds, position)
     close_statement(stmt)
     if not ok and transaction_open then pcall(function() db:exec("ROLLBACK") end) end
     pcall(function() db:close() end)
-    if not ok then logger.warn("library_db read time write failed:", err) end
+    if not ok then logger.warn("library_db read time write failed:", err)
+    else status_changed(self) end
     return ok
 end
 
@@ -303,17 +322,28 @@ function LibraryDB:ackReadTime(item)
     local db = claim_database(self, item)
     if not db then return false end
     local stmt
+    local transaction_open = false
+    local affected = 0
     local ok, err = pcall(function()
+        db:exec("BEGIN IMMEDIATE")
+        transaction_open = true
         stmt = db:prepare([[
             DELETE FROM read_time_outbox
              WHERE id=? AND state='claimed' AND claim_token=?
         ]])
         stmt:reset():bind(tonumber(item.id), tostring(item.claim_token)):step()
+        close_statement(stmt)
+        stmt = nil
+        affected = changed_rows(db)
+        db:exec("COMMIT")
+        transaction_open = false
     end)
     close_statement(stmt)
+    if not ok and transaction_open then pcall(function() db:exec("ROLLBACK") end) end
     pcall(function() db:close() end)
-    if not ok then logger.warn("library_db read time ack failed:", err) end
-    return ok
+    if not ok then logger.warn("library_db read time ack failed:", err)
+    elseif affected == 1 then status_changed(self) end
+    return ok and affected == 1
 end
 
 -- An ambiguous write may already have reached the server. Quarantine it rather
@@ -322,6 +352,7 @@ function LibraryDB:quarantineReadTime(item, err)
     local db = claim_database(self, item)
     if not db then return false end
     local stmt
+    local affected = 0
     local ok, write_err = pcall(function()
         stmt = db:prepare([[
             UPDATE read_time_outbox
@@ -330,17 +361,22 @@ function LibraryDB:quarantineReadTime(item, err)
         ]])
         stmt:reset():bind(tostring(err or "unknown"), tonumber(item.id),
             tostring(item.claim_token)):step()
+        close_statement(stmt)
+        stmt = nil
+        affected = changed_rows(db)
     end)
     close_statement(stmt)
     pcall(function() db:close() end)
-    if not ok then logger.warn("library_db read time quarantine failed:", write_err) end
-    return ok
+    if not ok then logger.warn("library_db read time quarantine failed:", write_err)
+    elseif affected == 1 then status_changed(self) end
+    return ok and affected == 1
 end
 
 function LibraryDB:releaseReadTimeClaim(item)
     local db = claim_database(self, item)
     if not db then return false end
     local stmt
+    local affected = 0
     local ok = pcall(function()
         stmt = db:prepare([[
             UPDATE read_time_outbox
@@ -348,9 +384,81 @@ function LibraryDB:releaseReadTimeClaim(item)
              WHERE id=? AND state='claimed' AND claim_token=?
         ]])
         stmt:reset():bind(tonumber(item.id), tostring(item.claim_token)):step()
+        close_statement(stmt)
+        stmt = nil
+        affected = changed_rows(db)
     end)
     close_statement(stmt)
     pcall(function() db:close() end)
+    if ok and affected == 1 then status_changed(self) end
+    return ok and affected == 1
+end
+
+function LibraryDB:offlineStatus()
+    local db = self:open()
+    if not db then return { available = false, annotations = {} } end
+    local result = {
+        available = true, pending_seconds = 0, unknown_seconds = 0,
+        annotations = {}, last_confirmed_at = nil,
+    }
+    local time_stmt, annotation_stmt, meta_stmt
+    local ok, err = pcall(function()
+        time_stmt = db:prepare([[
+            SELECT state, COALESCE(SUM(elapsed_seconds), 0)
+              FROM read_time_outbox GROUP BY state
+        ]])
+        local row = time_stmt:reset():step()
+        while row do
+            local state, seconds = tostring(row[1]), tonumber(row[2]) or 0
+            if state == "pending" or state == "claimed" then
+                result.pending_seconds = result.pending_seconds + seconds
+            elseif state == "unknown" then
+                result.unknown_seconds = result.unknown_seconds + seconds
+            end
+            row = time_stmt:step()
+        end
+        annotation_stmt = db:prepare([[
+            SELECT sync_state, COUNT(*) FROM local_annotation_outbox
+             GROUP BY sync_state
+        ]])
+        row = annotation_stmt:reset():step()
+        while row do
+            result.annotations[tostring(row[1])] = tonumber(row[2]) or 0
+            row = annotation_stmt:step()
+        end
+        meta_stmt = db:prepare([[
+            SELECT value FROM sync_status_meta WHERE name='last_confirmed_at'
+        ]])
+        row = meta_stmt:reset():step()
+        result.last_confirmed_at = row and tonumber(row[1]) or nil
+    end)
+    close_statement(time_stmt)
+    close_statement(annotation_stmt)
+    close_statement(meta_stmt)
+    pcall(function() db:close() end)
+    if not ok then
+        logger.warn("library_db offline status read failed:", err)
+        return { available = false, annotations = {} }
+    end
+    return result
+end
+
+function LibraryDB:setSyncLastConfirmedAt(timestamp)
+    local db = self:open()
+    if not db then return false end
+    local stmt
+    local ok, err = pcall(function()
+        stmt = db:prepare([[
+            INSERT INTO sync_status_meta (name, value)
+            VALUES ('last_confirmed_at', ?)
+            ON CONFLICT(name) DO UPDATE SET value=excluded.value
+        ]])
+        stmt:reset():bind(math.floor(tonumber(timestamp) or os.time())):step()
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if not ok then logger.warn("library_db sync timestamp write failed:", err)
+    else status_changed(self) end
     return ok
 end
 
@@ -358,6 +466,7 @@ function LibraryDB:recoverStaleReadTimeClaims(cutoff)
     local db = self:open()
     if not db then return false end
     local stmt
+    local affected = 0
     local ok = pcall(function()
         stmt = db:prepare([[
             UPDATE read_time_outbox
@@ -366,9 +475,13 @@ function LibraryDB:recoverStaleReadTimeClaims(cutoff)
              WHERE state='claimed' AND claimed_at<=?
         ]])
         stmt:reset():bind(tonumber(cutoff) or 0):step()
+        close_statement(stmt)
+        stmt = nil
+        affected = changed_rows(db)
     end)
     close_statement(stmt)
     pcall(function() db:close() end)
+    if ok and affected > 0 then status_changed(self) end
     return ok
 end
 
@@ -705,7 +818,8 @@ function LibraryDB:putLocalAnnotationSnapshot(book_id, document_path, annotation
     close_statement(stmt)
     if not ok and transaction_open then pcall(function() db:exec("ROLLBACK") end) end
     pcall(function() db:close() end)
-    if not ok then logger.warn("library_db annotation snapshot write failed:", err) end
+    if not ok then logger.warn("library_db annotation snapshot write failed:", err)
+    else status_changed(self) end
     return ok
 end
 
@@ -841,6 +955,7 @@ end
 function LibraryDB:recoverLocalAnnotationInflight(cutoff)
     local db = self:open()
     if not db then return false end
+    local affected = 0
     local ok, err = pcall(function()
         local stmt = db:prepare([[
             UPDATE local_annotation_outbox
@@ -850,9 +965,11 @@ function LibraryDB:recoverLocalAnnotationInflight(cutoff)
         ]])
         stmt:reset():bind(tonumber(cutoff) or 0):step()
         stmt:close()
+        affected = changed_rows(db)
     end)
     pcall(function() db:close() end)
-    if not ok then logger.warn("library_db annotation inflight recovery failed:", err) end
+    if not ok then logger.warn("library_db annotation inflight recovery failed:", err)
+    elseif affected > 0 then status_changed(self) end
     return ok
 end
 
@@ -864,14 +981,28 @@ function LibraryDB:updateLocalAnnotationWork(local_id, patch)
     if not db then return false end
     local current_stmt
     local write_stmt
+    local transaction_open = false
+    local updated = false
     local ok, err = pcall(function()
+        db:exec("BEGIN IMMEDIATE")
+        transaction_open = true
         current_stmt = db:prepare("SELECT " .. ANNOTATION_OUTBOX_COLUMNS
             .. " FROM local_annotation_outbox WHERE local_id=?")
         local current = annotation_outbox_row(
             current_stmt:reset():bind(tostring(id or "")):step())
-        if not current then return end
+        close_statement(current_stmt)
+        current_stmt = nil
+        if not current then
+            db:exec("COMMIT")
+            transaction_open = false
+            return
+        end
         if claim and (current.sync_state ~= "inflight"
-            or current.claim_token ~= claim.claim_token) then return end
+            or current.claim_token ~= claim.claim_token) then
+            db:exec("COMMIT")
+            transaction_open = false
+            return
+        end
         local state = patch.sync_state or current.sync_state
         local remote_id = patch.remote_id
         if remote_id == nil then remote_id = current.remote_id end
@@ -882,35 +1013,67 @@ function LibraryDB:updateLocalAnnotationWork(local_id, patch)
         local present = patch.present
         if present == nil then present = current.present end
         if patch.delete == true then
-            write_stmt = db:prepare([[
-                DELETE FROM local_annotation_outbox
-                 WHERE local_id=? AND (?='' OR claim_token=? AND sync_state='inflight')
-            ]])
-            local token = claim and claim.claim_token or ""
-            write_stmt:reset():bind(current.local_id, token, token):step()
-            return
+            if claim then
+                write_stmt = db:prepare([[
+                    DELETE FROM local_annotation_outbox
+                     WHERE local_id=? AND claim_token=? AND sync_state='inflight'
+                ]])
+                write_stmt:reset():bind(current.local_id, claim.claim_token):step()
+            else
+                write_stmt = db:prepare([[
+                    DELETE FROM local_annotation_outbox WHERE local_id=?
+                ]])
+                write_stmt:reset():bind(current.local_id):step()
+            end
+            close_statement(write_stmt)
+            write_stmt = nil
+            updated = changed_rows(db) == 1
+        else
+            local sql = [[
+                UPDATE local_annotation_outbox
+                   SET present=?, sync_state=?, remote_id=?, remote_kind=?,
+                       replacement_id=?, last_attempt_at=?, last_error=?,
+                       claim_token='', claimed_at=0
+                 WHERE local_id=?
+            ]]
+            if claim then
+                sql = sql .. " AND claim_token=? AND sync_state='inflight'"
+            end
+            write_stmt = db:prepare(sql)
+            if claim then
+                write_stmt:reset():bind(
+                    present and 1 or 0,
+                    tostring(state), tostring(remote_id or ""),
+                    tostring(remote_kind or ""),
+                    tostring(replacement_id or ""),
+                    tonumber(patch.last_attempt_at) or os.time(),
+                    tostring(patch.last_error or ""), current.local_id,
+                    claim.claim_token
+                ):step()
+            else
+                write_stmt:reset():bind(
+                    present and 1 or 0,
+                    tostring(state), tostring(remote_id or ""),
+                    tostring(remote_kind or ""),
+                    tostring(replacement_id or ""),
+                    tonumber(patch.last_attempt_at) or os.time(),
+                    tostring(patch.last_error or ""), current.local_id
+                ):step()
+            end
+            close_statement(write_stmt)
+            write_stmt = nil
+            updated = changed_rows(db) == 1
         end
-        write_stmt = db:prepare([[
-            UPDATE local_annotation_outbox
-               SET present=?, sync_state=?, remote_id=?, remote_kind=?,
-                   replacement_id=?, last_attempt_at=?, last_error=?,
-                   claim_token='', claimed_at=0
-             WHERE local_id=?
-        ]])
-        write_stmt:reset():bind(
-            present and 1 or 0,
-            tostring(state), tostring(remote_id or ""),
-            tostring(remote_kind or ""),
-            tostring(replacement_id or ""),
-            tonumber(patch.last_attempt_at) or os.time(),
-            tostring(patch.last_error or ""), current.local_id
-        ):step()
+        db:exec("COMMIT")
+        transaction_open = false
     end)
     close_statement(current_stmt)
     close_statement(write_stmt)
+    if not ok and transaction_open then pcall(function() db:exec("ROLLBACK") end) end
     pcall(function() db:close() end)
-    if not ok then logger.warn("library_db annotation outbox update failed:", err) end
-    return ok
+    if not ok then logger.warn("library_db annotation outbox update failed:", err)
+    elseif updated then status_changed(self) end
+    return ok and updated
 end
 
 function LibraryDB:localAnnotationStatus()

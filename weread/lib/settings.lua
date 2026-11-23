@@ -6,6 +6,12 @@ local lfs = require("libs/libkoreader-lfs")
 
 local Settings = {}
 Settings.__index = Settings
+
+local function sync_status_changed(self, key)
+    if key ~= "account" then return end
+    local ok, SyncStatus = pcall(require, "weread.lib.sync_status")
+    if ok then SyncStatus.invalidateAccount(self) end
+end
 Settings.AUTH_SCHEMA_VERSION = 1
 
 local defaults = {
@@ -273,6 +279,7 @@ function Settings:set(key, value, progress_book_id)
         value = indexes
     end
     self.store:saveSetting(key, value)
+    sync_status_changed(self, key)
 end
 
 function Settings:delete(key)
@@ -281,6 +288,7 @@ function Settings:delete(key)
     else
         self.store:saveSetting(key, nil)
     end
+    sync_status_changed(self, key)
 end
 
 function Settings:has_legacy_book_records()
@@ -390,6 +398,7 @@ end
 function Settings:reset_account()
     clear_auth_store(self.store)
     self:flush()
+    sync_status_changed(self, "account")
 end
 
 function Settings:is_cookie_configured()

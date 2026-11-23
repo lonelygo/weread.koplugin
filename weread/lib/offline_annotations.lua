@@ -257,17 +257,18 @@ function OfflineAnnotations:_finish(row, result)
         return 1
     end
 
+    local acknowledged = false
     if outcome.action == "create" and outcome.accepted and outcome.remote_id then
-        self.library_db:updateLocalAnnotationWork(row, {
+        acknowledged = self.library_db:updateLocalAnnotationWork(row, {
             sync_state = "synced",
             remote_id = outcome.remote_id,
             remote_kind = row.kind,
         })
     elseif outcome.action == "delete" and outcome.accepted then
-        self.library_db:updateLocalAnnotationWork(row, { delete = true })
+        acknowledged = self.library_db:updateLocalAnnotationWork(row, { delete = true })
     elseif outcome.action == "replace" and outcome.replacement_id then
         if outcome.accepted then
-            self.library_db:updateLocalAnnotationWork(row, {
+            acknowledged = self.library_db:updateLocalAnnotationWork(row, {
                 sync_state = "synced",
                 remote_id = outcome.replacement_id,
                 remote_kind = row.kind,
@@ -282,7 +283,7 @@ function OfflineAnnotations:_finish(row, result)
             })
         end
     elseif outcome.action == "replace_delete" and outcome.accepted then
-        self.library_db:updateLocalAnnotationWork(row, {
+        acknowledged = self.library_db:updateLocalAnnotationWork(row, {
             sync_state = "synced",
             remote_id = outcome.replacement_id,
             remote_kind = row.kind,
@@ -299,6 +300,9 @@ function OfflineAnnotations:_finish(row, result)
             logger.warn("annotation upload result unknown:", "local_id=", row.local_id)
         end
         return ambiguous and 1 or 60
+    end
+    if acknowledged then
+        require("weread.lib.sync_status").noteAck(self, self.now())
     end
     return 1
 end

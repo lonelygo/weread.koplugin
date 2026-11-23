@@ -14,7 +14,7 @@ Run these before every PR:
 ```bash
 bash scripts/run_lua_specs.sh
 bash scripts/check_lua_namespace.sh
-luacheck main.lua _meta.lua weread spec
+luacheck main.lua _meta.lua integrations weread spec
 python3 scripts/test_mock_weread.py
 ```
 
@@ -103,6 +103,18 @@ python3 scripts/test_updater_simulator.py \
 手动更新、校验失败与重试；截图和日志保存在 `evidence/`。不会更新日常使用的插件。
 加 `--width 1072 --height 1448 --dpi 300` 可复测大屏；加 `--interactive` 会生成
 `WeReadUpdateTest.app`，打开后可进行真实窗口点击测试。每次使用新的 `--run-dir`。
+
+## SimpleUI 首页同步状态
+
+使用 SimpleUI 3.1.0 的官方发布 ZIP 和已构建的 KOReader 模拟器，运行以下命令。测试会把当前候选包和 SimpleUI 安装到隔离配置，验证状态行的位置、翻页、点开详情、离线续读以及本地测试服务返回回执后的刷新。截图和结果保存在指定的新目录中。[SimpleUI 3.1.0 发布页](https://github.com/doctorhetfield-cmd/simpleui.koplugin/releases/tag/3.1.0)
+
+```bash
+python3 scripts/run_simpleui_status_simulator.py \
+    --koreader /path/to/koreader-runtime --simpleui-zip /path/to/simpleui.koplugin.zip \
+    --run-dir /tmp/weread-simpleui-test
+```
+
+可用 `--candidate-zip` 复测同一份 ZIP，或用 `--width 1072 --height 1448 --dpi 300` 验证大屏。运行器会检查每张 PNG 的实际尺寸。
 
 ## Release UI acceptance / 发版前界面验收
 
