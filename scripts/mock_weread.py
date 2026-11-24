@@ -398,7 +398,7 @@ def main():
     parser.add_argument("--koreader", type=Path, help="built KOReader runtime directory (not source root)")
     parser.add_argument("--log", type=Path, help="JSONL request log, without headers or private data")
     parser.add_argument("--smoke", action="store_true", help="run real KOReader offscreen smoke, save evidence, then exit")
-    parser.add_argument("--scenario", choices=("basic", "continuous", "offline", "reading", "unified", "chunks"), default="basic",
+    parser.add_argument("--scenario", choices=("basic", "preparation", "continuous", "offline", "reading", "unified", "chunks"), default="basic",
                         help="offscreen integration scenario (requires --smoke)")
     args = parser.parse_args()
     if bool(args.run_dir) != bool(args.koreader):
@@ -424,7 +424,7 @@ def main():
         log = args.run_dir / "evidence/smoke.log"
         try:
             with log.open("w") as out:
-                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
+                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "preparation": "weread_preparation_mock.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
                                         cwd=args.koreader, env=env, stdout=out, stderr=subprocess.STDOUT, timeout=180)
             if result.returncode == 0 and args.scenario == "basic":
                 full_books = list((args.run_dir / "profile/weread-mock/cache").rglob("* - full.epub"))
@@ -435,6 +435,18 @@ def main():
                     for uid in range(1, 7):
                         assert any(f"这是第{uid}章的第1段" in page for page in pages), f"missing chapter {uid}"
                     assert any("images/" in name for name in epub.namelist()), "missing image asset"
+            if result.returncode == 0 and args.scenario == "preparation":
+                books = list((args.run_dir / "profile/weread-mock/cache").glob("*/*.epub"))
+                assert len(books) == 1, "expected one visible EPUB"
+                with zipfile.ZipFile(books[0]) as epub:
+                    assert epub.testzip() is None
+                    for uid in range(1, 7):
+                        assert f"这是第{uid}章" in epub.read(f"OEBPS/text/chapter-{uid}.xhtml").decode()
+                events = [json.loads(line) for line in server.log_path.read_text().splitlines()]
+                chunks = [e["encoded_chapter"] for e in events if e["path"] == "/web/book/chapter/e_0"]
+                assert chunks == [weread_e(i) for i in (1, 5, 3, 4, 2, 6)], chunks
+                offline_at = next(i for i, e in enumerate(events) if e["path"] == "/__control")
+                assert not any(e["path"].startswith("/web/book/chapter") for e in events[offline_at + 1:])
             if result.returncode == 0 and args.scenario == "continuous":
                 books = list((args.run_dir / "profile/weread-mock/cache").glob("*/* - offline.epub"))
                 assert len(books) == 1, "expected one continuous EPUB"

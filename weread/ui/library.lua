@@ -3,6 +3,7 @@ local BookReviews = require("weread.lib.book_reviews")
 local BookReviewsView = require("weread.ui.book_reviews_view")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Content = require("weread.lib.content")
+local ReadingPlan = require("weread.lib.reading_plan")
 local ShelfGroups = require("weread.lib.shelf_groups")
 local InputDialog = require("ui/widget/inputdialog")
 local logger = require("weread.lib.logger")
@@ -20,6 +21,7 @@ local file_exists = PluginUtil.file_exists
 
 local M = {}
 local sortBooks
+local requested_chapter
 
 local function cover_subprocess_runner()
     local ok, ffiutil = pcall(require, "ffi/util")
@@ -61,6 +63,13 @@ local function has_book_details(book)
         if book[key] ~= nil and book[key] ~= "" then return true end
     end
     return false
+end
+
+local function offline_range(state)
+    if state.complete then return _("Whole book offline") end
+    if state.last then return T(_("Offline through chapter %1"), state.last) end
+    if state.started then return _("Current chapter needs Wi-Fi") end
+    return _("First chapter needs Wi-Fi")
 end
 
 local function list_items_per_page()
@@ -424,6 +433,16 @@ function M:showShelfView(mode, keyword, old_view, options)
     end
     if old_view then UIManager:close(old_view) end
     local view
+    local function shelf_range(item)
+        local id = tostring(item.book_id or item.bookId)
+        local record = saved_books[id]
+        if not record or not item._cached then return nil end
+        local catalog = record.chapters or (self.library_db and self.library_db:getChapters(id))
+        if not catalog then catalog = Content.load_catalog_cache(self.client, self.settings, record) end
+        if not catalog and file_exists(record.cached_full_book) then return _("Whole book offline") end
+        if not catalog or #catalog == 0 then return nil end
+        return offline_range(self:bookReadingPlan(record, catalog))
+    end
     view = LibraryView.show({
         mode = mode,
         title = options.title,
@@ -445,9 +464,13 @@ function M:showShelfView(mode, keyword, old_view, options)
         cover_columns = cover_layout and cover_layout.columns,
         cover_rows = cover_layout and cover_layout.rows,
         cover_cell_height = cover_layout and cover_layout.cell_height,
+        shelf_range = shelf_range,
         cover_paths = cover_paths,
         cover_loading = cover_loading,
     }, {
+        on_close = function()
+            if self.shelf_view == view then self.shelf_view = nil end
+        end,
         on_switch = function(new_mode)
             local next_options = {}
             for key, value in pairs(options) do next_options[key] = value end
@@ -520,6 +543,12 @@ function M:showShelfView(mode, keyword, old_view, options)
     })
     if paged then self.shelf_view_pages[mode] = view.page end
     self.shelf_view = view
+    view.refresh_reading_status = function()
+        if self.shelf_view ~= view then return end
+        options.prepared_shelf = nil
+        options.skip_cover_fetch_once = true
+        self:showShelfView(mode, keyword, view, options)
+    end
     if cover_mode and not skip_cover_fetch_once then
         local fetch_options = {}
         for key, value in pairs(options) do fetch_options[key] = value end
@@ -753,6 +782,147 @@ function M:refreshBookRecord(book, old_view, options)
     if started == false and options.automatic then self:showBookMenu(book) end
 end
 
+function M:bookReadingPlan(book, chapters)
+    local stable, published
+    local has_files = book.incremental_reader_file or book.cache_dir or next(book.cached_chapters or {})
+    if has_files then stable, published = Content.incremental_publication(self.settings, book) end
+    local full = self:getFullBookCachePath(book)
+    local history, live
+    if has_files or file_exists(full) then
+        history = require("readhistory").hist
+        if self.ui and self.ui.document and self.progress_sync then
+            local position = self.progress_sync:capture_local()
+            if position and tostring(position.book_id) == tostring(book.book_id or book.bookId) then
+                live = position
+            end
+        end
+    end
+    local function saved_page(path)
+        local DocSettings = require("docsettings")
+        if not DocSettings:hasSidecarFile(path) then return nil end
+        local sidecar = DocSettings:open(path)
+        return sidecar:readSetting("last_xpointer") or sidecar:readSetting("last_page")
+    end
+    return ReadingPlan.build(book, chapters, full, stable, published, history, live, file_exists, saved_page)
+end
+
+function M:startOrContinueReading(book)
+    local function read(chapters)
+        local state = self:bookReadingPlan(book, chapters)
+        if state.resume_path then
+            self:openFile(state.resume_path)
+            return
+        end
+        local ch = state.current
+        if not ch then self:showInfo(_("No chapters.")); return end
+        local uid = tostring(ch.chapterUid or ch.chapterId)
+        local path = state.cached[uid]
+        if not path then
+            Content.recover_chapter_packages(self.settings, book, chapters)
+            path = book.cached_chapters and book.cached_chapters[uid]
+            if not file_exists(path) then path = nil end
+        end
+        if path and (state.published[uid] or path == self:getFullBookCachePath(book)) then
+            -- A first read of a pre-built book starts at the first catalog entry,
+            -- even if a later chapter was the first one added to its spine.
+            self:openFile(path, state.published[uid] and uid or nil)
+        elseif path then
+            self:openCachedChapter(book, ch, path)
+        elseif not self:isNetworkConnected() then
+            self:showOffline(_("Download chapter and read"))
+        elseif not self.downloader:promotePrefetch(book, ch) then
+            self.downloader:start(book, { ch }, "chapter", {
+                single_chapter = true, open_on_complete = true,
+            })
+        end
+    end
+    if not book.chapters or #book.chapters == 0 then
+        local known = self:bookReadingPlan(book)
+        local ready = known.resume_path or self:getFullBookCachePath(book)
+        if file_exists(ready) then self:openFile(ready); return end
+    end
+    self:loadChapters(book, read)
+end
+
+local function save_reading_cache(settings, book)
+    local books = settings:get("books", {})
+    local id = tostring(book.book_id or book.bookId)
+    local record = books[id] or book
+    for _, key in ipairs({ "cached_chapters", "annotation_documents" }) do
+        record[key] = record[key] or {}
+        for k, v in pairs(book[key] or {}) do record[key][k] = v end
+    end
+    for _, key in ipairs({ "cache_dir", "incremental_reader_file", "incremental_chapter_uids" }) do
+        if book[key] then record[key] = book[key] end
+    end
+    books[id] = record
+    settings:set("books", books)
+    settings:flush()
+end
+
+function M:showPrepareChapters(book, refreshed)
+    self:loadChapters(book, function(chapters)
+        if #chapters == 0 then self:showInfo(_("No chapters.")); return end
+        -- Recover complete atomic chapter packages left by a cancelled job or a restart.
+        Content.recover_chapter_packages(self.settings, book, chapters)
+        local state = self:bookReadingPlan(book, chapters)
+        local all_label = _("Download remaining book")
+        local function prepare(count)
+            local selected = ReadingPlan.missing(state, count)
+            local function done()
+                if refreshed then refreshed() end
+                local latest = self:bookReadingPlan(book, chapters)
+                local remaining = #ReadingPlan.missing(latest, count)
+                local message = remaining > 0 and T(_("%1 chapters still need downloading."), remaining)
+                    or _("Selected chapters are ready.")
+                self:showInfo(message .. "\n" .. offline_range(latest))
+            end
+            if #selected == 0 then
+                -- Cached packages from an interrupted run may still need publishing.
+                if Content.has_unpublished_packages(book, state.published) then
+                    local path, err = Content.save_incremental_book_epub(self.settings, book)
+                    if not path then self:showInfo(display_error(err)); return end
+                    save_reading_cache(self.settings, book)
+                end
+                done()
+            elseif not self:isNetworkConnected() then
+                self:showOffline(_("Prepare chapters"))
+            else
+                self.downloader:start(book, selected, "chapters", {
+                    prepare_offline = true, separate_chapters = true, silent_completion = true,
+                    on_complete = function(ok)
+                        if ok then done(); return end
+                        Content.recover_chapter_packages(self.settings, book, chapters)
+                        if next(book.cached_chapters or {}) then save_reading_cache(self.settings, book) end
+                        if refreshed then refreshed() end
+                    end,
+                })
+            end
+        end
+        local function queue(count) UIManager:nextTick(function() prepare(count) end) end
+        local all_info = T(_("Whole book: %1 missing chapters, including earlier gaps."),
+            #state.catalog - state.total_cached)
+        if state.forward_count == 0 then
+            if state.complete and not Content.has_unpublished_packages(book, state.published) then
+                self:showInfo(_("Whole book offline")); return
+            end
+            UIManager:show(ConfirmBox:new{ text = all_info, ok_text = all_label,
+                ok_callback = function() queue() end })
+            return
+        end
+        local from = state.started and T(_("After chapter %1. Cached chapters are skipped."), state.index)
+            or _("From chapter 1. Cached chapters are skipped.")
+        UIManager:show(require("ui/widget/spinwidget"):new{
+            title_text = _("Prepare chapters"), info_text = from .. "\n" .. all_info,
+            value = math.min(5, state.forward_count), value_min = 1, value_max = state.forward_count,
+            value_step = 1, value_hold_step = 5, precision = "%d", width_factor = 0.86,
+            cancel_text = _("Cancel"), wrap = false, ok_always_enabled = true,
+            ok_text = _("Prepare"), callback = function(spin) queue(spin.value) end,
+            extra_text = all_label, extra_callback = function() queue() end,
+        })
+    end)
+end
+
 function M:showBookMenu(book)
     local BookDetailView = require("weread.ui.book_detail_view")
     local book_id = book.book_id or book.bookId
@@ -766,21 +936,13 @@ function M:showBookMenu(book)
         end
     end
     local saved = self.settings:get("books", {})[book_id] or book
-    local cached_path = self:getFullBookCachePath(saved)
-    local is_full_cached = file_exists(cached_path)
+    local plan = self:bookReadingPlan(saved, book.chapters)
     local has_cache = self:bookRecordHasDownload(saved)
-    book.cached_full_book = is_full_cached and cached_path or nil
-    local cached_chapter_count = 0
-    for _uid, path in pairs(book.cached_chapters or {}) do
-        if file_exists(path) then cached_chapter_count = cached_chapter_count + 1 end
+    local chapter_status = #plan.catalog > 0 and offline_range(plan) or nil
+    if not chapter_status then
+        if file_exists(saved.cached_full_book) then chapter_status = _("Whole book offline")
+        elseif not has_cache then chapter_status = offline_range(plan) end
     end
-    local total_chapters = type(book.chapters) == "table" and #book.chapters or nil
-    if is_full_cached and cached_chapter_count == 0 and total_chapters then
-        cached_chapter_count = total_chapters
-    end
-    local chapter_status = total_chapters
-        and T(_("Cached %1/%2 chapters"), tostring(cached_chapter_count), tostring(total_chapters))
-        or T(_("%1 chapters cached"), tostring(cached_chapter_count))
 
     local author_parts = {}
     if book.author and book.author ~= "" then author_parts[#author_parts + 1] = book.author end
@@ -836,7 +998,12 @@ function M:showBookMenu(book)
             self:showBookReviews(book)
         end),
     }
-    local actions = {}
+    local actions = { {
+        text = _("⇩ Download full book"),
+        callback = self:safeCallback(_("Download full book"), function()
+            self:confirmDownloadAllChapters(book)
+        end),
+    } }
     if has_cache then
         actions[#actions + 1] = {
             text = _("Clear book cache"),
@@ -859,22 +1026,23 @@ function M:showBookMenu(book)
         and os.date("%Y-%m-%d %H:%M", book.detail_updated_at) or _("Never updated")
     local bottom_actions = {
         {
-            text = _("⇩ Download full book"),
-            callback = self:safeCallback(_("Download full book"), function()
-                self:confirmDownloadAllChapters(book)
-            end),
+            text = plan.started and _("Continue reading") or _("Start reading"),
+            callback = self:safeCallback(_("Read"), function() self:startOrContinueReading(book) end),
         },
         {
-            text = _("☷ Chapter list"),
-            callback = open_chapter_list,
-        },
-        {
-            text = _("▤ Read"),
-            enabled = has_cache,
-            callback = self:safeCallback(_("Read"), function()
-                self:openBookForReading(book)
+            text = _("Prepare next 5"),
+            callback = self:safeCallback(_("Prepare chapters"), function()
+                self:showPrepareChapters(book, function()
+                    if self._book_detail_view ~= view then return end
+                    UIManager:close(view)
+                    if self.shelf_view then self.shelf_view.refresh_reading_status() end
+                    local latest = self.settings:get("books", {})[book_id] or book
+                    latest.chapters = latest.chapters or book.chapters
+                    self:showBookMenu(latest)
+                end)
             end),
         },
+        { text = _("☷ Chapter list"), callback = open_chapter_list },
     }
     view = BookDetailView.show({
         title = book.title or _("Book details"),
@@ -888,6 +1056,9 @@ function M:showBookMenu(book)
         actions = actions,
         bottom_actions = bottom_actions,
     }, {
+        on_close = function()
+            if self._book_detail_view == view then self._book_detail_view = nil end
+        end,
         on_refresh = self:safeCallback(_("Get latest information"), function()
             self:refreshBookRecord(book, view)
         end),
@@ -1449,11 +1620,20 @@ function M:showChapterDownloadSelection(book, chapters, on_downloaded)
         _("No chapters."), { items_per_page = perpage })
 end
 
-function M:openFile(path)
+-- FileManager and ReaderUI own different plugin instances. Carry an explicit
+-- chapter jump only to the next matching document open in this process.
+function M:takeRequestedChapter(path)
+    local request = requested_chapter
+    requested_chapter = nil
+    return request and request.path == path and request.uid or nil
+end
+
+function M:openFile(path, chapter_uid)
     if not path or path == "" then
         self:showInfo(_("No cached file."))
         return
     end
+    requested_chapter = chapter_uid and { path = path, uid = chapter_uid } or nil
     self:closeWeReadUI()
     if self.ui.document then
         self.ui:switchDocument(path)
@@ -1555,8 +1735,7 @@ function M:openCachedChapter(book, chapter, cache_path)
             display_error(activation_error)))
         return false
     end
-    self._pending_incremental_chapter_uid = chapter_uid
-    self:openFile(reader_path)
+    self:openFile(reader_path, chapter_uid)
     return true
 end
 

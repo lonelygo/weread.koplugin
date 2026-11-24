@@ -1044,7 +1044,7 @@ function Content.incremental_reader_path(settings, book)
         .. " - offline") .. ".epub"
 end
 
-local function read_chapter_package(path, uid, workspace)
+local function read_chapter_package(path, uid, workspace, legacy_index)
     local Archiver = require("ffi/archiver")
     local archive = Archiver.Reader:new()
     if not archive:open(path) then
@@ -1053,12 +1053,14 @@ local function read_chapter_package(path, uid, workspace)
     local body, css
     local assets = {}
     local prefix = basename_safe(uid) .. "-"
+    local chapter_entry = legacy_index and string.format("OEBPS/text/chapter-%03d.xhtml", legacy_index)
+        or "OEBPS/text/chapter-" .. basename_safe(uid) .. ".xhtml"
     local ok, err = xpcall(function()
         for entry in archive:iterate() do
             local name = tostring(entry.path or "")
             if name == "OEBPS/style.css" then
                 css = archive:extractToMemory(name)
-            elseif name:match("^OEBPS/text/[^/]+%.xhtml$") then
+            elseif name == chapter_entry or (not legacy_index and name:match("^OEBPS/text/[^/]+%.xhtml$")) then
                 body = archive:extractToMemory(name)
             elseif name:match("^OEBPS/images/[^/]+$") then
                 local original = basename(name)
@@ -1170,13 +1172,55 @@ local function valid_published_epub(path)
     return signature == "PK"
 end
 
-function Content.incremental_contains_chapter(settings, book, uid)
-    local path = book.incremental_reader_file
-        or Content.incremental_reader_path(settings, book)
-    if not valid_published_epub(path) then return false end
+-- Each package is committed by rename. A leftover .part never counts as ready.
+function Content.recover_chapter_packages(settings, book, chapters)
+    local legacy = book.cached_full_book or book.cached_file
+    local subset = legacy and (book.annotation_documents or {})[legacy]
+    if subset and subset.chapters and #subset.chapters < #chapters and path_exists(legacy) then
+        book.cached_chapters = book.cached_chapters or {}
+        for _, ch in ipairs(subset.chapters) do
+            local id = tostring(ch.chapterUid or ch.chapterId)
+            book.cached_chapters[id] = book.cached_chapters[id] or legacy
+        end
+    end
+    local lfs = require("libs/libkoreader-lfs")
+    local directory = Content.book_resolved_dir(settings, book.book_id or book.bookId, book)
+        .. "/.weread-chapters"
+    if lfs.attributes(directory, "mode") ~= "directory" then return end
+    local names = {}
+    for name in lfs.dir(directory) do names[name] = true end
+    book.cached_chapters = book.cached_chapters or {}
+    for _, chapter in ipairs(chapters) do
+        local uid = tostring(chapter.chapterUid or chapter.chapterId or "")
+        local name = "chapter-" .. basename_safe(uid) .. ".epub"
+        local path = directory .. "/" .. name
+        if names[name] and book.cached_chapters[uid] ~= path and valid_published_epub(path) then
+            book.cached_chapters[uid] = path
+        end
+    end
+end
+
+function Content.has_unpublished_packages(book, published)
+    for uid, path in pairs(book.cached_chapters or {}) do
+        if not published[tostring(uid)] and path ~= book.cached_full_book
+            and path ~= book.cached_file and path_exists(path) then return true end
+    end
+    return false
+end
+
+function Content.incremental_publication(settings, book)
+    local path = book.incremental_reader_file or (Content.book_resolved_dir(
+        settings, book.book_id or book.bookId, book) .. "/"
+        .. filename_safe((book.title or "WeRead") .. " - offline") .. ".epub")
+    if not valid_published_epub(path) then return nil, {} end
     local manifest = read_incremental_manifest(settings, book)
     local included = #manifest.uids > 0
         and manifest.uids or book.incremental_chapter_uids or {}
+    return path, included
+end
+
+function Content.incremental_contains_chapter(settings, book, uid)
+    local path, included = Content.incremental_publication(settings, book)
     for _, current in ipairs(included) do
         if tostring(current) == tostring(uid) then
             return true, path, included
@@ -1256,6 +1300,30 @@ function Content.save_incremental_book_epub(settings, book)
     for _uid, source in pairs(book.cached_chapters or {}) do
         source_counts[source] = (source_counts[source] or 0) + 1
     end
+    local package_index, counts = {}, {}
+    for _, chapter in ipairs(catalog) do
+        local uid = tostring(chapter.chapterUid or chapter.chapterId)
+        local source = book.cached_chapters[uid]
+        if source and source_counts[source] > 1 then
+            counts[source] = (counts[source] or 0) + 1
+            package_index[uid] = counts[source]
+        end
+    end
+    -- Selected legacy batches used numbered entries; an individual newer
+    -- package uses its chapter UID. A subset may share the old full-book alias.
+    local legacy_subset = {}
+    for source in pairs(source_counts) do
+        local descriptor = (book.annotation_documents or {})[source]
+        local members = descriptor and descriptor.chapters
+        if members and #members < #catalog and #members > 0
+            and (source == book.cached_file or source == book.cached_full_book or source_counts[source] > 1) then
+            legacy_subset[source] = true
+            for index, chapter in ipairs(members) do
+                local uid = tostring(chapter.chapterUid or chapter.chapterId)
+                if book.cached_chapters[uid] == source and #members > 1 then package_index[uid] = index end
+            end
+        end
+    end
     local order, seen = {}, {}
     for _, uid in ipairs(book.incremental_chapter_uids or {}) do
         uid = tostring(uid)
@@ -1276,14 +1344,12 @@ function Content.save_incremental_book_epub(settings, book)
         for _, uid in ipairs(order) do
             local chapter = catalog_by_uid[uid]
             local source = book.cached_chapters and book.cached_chapters[uid]
-            if base_uids[uid] and (not source
-                or source_counts[source] ~= 1) then
+            if base_uids[uid] and not source then
                 error("published incremental chapter cache is unavailable: " .. uid, 0)
             end
             if source and source ~= book.incremental_reader_file
-                and source ~= book.cached_full_book
-                and source_counts[source] == 1 then
-                local package, err = read_chapter_package(source, uid, workspace)
+                and (source ~= book.cached_full_book or legacy_subset[source]) then
+                local package, err = read_chapter_package(source, uid, workspace, package_index[uid])
                 if not package then error(err, 0) end
                 local chapter_name = "chapter-" .. basename_safe(uid) .. ".xhtml"
                 local chapter_body = package.body

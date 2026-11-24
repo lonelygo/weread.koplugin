@@ -4,11 +4,6 @@ local WorkerSettings = require("weread.lib.worker_settings")
 
 local M = {}
 
-local function empty_footnote_stats()
-    return { candidates = 0, converted = 0, image_notes = 0,
-        backlinks = 0, removed_note_blocks = 0, unresolved = 0, fallback = 0 }
-end
-
 function M.run(settings, client, book, chapter, context)
     local auth_result = WorkerSettings.capture(settings)
     local workspace
@@ -49,26 +44,10 @@ function M.run(settings, client, book, chapter, context)
             client, settings, book, chapter, xhtml, state)
         context.checkCancelled()
 
-        local stats = empty_footnote_stats()
-        if scan_ok then
-            context.emit { stage = "footnotes" }
-            local index = Footnotes.build_book_index({ [uid] = scan }, { chapter })
-            local transformed, current = Footnotes.transform_chapter(
-                finalized, scan, index)
-            local valid = Footnotes.validate(transformed)
-            if valid then
-                finalized = transformed
-                stats = current or stats
-                if Footnotes.has_converted(current) then
-                    state.css = (state.css or "") .. "\n"
-                        .. Footnotes.FOOTNOTES_CSS
-                end
-            else
-                stats.fallback = 1
-            end
-        else
-            stats.fallback = 1
-        end
+        context.emit { stage = "footnotes" }
+        local stats
+        finalized, state.css, stats = Footnotes.prepare_single(
+            finalized, scan_ok and scan, chapter, state.css)
         context.checkCancelled()
 
         context.emit { stage = "epub" }

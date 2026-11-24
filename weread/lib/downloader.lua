@@ -622,6 +622,8 @@ function Downloader:start(book, chapters, suffix, options)
         },
         single_chapter = options.single_chapter == true,
         separate_chapters = options.separate_chapters == true,
+        prepared_paths = options.prepare_offline and {} or nil,
+        footnotes_done = options.prepare_offline == true,
         include_annotations = false,
         open_on_complete = options.open_on_complete == true,
         offer_read = options.offer_read ~= false,
@@ -635,7 +637,8 @@ function Downloader:start(book, chapters, suffix, options)
     }
     self._active_job = dl
 
-    local task_label = options.single_chapter and _("Download chapter and read") or _("Download full book")
+    local task_label = options.prepare_offline and _("Prepare chapters")
+        or options.single_chapter and _("Download chapter and read") or _("Download full book")
     local task_runner = function(callback)
         return self.run_online_task(task_label, callback)
     end
@@ -998,7 +1001,23 @@ function Downloader:_finishChapter(dl)
     local xhtml, chapter_assets = result.xhtml, result.assets
     dl.state = result.state
     local uid = tostring(chapter.chapterUid or dl.index)
-    if dl.resumable then
+    if dl.prepared_paths then
+        local body, css, stats = Footnotes.prepare_single(xhtml, dl.footnote_scans[uid], chapter, dl.state.css)
+        local saved, path = pcall(Content.save_chapter_epub, self.settings, dl.book, chapter, body, chapter_assets, css)
+        if not saved then self:_failChapter(dl, path); return end
+        if dl.workspace then
+            self:_cleanupWorkspace(dl)
+            dl.state.used_asset_names = nil
+            if dl.index < dl.total then
+                dl.workspace = Content.create_download_workspace(self.settings, dl.book)
+                dl.state.workspace = dl.workspace
+            end
+        end
+        dl.prepared_paths[uid] = path
+        dl.footnote_scans[uid] = nil
+        add_footnote_stats(dl.footnote_stats, stats)
+        dl.footnote_stats.fallback = dl.footnote_stats.fallback + (stats.fallback or 0)
+    elseif dl.resumable then
         Content.save_full_download_css(dl.workspace, dl.state.css)
         Content.save_full_download_chapter(dl.workspace, chapter, dl.index, xhtml)
         dl.completed[dl.index] = true
@@ -1007,9 +1026,9 @@ function Downloader:_finishChapter(dl)
         dl.bodies[uid] = xhtml
     end
     dl.assets_by_uid = dl.assets_by_uid or {}
-    dl.assets_by_uid[uid] = chapter_assets or {}
+    if not dl.prepared_paths then dl.assets_by_uid[uid] = chapter_assets or {} end
     table.insert(dl.selected, chapter)
-    if not dl.resumable then
+    if not dl.resumable and not dl.prepared_paths then
         for _i, asset in ipairs(chapter_assets or {}) do
             table.insert(dl.assets, asset)
             dl.asset_bytes = (dl.asset_bytes or 0) + (tonumber(asset.size) or 0)
@@ -1148,14 +1167,16 @@ function Downloader:_step(dl)
                 return incremental, nil, cached
             end
             if dl.separate_chapters then
-                local paths = {}
-                for chapter_index, chapter in ipairs(dl.selected) do
-                    local uid = tostring(chapter.chapterUid or chapter_index)
-                    paths[uid] = Content.save_chapter_epub(
-                        self.settings, dl.book, chapter, dl.bodies[uid],
-                        (dl.assets_by_uid and dl.assets_by_uid[uid]) or {},
-                        dl.state.css
-                    )
+                local paths = dl.prepared_paths or {}
+                if not dl.prepared_paths then
+                    for chapter_index, chapter in ipairs(dl.selected) do
+                        local uid = tostring(chapter.chapterUid or chapter_index)
+                        paths[uid] = Content.save_chapter_epub(
+                            self.settings, dl.book, chapter, dl.bodies[uid],
+                            (dl.assets_by_uid and dl.assets_by_uid[uid]) or {},
+                            dl.state.css
+                        )
+                    end
                 end
                 dl.book.cached_chapters = dl.book.cached_chapters or {}
                 for uid, cached in pairs(paths) do
@@ -1226,9 +1247,8 @@ function Downloader:_step(dl)
                             dl.book.incremental_chapter_uids
                     end
                 elseif dl.separate_chapters then
-                    for chapter_index, chapter in ipairs(dl.selected) do
-                        local uid = tostring(chapter.chapterUid or chapter_index)
-                        target.cached_chapters[uid] = chapter_paths[uid]
+                    for uid, cached in pairs(dl.book.cached_chapters or chapter_paths) do
+                        target.cached_chapters[uid] = cached
                     end
                     if dl.book.incremental_reader_file then
                         target.incremental_reader_file =

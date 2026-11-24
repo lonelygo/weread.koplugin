@@ -381,7 +381,7 @@ end
 
 function M:bookRecordHasDownload(record)
     if type(record) ~= "table" then return false end
-    if file_exists(record.cached_full_book) or file_exists(record.cached_file) then
+    if file_exists(record.incremental_reader_file) or file_exists(record.cached_full_book) or file_exists(record.cached_file) then
         return true
     end
     for _uid, path in pairs(record.cached_chapters or {}) do

@@ -979,6 +979,9 @@ function ProgressSync:on_close_document()
             self:_upload_snapshot(position, "document_close", false)
         end
     end
+    if position and self:_config().upload_on_close ~= true then
+        self:_persist(position.book_id, { last_local_position = position })
+    end
     self.generation = self.generation + 1
     self.current_book_id = nil
     self.verified = false

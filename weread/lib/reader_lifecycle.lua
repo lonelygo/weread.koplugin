@@ -144,6 +144,78 @@ function M:handleEndOfBook(status_self)
     return self._orig_onEndOfBook(status_self)
 end
 
+-- The physical spine is append-only: CREngine XPointers refer to fragment
+-- numbers. When a hole is filled, turn across that boundary in catalog order.
+function M:_installCatalogPageTurns(book_id)
+    local ui, book = self.ui, self.settings:get("books", {})[book_id]
+    local rolling, path = ui.rolling, ui.document and ui.document.file
+    if not rolling or not path or not book or path ~= book.incremental_reader_file
+        or self._original_page_turn then return end
+    local desc = (book.annotation_documents or {})[path]
+    local spine = desc and desc.chapters
+    if not spine or #spine < 2 then return end
+    local catalog = self:ensureChaptersLoaded(book)
+    if not catalog then return end
+    local indexes, logical, physical = {}, {}, {}
+    for index, ch in ipairs(catalog) do indexes[tostring(ch.chapterUid or ch.chapterId)] = index end
+    local sparse = false
+    for slot, ch in ipairs(spine) do
+        local index = indexes[tostring(ch.chapterUid or ch.chapterId)]
+        if not index then return end
+        logical[slot], physical[index] = index, slot
+        if slot > 1 and logical[slot - 1] + 1 ~= index then sparse = true end
+    end
+    if not sparse then return end
+    local original = rolling.onGotoViewRel
+    self._original_page_turn = original
+    rolling.onGotoViewRel = function(module, direction)
+        if (direction ~= 1 and direction ~= -1) or not ui.toc or not ui.document then
+            return original(module, direction)
+        end
+        local page = ui.document:getCurrentPage()
+        local slot = ui.toc:getTocIndexByPage(page)
+        local index = logical[slot]
+        if not index then return original(module, direction) end
+        local target = index + direction
+        if module.view.view_mode == "page" then
+            local destination = page + direction * ui.document:getVisiblePageNumberCount()
+            if ui.document:hasHiddenFlows() then
+                destination = direction == 1 and ui.document:getNextPage(page) or ui.document:getPrevPage(page)
+            end
+            if destination >= 1 and destination <= ui.document:getPageCount() then
+                local next_slot = ui.toc:getTocIndexByPage(destination)
+                if next_slot == slot or logical[next_slot] == target then
+                    return original(module, direction)
+                end
+            elseif not logical[slot + direction] and not physical[target] then
+                return original(module, direction)
+            end
+        else
+            -- Scrolling accounts for overlap and footers in the native method.
+            local result = original(module, direction)
+            if not ui.document then return result end
+            local next_slot = ui.toc:getTocIndexByPage(ui.document:getCurrentPage())
+            if next_slot == slot or logical[next_slot] == target then return result end
+        end
+        local toc = ui.document:getToc()
+        local dest_slot = physical[target]
+        if dest_slot and toc[dest_slot] then
+            if direction > 0 then
+                module:onGotoXPointer(toc[dest_slot].xpointer)
+            else
+                local after = toc[dest_slot + 1]
+                module:onGotoPage(after and math.max(toc[dest_slot].page, after.page - 1)
+                    or ui.document:getPageCount())
+            end
+        elseif catalog[target] then
+            self:openChapter(self.settings:get("books", {})[book_id] or book, catalog[target])
+        elseif direction > 0 then
+            self:handleEndOfBook(ui.status)
+        end
+        return true
+    end
+end
+
 function M:onReaderReady()
     self._reader_session_gen = (self._reader_session_gen or 0) + 1
     local perf = PluginUtil.reader_open_perf
@@ -172,6 +244,7 @@ function M:onReaderReady()
                 self:_ensureThoughtDB(weread_book_id)
             end)
         end
+        self:_installCatalogPageTurns(weread_book_id)
         if not self._orig_onEndOfBook and self.ui.status and type(self.ui.status.onEndOfBook) == "function" then
             self._orig_onEndOfBook = self.ui.status.onEndOfBook
             self.ui.status.onEndOfBook = function(status_self)
@@ -195,13 +268,10 @@ function M:onReaderReady()
     if self.onUnifiedAnnotationsReady then self:onUnifiedAnnotationsReady() end
 
     local annotations_ready = perf("annotations_ready", opened)
-    if weread_book_id and self._pending_incremental_chapter_uid then
-        local pending_uid = self._pending_incremental_chapter_uid
+    local jump = self.takeRequestedChapter and self:takeRequestedChapter(self.ui.document.file)
+    if weread_book_id and jump then
         local pending_book = self.settings:get("books", {})[tostring(weread_book_id)]
-        if pending_book and self:_gotoIncrementalChapter(
-            pending_book, pending_uid, self.ui) then
-            self._pending_incremental_chapter_uid = nil
-        end
+        if pending_book then self:_gotoIncrementalChapter(pending_book, jump, self.ui) end
     end
     self.progress_sync:on_reader_ready()
     if weread_book_id then
@@ -312,6 +382,10 @@ function M:onCloseDocument()
     self:_removeReaderHighlightTapGuard()
     self:_removeNativeAnnotationGuard()
 
+    if self._original_page_turn and self.ui.rolling then
+        self.ui.rolling.onGotoViewRel = self._original_page_turn
+        self._original_page_turn = nil
+    end
     if self._orig_onEndOfBook and self.ui.status then
         self.ui.status.onEndOfBook = self._orig_onEndOfBook
         self._orig_onEndOfBook = nil
@@ -612,9 +686,10 @@ function M:getChapterInfoFromFile(book, file_path)
         return nil, nil, false
     end
 
-    if file_path == book.incremental_reader_file then
-        local descriptor = book.annotation_documents
-            and book.annotation_documents[file_path]
+    local descriptor = book.annotation_documents and book.annotation_documents[file_path]
+    local subset = descriptor and descriptor.chapters and #descriptor.chapters > 1
+        and #descriptor.chapters < #book.chapters
+    if file_path == book.incremental_reader_file or subset then
         local document = self.ui and self.ui.document
         local page = document and document.getCurrentPage
             and document:getCurrentPage() or nil

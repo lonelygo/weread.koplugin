@@ -205,5 +205,22 @@ assert(candidate_paths[1] ~= candidate_paths[2]
         and candidate_paths[2] ~= candidate_paths[3],
     "incremental builds reused a shared mutable workspace")
 
+-- Before the stable reader existed, a selected batch could occupy the full-book
+-- alias. Its XHTML numbers are positions within that batch, independent of UID.
+local legacy = "/cache/selected.epub"
+archives[legacy] = {
+    ["OEBPS/text/chapter-001.xhtml"] = "<html><body><p>legacy two</p></body></html>",
+    ["OEBPS/text/chapter-002.xhtml"] = "<html><body><p>legacy one</p></body></html>",
+}
+local migrated = {
+    book_id = "legacy", title = "Legacy", cache_dir = root .. "/legacy", chapters = chapters,
+    cached_full_book = legacy, cached_chapters = { ["1"] = legacy, ["2"] = legacy, ["3"] = "/cache/three.epub" },
+    annotation_documents = { [legacy] = { chapters = { chapters[2], chapters[1] } } },
+}
+assert(Content.save_incremental_book_epub(settings, migrated))
+assert(writes["OEBPS/text/chapter-1.xhtml"]:find("legacy one", 1, true))
+assert(writes["OEBPS/text/chapter-2.xhtml"]:find("legacy two", 1, true))
+assert(writes["OEBPS/text/chapter-3.xhtml"]:find("three", 1, true))
+
 assert(os.execute("rm -rf " .. string.format("%q", root)))
 print("incremental_content_spec: stable aggregate, spine and asset isolation passed")

@@ -52,14 +52,14 @@ package.preload["weread.lib.content"] = function()
     }
 end
 package.preload["weread.lib.footnotes"] = function()
-    return {
-        scan_chapter = function() return {} end,
-        build_book_index = function() return {} end,
-        transform_chapter = function(body) return body, { converted = 1 } end,
-        validate = function() return true end,
-        has_converted = function() return true end,
-        FOOTNOTES_CSS = "standard-footnote-css",
-    }
+    local footnotes = dofile("weread/lib/footnotes.lua")
+    footnotes.scan_chapter = function() return {} end
+    footnotes.build_book_index = function() return {} end
+    footnotes.transform_chapter = function(body) return body, { converted = 1 } end
+    footnotes.validate = function() return true end
+    footnotes.has_converted = function() return true end
+    footnotes.FOOTNOTES_CSS = "standard-footnote-css"
+    return footnotes
 end
 
 local flushes = 0

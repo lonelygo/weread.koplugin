@@ -366,6 +366,7 @@ function BookDetailView:onShow()
 end
 
 function BookDetailView:onCloseWidget()
+    if self.on_close then self.on_close() end
     UIManager:setDirty(nil, function() return "ui", self.dimen end)
 end
 
@@ -380,6 +381,7 @@ function M.show(data, callbacks)
     local view = BookDetailView:new{
         data = data,
         on_refresh = callbacks.on_refresh,
+        on_close = callbacks.on_close,
     }
     UIManager:show(view)
     return view

@@ -469,9 +469,14 @@ local CoverCell = InputContainer:extend{
 }
 
 function CoverCell:init()
+    local range
+    if self.reserve_range then
+        range = TextWidget:new{ text = self.range_text or "", face = Font:getFace("cfont", 13),
+            max_width = self.width - 2 * Size.padding.small }
+    end
     local metrics = CoverLayout.card{
         width = self.width,
-        height = self.height,
+        height = self.height - (range and range:getSize().h or 0),
         size_scale = Screen:scaleBySize(1000) / 1000,
     }
     local border = Size.border.thin
@@ -631,6 +636,7 @@ function CoverCell:init()
                     dimen = Geom:new{ w = metrics.cover_width, h = metrics.title_height },
                     title_container,
                 },
+                range,
             },
         },
     }
@@ -891,7 +897,8 @@ function LibraryView:itemStatus(book)
         status = _("Done")
     end
     if book._cached then
-        status = status ~= "" and ("✓  " .. status) or "✓"
+        local range = self.shelf_range and self.shelf_range(book)
+        status = range or (status ~= "" and ("✓  " .. status) or "✓")
     end
     return status
 end
@@ -948,6 +955,13 @@ function LibraryView:content()
         ))
         local grid_height = math.max(cell_height, tonumber(self.cover_content_height)
             or cell_height * rows)
+        local ranges, reserve_range = {}, false
+        if self.mode ~= "public_account" and self.shelf_range then
+            for index = first, last do
+                ranges[index] = self.shelf_range(source[index])
+                if ranges[index] then reserve_range = true end
+            end
+        end
         local grid_row
         for index = first, last do
             local book = source[index]
@@ -966,6 +980,8 @@ function LibraryView:content()
             local cover_cell = CoverCell:new{
                 book = book,
                 cached = book._cached == true,
+                range_text = ranges[index],
+                reserve_range = reserve_range,
                 cover_path = self.cover_paths and self.cover_paths[book] or nil,
                 cover_loading = self.cover_loading and self.cover_loading[book] == true,
                 contain_cover = self.mode == "public_account",
@@ -1130,6 +1146,7 @@ function LibraryView:onShow()
 end
 
 function LibraryView:onCloseWidget()
+    if self.on_close then self.on_close() end
     UIManager:setDirty(nil, function() return "ui", self.dimen end)
 end
 
@@ -1186,8 +1203,10 @@ function M.show(data, callbacks)
         cover_columns = data.cover_columns,
         cover_rows = data.cover_rows,
         cover_cell_height = data.cover_cell_height,
+        shelf_range = data.shelf_range,
         cover_paths = data.cover_paths,
         cover_loading = data.cover_loading,
+        on_close = callbacks.on_close,
         on_switch = callbacks.on_switch,
         on_select_group = callbacks.on_select_group,
         on_display_change = callbacks.on_display_change,

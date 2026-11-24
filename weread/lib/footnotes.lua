@@ -636,4 +636,19 @@ function Footnotes.log_stats(stats)
         "unresolved=", tostring(stats and stats.unresolved or 0))
 end
 
+-- A standalone chapter can resolve its own footnotes. Keep the original body
+-- whenever the converted markup fails validation.
+function Footnotes.prepare_single(body, scan, chapter, css)
+    if scan then
+        local uid = tostring(chapter.chapterUid or chapter.chapterId or "1")
+        local index = Footnotes.build_book_index({ [uid] = scan }, { chapter })
+        local transformed, stats = Footnotes.transform_chapter(body, scan, index)
+        if Footnotes.validate(transformed) then
+            if Footnotes.has_converted(stats) then css = (css or "") .. "\n" .. Footnotes.FOOTNOTES_CSS end
+            return transformed, css, stats
+        end
+    end
+    return body, css, { fallback = 1 }
+end
+
 return Footnotes
