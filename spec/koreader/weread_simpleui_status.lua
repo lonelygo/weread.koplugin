@@ -238,22 +238,54 @@ assert(status_row().dimen.x == initial_status_dimen.x
     "status change moved the mounted row")
 screen_shot("02-pending")
 
-local status_dimen = status_row().dimen
-tap(status_dimen.x + status_dimen.w - 7,
-    status_dimen.y + math.floor(status_dimen.h / 2))
-wait_for("sync details", function()
-    local top = UIManager._window_stack[#UIManager._window_stack].widget
-    return type(top.text) == "string"
-        and top.text:find("30", 1, true) and top.text:find("2", 1, true)
-end)
+local function open_details()
+    local row = status_row().dimen
+    tap(row.x + row.w - 7, row.y + math.floor(row.h / 2))
+    local dialog
+    wait_for("sync details", function()
+        dialog = UIManager._window_stack[#UIManager._window_stack].widget
+        return dialog.title == "微信读书同步状态" and dialog:getContentSize()
+    end)
+    return dialog
+end
+local function tap_action(dialog, id)
+    local button = assert(dialog:getButtonById(id))
+    local d = button.dimen
+    tap(d.x + math.floor(d.w / 2), d.y + math.floor(d.h / 2))
+end
+local function back_on_home()
+    return UIManager._window_stack[#UIManager._window_stack].widget == home_screen
+end
+local dialog = open_details()
+local bounds = dialog:getContentSize()
+assert(bounds.w < screen_width and bounds.h < screen_height * 0.6, "pending details should fit a compact popup")
+assert(math.abs(bounds.x * 2 + bounds.w - screen_width) <= 2
+    and math.abs(bounds.y * 2 + bounds.h - screen_height) <= 2, "popup should be centered")
+local close = assert(dialog:getButtonById("close"))
+local upload = assert(dialog:getButtonById("upload"))
+assert(close.text == "关闭" and upload.text == "立即上传" and upload.enabled)
+assert(close.dimen.y == upload.dimen.y and close.dimen.h == upload.dimen.h
+    and close.dimen.x + close.dimen.w <= upload.dimen.x, "actions should share one row")
 assert(wifi_wake_calls == 0, "viewing sync status woke Wi-Fi")
 screen_shot("03-details")
-UIManager:close(UIManager._window_stack[#UIManager._window_stack].widget)
-spin(0.1)
-
-connected = true
-FileManager.instance:handleEvent(Event:new("NetworkConnected"))
+tap_action(dialog, "close")
+wait_for("close returns to Home", back_on_home)
 local SyncStatus = require("weread.lib.sync_status")
+assert(SyncStatus.get(plugin).pending_seconds == 30 and SyncStatus.get(plugin).pending_annotations == 2)
+
+tap_action(open_details(), "upload")
+wait_for("offline feedback", function()
+    return UIManager._window_stack[#UIManager._window_stack].widget.text == "当前未联网，待传记录会保留在本机。"
+end)
+wait_for("offline upload returns to Home", back_on_home)
+assert(SyncStatus.get(plugin).pending_seconds == 30 and SyncStatus.get(plugin).pending_annotations == 2)
+assert(wifi_wake_calls == 0, "offline upload woke Wi-Fi")
+
+dialog = open_details()
+-- No network event: the tap itself must reach the manual coordinator from Home.
+connected = true
+tap_action(dialog, "upload")
+wait_for("upload returns to Home", back_on_home)
 wait_for("real service acknowledgements", function()
     local snapshot = SyncStatus.get(plugin)
     return snapshot.state == "synced" and snapshot.last_confirmed_at ~= nil
@@ -295,6 +327,7 @@ assert(status_text():find("进度", 1, true), status_text())
 screen_shot("06-progress")
 
 assert(plugin.progress_sync:_persist("900001", {
+    title = string.rep("关于阅读与记忆的长书名", 55),
     pending_upload_blocked = true,
     pending_upload_remote = { chapter_uid = 6, progress = 98 },
     last_sync_error = "offline_progress_conflict",
@@ -305,6 +338,21 @@ wait_for("conflict status", function()
 end)
 wait_for("conflict shown on Home", function() return status_text():find("需选择进度", 1, true) end)
 screen_shot("07-conflict")
+
+-- Exercise wrapped conflict details through the normal Home and touch paths.
+dialog = open_details()
+local scroll = dialog._added_widgets[1]
+local _, last_visible = scroll.text_widget:getVisibleHeightRatios()
+assert(last_visible < 1, "long conflict details should scroll")
+local footer = dialog:getButtonById("upload").dimen:copy()
+assert(dialog:getContentSize().h < screen_height * 0.8 and scroll.dimen.y + scroll.dimen.h <= footer.y)
+tap(scroll.dimen.x + math.floor(scroll.dimen.w * 0.75), scroll.dimen.y + math.floor(scroll.dimen.h / 2))
+wait_for("scrolling reaches more conflict text", function()
+    return scroll.text_widget:getVisibleHeightRatios() > 0
+end)
+assert(dialog:getButtonById("upload").dimen.y == footer.y, "scrolling moved the footer")
+tap_action(dialog, "close")
+wait_for("closing long details returns to Home", back_on_home)
 
 local final_card = assert(find_current(home_screen, {}), "book card missing after status updates")
 assert(final_card.dimen.y == card_dimen.y and final_card.dimen.h == card_dimen.h,

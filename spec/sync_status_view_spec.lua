@@ -19,25 +19,52 @@ package.loaded["ui/uimanager"] = {
         opened = nil
     end,
 }
-package.loaded["ui/widget/textviewer"] = { new = function(_, options) return options end }
+package.loaded.device = { screen = { getHeight = function() return 800 end } }
+package.loaded["ui/font"] = { getFace = function() return {} end }
+package.loaded["ui/widget/buttondialog"] = {
+    new = function(_, options)
+        options.getAddedWidgetAvailableWidth = function() return 450 end
+        options.addWidget = function(dialog, body) dialog.body = body end
+        return options
+    end,
+}
+package.loaded["ui/widget/textboxwidget"] = {
+    new = function(_, options)
+        options.getSize = function() return { h = 120 } end
+        return options
+    end,
+}
 local view = require("weread.ui.sync_status")
+local uploads = 0
+view.safeCallback = function(_, _label, callback) return callback end
+view.syncOfflineNow = function()
+    assert(not opened, "dismiss details before opening any progress choice")
+    uploads = uploads + 1
+end
 
-status = { state = "signed_out" }
+status = { state = "signed_out", signed_in = false }
 assert(view:getOfflineSyncStatusText() == "微信读书　未登录")
-status = { state = "unavailable" }
 view:showOfflineSyncStatus()
-assert(opened.text == "暂时无法读取同步状态")
+assert(opened.buttons[1][2].enabled == false)
+status = { state = "unavailable", signed_in = true }
+view:showOfflineSyncStatus()
+assert(opened.body.text == "暂时无法读取同步状态")
 
 status = {
-    state = "pending", available = true, pending_seconds = 480, pending_annotations = 2,
+    state = "pending", available = true, signed_in = true, pending_seconds = 480, pending_annotations = 2,
     pending_progress = 0, conflicts = {}, unknown_seconds = 0, unknown_annotations = 0,
 }
 assert(view:getOfflineSyncStatusText() == "微信读书　待传 8 分钟 · 2 条标注")
 view:showOfflineSyncStatus()
-assert(opened.title == "微信读书同步状态" and opened.text:find("480 秒", 1, true))
-assert(opened.text:find("待传划线和笔记：2 条", 1, true))
-opened.buttons_table[1][1].callback()
-assert(not opened)
+assert(opened.title == "微信读书同步状态" and opened.body.text:find("480 秒", 1, true))
+assert(opened.body.text:find("待传划线和笔记：2 条", 1, true))
+assert(opened.buttons[1][1].text == "关闭" and opened.buttons[1][2].text == "立即上传")
+opened.buttons[1][1].callback()
+assert(not opened and uploads == 0)
+view:showOfflineSyncStatus()
+assert(opened.buttons[1][2].enabled)
+opened.buttons[1][2].callback()
+assert(not opened and uploads == 1)
 
 status.pending_seconds, status.pending_annotations, status.pending_progress = 0, 0, 1
 assert(view:getOfflineSyncStatusText() == "微信读书　待传 1 本书的进度")
@@ -48,7 +75,8 @@ status.conflicts = { { title = "山谷来信" } }
 status.unknown_seconds, status.unknown_annotations = 30, 2
 assert(view:getOfflineSyncStatusText() == "微信读书　1 本书需选择进度")
 view:showOfflineSyncStatus()
-assert(opened.text:find("《山谷来信》", 1, true) and opened.text:find("30 秒时长，2 条标注", 1, true))
+assert(opened.body.text:find("《山谷来信》", 1, true) and opened.body.text:find("30 秒时长，2 条标注", 1, true))
+assert(opened.body.text:find("点「立即上传」选择要保留的进度", 1, true))
 status.state = "unknown"
 assert(view:getOfflineSyncStatusText() == "微信读书　有记录待核对")
 status.state = "idle"

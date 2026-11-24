@@ -222,18 +222,25 @@ function M:getMainMenuItems()
     return items
 end
 
+function M:syncOfflineNow()
+    if not self:requireLogin(true, false) then return false end
+    local book_id = self:detectWeReadBook()
+    if book_id and not WeRead.is_mp_book(book_id) then
+        return self.progress_sync:sync_now()
+    end
+    local requested = self.offline_sync:request("manual_sync", { manual = true })
+    if requested and not self:isNetworkConnected() then
+        self:showTransientInfo(_("Offline. Pending records stay on this device."))
+    end
+    return requested
+end
+
 function M:getOfflineSyncMenuItems()
     return {
         {
             text = _("Sync now"),
             callback = self:safeCallback(_("Sync now"), function()
-                if not self:requireLogin(true, false) then return end
-                local book_id = self:detectWeReadBook()
-                if book_id and not WeRead.is_mp_book(book_id) then
-                    self.progress_sync:sync_now()
-                else
-                    self.offline_sync:request("manual_sync", { manual = true })
-                end
+                self:syncOfflineNow()
             end),
         },
         {

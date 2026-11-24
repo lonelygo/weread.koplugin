@@ -45,38 +45,75 @@ function M:getOfflineSyncStatusText()
     return T(_("WeRead  %1"), summary(SyncStatus.get(self)))
 end
 
-function M:showOfflineSyncStatus()
-    local status = SyncStatus.get(self)
-    local lines = { summary(status) }
-    if status.available then
-        lines[#lines + 1] = ""
-        lines[#lines + 1] = T(_("Reading time pending: %1 s"), status.pending_seconds)
-        lines[#lines + 1] = T(_("Highlights and notes pending: %1"), status.pending_annotations)
-        lines[#lines + 1] = T(_("Books with progress pending: %1"), status.pending_progress)
-        for _i, book in ipairs(status.conflicts) do
-            lines[#lines + 1] = T(_("Progress conflict: %1. Select Sync now to review."), book.title or book.book_id)
-        end
-        if status.unknown_seconds > 0 or status.unknown_annotations > 0 then
-            lines[#lines + 1] = T(_("Unconfirmed by WeRead: %1 s, %2 annotations"),
-                status.unknown_seconds, status.unknown_annotations)
-            lines[#lines + 1] = _("Check these records in WeRead.")
-        end
-        if status.last_confirmed_at and status.state ~= "synced" then
-            lines[#lines + 1] = T(_("Last fully confirmed: %1"), confirmedTime(status.last_confirmed_at))
-        end
+local function details(status)
+    if not status.available then return summary(status) end
+    local lines = {}
+    if status.state ~= "pending" then
+        lines = { summary(status), "" }
     end
-    local UIManager = require("ui/uimanager")
-    local TextViewer = require("ui/widget/textviewer")
-    local viewer
-    viewer = TextViewer:new{
-        title = _("WeRead sync status"), text = table.concat(lines, "\n"),
-        show_menu = false, auto_para_direction = true,
-        buttons_table = {{{
-            text = _("Close"),
-            callback = function() UIManager:close(viewer) end,
-        }}},
+    lines[#lines + 1] = T(_("Reading time pending: %1 s"), status.pending_seconds)
+    lines[#lines + 1] = T(_("Highlights and notes pending: %1"), status.pending_annotations)
+    lines[#lines + 1] = T(_("Books with progress pending: %1"), status.pending_progress)
+    for _i, book in ipairs(status.conflicts) do
+        lines[#lines + 1] = T(_("Progress conflict: %1"), book.title or book.book_id)
+    end
+    if #status.conflicts > 0 then
+        lines[#lines + 1] = _("Select Upload now to choose which progress to keep.")
+    end
+    if status.unknown_seconds > 0 or status.unknown_annotations > 0 then
+        lines[#lines + 1] = T(_("Unconfirmed by WeRead: %1 s, %2 annotations"),
+            status.unknown_seconds, status.unknown_annotations)
+        lines[#lines + 1] = _("Check these records in WeRead.")
+    end
+    if status.last_confirmed_at and status.state ~= "synced" then
+        lines[#lines + 1] = T(_("Last fully confirmed: %1"), confirmedTime(status.last_confirmed_at))
+    end
+    return table.concat(lines, "\n")
+end
+
+local function addStatusText(dialog, text)
+    local width = dialog:getAddedWidgetAvailableWidth()
+    local face = require("ui/font"):getFace("cfont", 20)
+    local body = require("ui/widget/textboxwidget"):new{
+        text = text, width = width, face = face, auto_para_direction = true,
     }
-    UIManager:show(viewer)
+    -- Long book titles and multiple progress conflicts can wrap onto many lines.
+    local limit = math.floor(require("device").screen:getHeight() * 0.45)
+    if body:getSize().h > limit then
+        body:free()
+        body = require("ui/widget/scrolltextwidget"):new{
+            text = text, width = width, face = face, auto_para_direction = true,
+            height = limit, dialog = dialog,
+        }
+    end
+    body.not_focusable = true
+    dialog:addWidget(body)
+end
+
+function M:showOfflineSyncStatus()
+    local UIManager = require("ui/uimanager")
+    local status = SyncStatus.get(self)
+    local dialog
+    dialog = require("ui/widget/buttondialog"):new{
+        title = _("WeRead sync status"),
+        use_info_style = false,
+        width_factor = 0.82,
+        buttons = {{
+            {
+                id = "close", text = _("Close"),
+                callback = function() UIManager:close(dialog) end,
+            },
+            {
+                id = "upload", text = _("Upload now"), enabled = status.signed_in,
+                callback = self:safeCallback(_("Upload now"), function()
+                    UIManager:close(dialog)
+                    self:syncOfflineNow()
+                end),
+            },
+        }},
+    }
+    addStatusText(dialog, details(status))
+    UIManager:show(dialog)
 end
 
 return M

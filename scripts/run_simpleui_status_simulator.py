@@ -208,6 +208,11 @@ def main() -> None:
     if result is None or result.returncode != 0:
         print(f"FAIL: {log}")
         raise SystemExit(1 if result is None else result.returncode)
+    seconds = sum(report["rt"] for report in state["read_reports"] if report["bookId"] == "900001")
+    notes = [write["payload"] for write in state["annotation_writes"] if write["path"] == "/web/review/add"]
+    received = sorted((note["bookId"], note["content"], note["isPrivate"]) for note in notes)
+    if seconds != 30 or received != [("900001", "私密笔记1", 1), ("900001", "私密笔记2", 1)]:
+        raise RuntimeError("Home upload did not deliver the expected reading time and two private notes")
     screenshots = sorted(evidence.glob("*.png"))
     if len(screenshots) != 7:
         raise RuntimeError(f"expected 7 screenshots, found {len(screenshots)}")
