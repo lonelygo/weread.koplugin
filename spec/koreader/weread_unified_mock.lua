@@ -264,8 +264,9 @@ if os.getenv("WEREAD_COMPARE_FAILURE") == "1" then
     comparison_failure_checked = true
     api("/__control", { progress_successes_before_failure = -1 })
 end
--- Intentionally omit NetworkConnected: only the real heartbeat must recover work.
-heartbeat()
+-- No NetworkConnected event. Exercise the normal heartbeat or an explicit tap.
+local manual = os.getenv("WEREAD_MANUAL_SYNC") == "1"
+if manual then current_plugin():getOfflineSyncMenuItems()[1].callback() else heartbeat() end
 local selected = false
 wait_for("unified heartbeat drains queues", function()
     if choice == "auto" then
@@ -282,6 +283,18 @@ wait_for("unified heartbeat drains queues", function()
 end)
 local first = api("/__state")
 assert(first.annotation_writes[1].payload.isPrivate == 1, "private note uploaded")
+local function completion()
+    for _, entry in ipairs(UIManager._window_stack) do
+        if entry.widget.text == "Sync complete. WeRead confirmed the upload." then return entry.widget end
+    end
+end
+if manual then
+    wait_for("full-batch confirmation after progress choice", completion)
+    assert(require("weread.lib.sync_status").get(current_plugin()).state == "synced")
+    UIManager:close(completion())
+else
+    assert(not completion(), "a background heartbeat showed a manual upload confirmation")
+end
 local position_after_choice
 if ReaderUI.instance then
     position_after_choice = reader().weread.progress_sync:capture_local()

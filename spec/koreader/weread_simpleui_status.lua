@@ -206,7 +206,7 @@ assert(card_dimen.y + card_dimen.h <= initial_status_dimen.y,
 screen_shot("01-empty")
 
 local database = plugin.library_db
-assert(database:enqueueReadTime("900001", 30, {
+assert(database:enqueueReadTime("900001", 50, {
     book_id = "900001", chapter_uid = 1, progress = 67,
 }))
 local annotations, changed = {}, {}
@@ -228,7 +228,7 @@ end
 assert(database:putLocalAnnotationSnapshot(
     "900001", current_path, annotations, { changed = changed }))
 wait_for("pending Home summary", function()
-    return status_text():find("30 秒", 1, true)
+    return status_text():find("50 秒", 1, true)
         and status_text():find("2 条", 1, true)
 end)
 assert(status_row().dimen.x == initial_status_dimen.x
@@ -271,30 +271,80 @@ screen_shot("03-details")
 tap_action(dialog, "close")
 wait_for("close returns to Home", back_on_home)
 local SyncStatus = require("weread.lib.sync_status")
-assert(SyncStatus.get(plugin).pending_seconds == 30 and SyncStatus.get(plugin).pending_annotations == 2)
+assert(SyncStatus.get(plugin).pending_seconds == 50 and SyncStatus.get(plugin).pending_annotations == 2)
+
+local function wait_result(label, text, timeout)
+    local result
+    wait_for(label, function()
+        result = UIManager._window_stack[#UIManager._window_stack].widget
+        return type(result.text) == "string" and result.text:find(text, 1, true)
+    end, timeout)
+    assert(not result.timeout, "terminal feedback must stay until dismissed")
+    return result
+end
+local function dismiss_result()
+    tap(math.floor(screen_width / 2), math.floor(screen_height / 2))
+    wait_for("dismiss result to Home", back_on_home)
+end
+local function set_service_failure(times)
+    local http = require("socket.http")
+    local ltn12 = require("ltn12")
+    local body = json.encode{ status = 503, times = times }
+    local _, code = http.request{
+        url = plugin.settings.mock_endpoint .. "/__control", method = "POST",
+        headers = { ["Content-Type"] = "application/json", ["Content-Length"] = tostring(#body) },
+        source = ltn12.source.string(body), sink = ltn12.sink.null(),
+    }
+    assert(code == 200)
+end
+local function menu_sync() plugin:getOfflineSyncMenuItems()[1].callback() end
+local confirmed_text = "同步完成，微信读书已确认收到全部待传记录。"
 
 tap_action(open_details(), "upload")
-wait_for("offline feedback", function()
-    return UIManager._window_stack[#UIManager._window_stack].widget.text == "当前未联网，待传记录会保留在本机。"
-end)
-wait_for("offline upload returns to Home", back_on_home)
-assert(SyncStatus.get(plugin).pending_seconds == 30 and SyncStatus.get(plugin).pending_annotations == 2)
+wait_result("offline feedback", "当前未联网")
+dismiss_result()
+assert(SyncStatus.get(plugin).pending_seconds == 50 and SyncStatus.get(plugin).pending_annotations == 2)
 assert(wifi_wake_calls == 0, "offline upload woke Wi-Fi")
 
-dialog = open_details()
--- No network event: the tap itself must reach the manual coordinator from Home.
+-- A saved Wi-Fi link can be up while the service returns HTTP 503.
 connected = true
+set_service_failure(-1)
+menu_sync()
+local failed = wait_result("service failure from settings", "未能连接微信读书")
+assert(failed.text:find("50 秒", 1, true) and failed.text:find("2 条", 1, true))
+screen_shot("08-service-failure")
+dismiss_result()
+assert(SyncStatus.get(plugin).pending_seconds == 50 and SyncStatus.get(plugin).pending_annotations == 2)
+set_service_failure(0)
+
+dialog = open_details()
+-- No network event. The tap must retry on its own and wait for both time slices.
 tap_action(dialog, "upload")
-wait_for("upload returns to Home", back_on_home)
-wait_for("real service acknowledgements", function()
-    local snapshot = SyncStatus.get(plugin)
-    return snapshot.state == "synced" and snapshot.last_confirmed_at ~= nil
-end, 45)
+wait_for("partial reading-time acknowledgement", function()
+    assert(UIManager._window_stack[#UIManager._window_stack].widget.text ~= confirmed_text)
+    return SyncStatus.get(plugin).pending_seconds == 20 and status_text():find("20 秒", 1, true)
+end)
+wait_result("upload confirmed from Home", confirmed_text, 50)
 local acknowledged = SyncStatus.get(plugin)
-assert(acknowledged.pending_seconds == 0 and acknowledged.pending_annotations == 0,
+assert(acknowledged.state == "synced" and acknowledged.last_confirmed_at
+    and acknowledged.pending_seconds == 0 and acknowledged.pending_annotations == 0,
     "acknowledged queue did not drain")
+screen_shot("09-upload-confirmed")
+dismiss_result()
 wait_for("acknowledgement shown on Home", function() return status_text():find("已同步", 1, true) end)
 screen_shot("05-synced")
+
+menu_sync()
+wait_result("empty queue, even with an old receipt", "当前没有待传记录。")
+dismiss_result()
+assert(database:enqueueReadTime("900001", 7, { book_id = "900001", chapter_uid = 1, progress = 67 }))
+menu_sync()
+menu_sync()
+wait_result("one completion from settings after two taps", confirmed_text, 50)
+assert(SyncStatus.get(plugin).pending_seconds == 0)
+dismiss_result()
+spin(0.4)
+assert(back_on_home(), "duplicate completion after repeated taps")
 
 local hidden_row = assert(status_row())
 local hidden_page_snapshot = status_text()
@@ -367,7 +417,7 @@ assert(wifi_wake_calls == 0, "Home interactions woke Wi-Fi")
 
 local evidence = {
     empty = "暂无待传记录",
-    pending = "待传 30 秒 · 2 条标注",
+    pending = "待传 50 秒 · 2 条标注",
     synced_at = acknowledged.last_confirmed_at,
     progress = "待传 1 本书的进度",
     conflict = "1 本书需选择进度",

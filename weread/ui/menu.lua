@@ -225,14 +225,10 @@ end
 function M:syncOfflineNow()
     if not self:requireLogin(true, false) then return false end
     local book_id = self:detectWeReadBook()
-    if book_id and not WeRead.is_mp_book(book_id) then
-        return self.progress_sync:sync_now()
-    end
-    local requested = self.offline_sync:request("manual_sync", { manual = true })
-    if requested and not self:isNetworkConnected() then
-        self:showTransientInfo(_("Offline. Pending records stay on this device."))
-    end
-    return requested
+    if book_id and WeRead.is_mp_book(book_id) then book_id = nil end
+    local started = self.offline_sync:startManual(book_id and tostring(book_id))
+    if not started then self:showInfo(_("Sync is unavailable. Reopen sync status and try again.")) end
+    return started
 end
 
 function M:getOfflineSyncMenuItems()

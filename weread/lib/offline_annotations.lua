@@ -321,8 +321,10 @@ function OfflineAnnotations:wake()
         return false
     end
     if self.worker:busy() then
-        if self:_has_pending() then self:_schedule_retry(2) end
-        return false
+        -- The prefetch worker is shared. This drain is still in progress
+        -- while its retry waits for the other job to release the worker.
+        self:_schedule_retry(2)
+        return true
     end
     local book_id = type(self.library_db.pendingOfflineBook) == "function"
         and self.library_db:pendingOfflineBook(false, true) or nil

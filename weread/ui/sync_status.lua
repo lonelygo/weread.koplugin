@@ -45,6 +45,41 @@ function M:getOfflineSyncStatusText()
     return T(_("WeRead  %1"), summary(SyncStatus.get(self)))
 end
 
+local result_messages = {
+    uploaded = "Sync complete. WeRead confirmed the upload.",
+    empty = "No records are waiting to upload.",
+    matched = "Reading progress matches WeRead. Nothing to upload.",
+    offline = "Offline. Pending records stay on this device.",
+    unreachable = "Could not reach WeRead. Check your connection and login, then try again.",
+    unconfirmed = "WeRead did not confirm the upload.",
+    progress_failed = "Could not sync reading progress with WeRead.",
+    unknown = "The upload result is uncertain. Check these records in WeRead before retrying.",
+    conflict = "Sync paused. Choose which reading progress to keep to continue.",
+    pending = "Some records could not be uploaded yet.",
+    unavailable = "Sync status unavailable",
+}
+
+function M:showManualSyncResult(reason, status)
+    if reason == "started" then
+        local Notification = require("ui/widget/notification")
+        Notification:notify(_("Syncing with WeRead…"), Notification.SOURCE_ALWAYS_SHOW)
+        return
+    end
+    local message = _(result_messages[reason])
+    if status.available and (status.state == "pending" or status.state == "unknown" or status.state == "conflict") then
+        if status.pending_seconds > 0 and self.settings:get("read_report", {}).enabled ~= true then
+            message = message .. "\n" .. _("Reading time reporting is turned off.")
+        end
+        if status.pending_annotations > 0 and self.settings:get("sync", {}).upload_annotations == false then
+            message = message .. "\n" .. _("Annotation uploading is turned off.")
+        end
+        if status.state == "pending" or status.state == "conflict" then
+            message = message .. "\n" .. summary(status)
+        end
+    end
+    self:showInfo(message)
+end
+
 local function details(status)
     if not status.available then return summary(status) end
     local lines = {}

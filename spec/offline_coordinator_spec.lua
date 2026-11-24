@@ -3,7 +3,7 @@ package.path = "./?.lua;" .. package.path
 local Sync = require("weread.lib.offline_sync")
 local function fixture()
     local state = { account = "alice", online = true, queued = nil, time = 1, probes = 0,
-        positions = 0, times = 0, annotations = 0, captures = 0, pending_positions = 0 }
+        positions = 0, times = 0, annotations = 0, captures = 0, pending_positions = 0, notices = {} }
     local prefs = { sync = { upload_annotations = true }, read_report = { enabled = true } }
     local tasks = {}
     local scheduler = {
@@ -11,28 +11,38 @@ local function fixture()
         unschedule = function(_, task) tasks[task] = nil end,
     }
     local plugin = {
-        settings = { get = function(_, key) return prefs[key] end },
+        settings = { get = function(_, key, default)
+            if key == "account" then return { user_vid = state.account } end
+            return prefs[key] or default
+        end },
         library_db = {
+            data_dir = "coordinator-spec",
             accountKey = function() return state.account end,
+            offlineStatus = function()
+                return { available = true, pending_seconds = state.seconds or 0, annotations = {},
+                    unknown_seconds = state.unknown or 0, last_confirmed_at = 1 }
+            end,
             pendingOfflineBook = function(_, with_time, with_annotations)
                 if with_time or with_annotations then return state.queued end
             end,
         },
         isNetworkConnected = function() return state.online end,
+        showManualSyncResult = function(_, code) table.insert(state.notices, code) end,
         progress_sync = {
             capture_for_reconnect = function() state.captures = state.captures + 1 end,
             has_pending = function()
                 return state.pending_positions > 0,
                     { actionable = state.pending_positions, book_id = state.position_book }
             end,
-            awaiting_choice = function(_, book) return state.conflict == book end,
+            awaiting_choice = function(_, book) return state.conflict and (not book or state.conflict == book) end,
             reconcile_pending = function(_, done, options)
                 state.positions = state.positions + 1
                 state.options = options
                 if state.hold then state.finish = done else done({ status = "idle" }) end
             end,
         },
-        read_report = { drain = function() state.times = state.times + 1 end },
+        read_report = { drain = function() state.times = state.times + 1; return state.scheduled end,
+            capture_for_manual = function() end },
         _offlineAnnotationCoordinator = function()
             return { drain = function() state.annotations = state.annotations + 1 end }
         end,
@@ -154,4 +164,95 @@ assert(yes)
 finish({ accepted = false, write_attempted = true, error_kind = "transport" })
 assert(not second:gate("annotation_write", {}), "failed transport should require another probe")
 second:deactivate()
+
+local feedback, f, _, step, flags = fixture()
+local status = require("weread.lib.sync_status")
+local function work(seconds, unknown)
+    f.seconds, f.unknown = seconds, unknown
+    f.queued = seconds > 0 and "book" or nil
+    status.invalidateOffline(feedback.plugin.settings)
+end
+local function notices(expected)
+    assert(table.concat(f.notices, ",") == expected, table.concat(f.notices, ","))
+    f.notices = {}
+end
+feedback:activate()
+f.scheduled = true
+work(50)
+feedback.heartbeat()
+step()
+f.job.on_done({ ok = true, value = true })
+step()
+local _, ack = feedback:gate("weread_read_write", { operation = "reading_time" })
+work(0)
+ack({ accepted = true })
+step()
+notices("") -- background replay stays silent
+
+feedback:startManual()
+step()
+notices("started,empty") -- yesterday's confirmation is not today's receipt
+work(50)
+feedback:startManual()
+feedback:startManual()
+step()
+f.job.on_done({ ok = true, value = true })
+step()
+local _, part = feedback:gate("weread_read_write", { operation = "reading_time" })
+work(20)
+part({ accepted = true })
+step()
+notices("started") -- a positive reply for only the first item
+local _, lost = feedback:gate("weread_read_write", { operation = "reading_time" })
+work(0, 20)
+lost({ accepted = false, write_attempted = true, error_kind = "transport" })
+step()
+notices("unknown")
+work(10)
+feedback:startManual()
+step()
+f.job.on_done({ ok = true, value = true })
+step()
+local _, rejected = feedback:gate("weread_read_write", { operation = "reading_time" })
+rejected({ accepted = false, error_kind = "server" })
+step()
+notices("started,unconfirmed")
+
+feedback:startManual()
+step()
+f.job.on_done({ ok = true, value = true })
+step()
+local _, from_alice = feedback:gate("weread_read_write", { operation = "reading_time" })
+f.account = "other"
+work(0)
+from_alice({ accepted = true })
+step()
+notices("started") -- stale replies do not notify the new login
+flags.read_report.enabled, flags.sync.upload_annotations = false, false
+work(20)
+feedback:startManual()
+step()
+notices("started,pending")
+work(0)
+f.position_book, f.pending_positions = "book", 1
+feedback:startManual()
+step()
+f.hold = true
+f.job.on_done({ ok = true, value = true })
+step()
+f.position_book, f.pending_positions = nil, 0
+f.finish({ status = "synced" })
+feedback:request("matching_progress_finished")
+step()
+notices("started,matched") -- a read-only match does not claim an upload
+local reader, reader_state, _, reader_step = fixture()
+reader_state.account = f.account
+reader:activate()
+assert(feedback:startManual(), "Home tap on the reused FileManager should reach the active reader")
+reader_step()
+assert(table.concat(reader_state.notices, ",") == "started,empty")
+reader_state.account = "separate-login"
+assert(not feedback:startManual(), "a Home tap cannot start work on behalf of a different login")
+reader:deactivate()
+feedback:deactivate()
 print("offline_coordinator_spec: passive checks, replay gates, account and screen transitions passed")

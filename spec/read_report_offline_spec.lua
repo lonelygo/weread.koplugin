@@ -163,6 +163,19 @@ local during_write = report:_run_pipeline("queued-book", { allow_renewal = false
 assert(during_write.error_kind == "transport"
     and during_write.write_attempted == true,
     "ambiguous reading-time request was incorrectly made replayable")
+for _, reply in ipairs({
+    { { succ = 1 }, 200, true },
+    { { data = { synckey = "1234" } }, 200, true },
+    { { succ = 0, synckey = "1234" }, 200, false },
+    { { errCode = -1, data = { succ = 1 } }, 200, false },
+    { { succ = 1, data = { errcode = -2 } }, 200, false },
+    { { succ = 1 }, 503, false },
+    { {}, 200, false },
+}) do
+    report._send = function() return reply[1], reply[2] end
+    local received = report:_run_pipeline("queued-book", { allow_renewal = false })
+    assert(received.accepted == reply[3], "incorrectly interpreted a reading-time receipt")
+end
 report.ensure_context = saved_ensure_context
 report._send = saved_send
 
@@ -176,6 +189,24 @@ assert(report:report_once())
 assert(pipeline_options.force_context == true and pipeline_options.position == nil,
     "reading-time replay reused an offline position that could regress cloud progress")
 report._run_pipeline = saved_run_pipeline
+
+local original_detect = report.detect_book
+report.detect_book = function() return nil end -- An ordinary EPUB is open.
+local target, _, source = report:resolve_target()
+assert(target == "queued-book" and source == "offline_queue")
+report.current_book_source = source
+report.last_accounted_at = clock - 30
+assert(report:_capture_active_time() == 0, "replay billed a local EPUB to the queued WeRead book")
+report.detect_book = original_detect
+report.current_book_source = "current_document"
+report.task = function() end
+local captured = #captures
+assert(report:drain(true))
+report:_precheck()
+assert(#captures == captured and report.last_accounted_at == clock - 30,
+    "a manual replay slice created a new slice or dropped the active clock")
+assert(report:_capture_active_time() == 30, "reading during replay must still be counted")
+report.task = nil
 
 local claims_before_busy = 0
 library_db.claimReadTime = function()

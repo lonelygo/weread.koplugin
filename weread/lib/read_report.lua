@@ -144,23 +144,25 @@ local function table_keys(value)
     return table.concat(keys, "|")
 end
 
+local function rejected(node)
+    if type(node) ~= "table" then return false end
+    local code = node.errCode or node.errcode or node.errorCode
+    return (code ~= nil and tonumber(code) ~= 0)
+        or (node.succ ~= nil and not WeRead.is_success_response(node))
+end
+
 local function response_accepted(result, http_code)
     local body = response_body(result)
-    if WeRead.is_success_response(body) then
-        return true, body
-    end
-    if type(body) ~= "table" then
+    local status = tonumber(http_code)
+    if type(body) ~= "table" or (status and (status < 200 or status >= 300)) then
         return false, body
     end
-    if body.synckey ~= nil then
-        return true, body
-    end
-    local error_code = body.errCode or body.errcode or body.errorCode
-        or result.errCode or result.errcode or result.errorCode
-    if error_code ~= nil then
+    if rejected(result) or rejected(result.data) or rejected(result.result) then
         return false, body
     end
-    return false, body
+    local key_type = type(body.synckey)
+    return WeRead.is_success_response(body)
+        or ((key_type == "string" or key_type == "number") and tostring(body.synckey) ~= ""), body
 end
 
 local function full_response_body(client, result)
@@ -339,20 +341,7 @@ function ReadReport:resolve_target()
             "manual"
     end
 
-    if not has_document then
-        local queued = self.library_db
-            and type(self.library_db.nextReadTime) == "function"
-            and self.library_db:nextReadTime() or nil
-        if queued then
-            local book = book_record(self.settings:get("books", {}), queued.book_id)
-            return tostring(queued.book_id),
-                type(book) == "table" and book.title or tostring(queued.book_id),
-                "offline_queue"
-        end
-        return nil, nil, "no_document"
-    end
-
-    local detected_id = self.detect_book()
+    local detected_id = has_document and self.detect_book()
     if detected_id then
         detected_id = tostring(detected_id)
         -- Avoid reloading every book record from disk on each tick just for
@@ -366,7 +355,13 @@ function ReadReport:resolve_target()
             type(book) == "table" and book.title or detected_id,
             "current_document"
     end
-    return nil, nil, "document_not_weread"
+    local queued = self.library_db and self.library_db.nextReadTime and self.library_db:nextReadTime()
+    if queued then
+        local book = book_record(self.settings:get("books", {}), queued.book_id)
+        return tostring(queued.book_id),
+            type(book) == "table" and book.title or tostring(queued.book_id), "offline_queue"
+    end
+    return nil, nil, has_document and "document_not_weread" or "no_document"
 end
 
 function ReadReport:_set_error(err, kind, prefix)
@@ -471,6 +466,7 @@ end
 
 function ReadReport:stop(reason)
     reason = reason or "unspecified"
+    self.manual_replay_tick = nil
     local had_task = self.task ~= nil
     self.generation = self.generation + 1
     if self.task then
@@ -545,7 +541,8 @@ function ReadReport:on_close_document()
 end
 
 function ReadReport:_capture_active_time(position)
-    if self.suspended or self.get_document() == nil or not self.last_accounted_at then
+    if self.suspended or self.current_book_source == "offline_queue"
+        or self.get_document() == nil or not self.last_accounted_at then
         return 0
     end
     local now = self.active_now()
@@ -569,6 +566,10 @@ function ReadReport:_capture_active_time(position)
     end
     self.last_accounted_at = now
     return elapsed
+end
+
+function ReadReport:capture_for_manual()
+    if self.task then self:_capture_active_time() end
 end
 
 -- ------------------------------------------------------------------
@@ -646,6 +647,8 @@ end
 -- Parent-side gate before any network work. Returns true, book_id when a
 -- report should be attempted. Must stay cheap: it runs on the UI loop.
 function ReadReport:_precheck()
+    local replay_only = self.manual_replay_tick
+    self.manual_replay_tick = nil
     local config = self:_config()
     if not config.enabled then
         self:stop("disabled")
@@ -680,7 +683,13 @@ function ReadReport:_precheck()
     if type(self.position_provider) == "function" then
         position, position_reason, position_applies = self.position_provider(book_id)
     end
-    local elapsed = self:_capture_active_time(position)
+    -- A manual replay in the reader can take several 30-second slots. Do
+    -- not append another slot on each replay tick. The active clock keeps
+    -- running and normal reading, suspend and close still capture that time.
+    local elapsed = 0
+    if not replay_only or not self.is_online() then
+        elapsed = self:_capture_active_time(position)
+    end
     if self.library_db and type(self.library_db.claimReadTime) == "function" then
         if type(self.library_db.recoverStaleReadTimeClaims) == "function" then
             self.library_db:recoverStaleReadTimeClaims(
@@ -1286,8 +1295,10 @@ function ReadReport:on_network_connected()
     return true
 end
 
-function ReadReport:drain()
-    return self:on_network_connected()
+function ReadReport:drain(manual)
+    local scheduled = self:on_network_connected()
+    if scheduled and manual then self.manual_replay_tick = true end
+    return scheduled
 end
 
 -- ------------------------------------------------------------------

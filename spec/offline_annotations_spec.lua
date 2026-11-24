@@ -153,7 +153,7 @@ finish()
 active = { kind = "other_worker" }
 annotations[4] = { id = "wait", page = "p4", text = "wait", drawer = "lighten" }
 assert(coordinator:capture("book", "/book.epub", annotations, { annotations[4] }))
-coordinator:drain()
+assert(coordinator:drain(), "manual sync must wait for the shared worker retry")
 local retry_task = assert(coordinator.retry_task,
     "busy shared worker did not arm a delayed annotation retry")
 coordinator:wake()

@@ -198,7 +198,9 @@ function WeReadPlugin:init()
             ProgressSyncDialog.show_choice(context)
         end,
         notify = function(code, data)
-            ProgressSyncDialog.notify(code, data)
+            if not self.offline_sync:handlesProgressNotice(code) then
+                ProgressSyncDialog.notify(code, data)
+            end
         end,
     }
     self:onDispatcherRegisterActions()
