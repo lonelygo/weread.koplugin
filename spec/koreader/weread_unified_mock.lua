@@ -188,15 +188,21 @@ UIManager.scheduleIn = function(self, seconds, callback, ...)
     if callback == coordinator.heartbeat then heartbeat_schedule[#heartbeat_schedule + 1] = seconds end
     return schedule_in(self, seconds, callback, ...)
 end
-local preferences = current_plugin().settings:get("sync")
-preferences.heartbeat_minutes = 2
-current_plugin().settings:set("sync", preferences)
-coordinator:reschedule_heartbeat()
+local interval_menu = current_plugin():getOfflineSyncMenuItems()[2]
+local choices = interval_menu.sub_item_table_func()
+local intervals = { 1, 2, 5, 10, 30, 60 }
+assert(#choices == #intervals)
+for index, minutes in ipairs(intervals) do
+    assert(choices[index].text == minutes .. " min", "wrong heartbeat choice label")
+    assert(choices[index].checked_func() == (minutes == 10), "wrong default heartbeat choice")
+end
+choices[2].callback()
+local saved = require("luasettings"):open(current_plugin().settings.settings_file)
+assert(saved:readSetting("sync").heartbeat_minutes == 2 and interval_menu.sub_item_table_func()[2].checked_func(),
+    "selected heartbeat persists and is checked when the menu is reopened")
 assert(coordinator:interval_seconds() == 120 and heartbeat_schedule[#heartbeat_schedule] == 120,
     "configured heartbeat schedules two minutes")
-preferences.heartbeat_minutes = 10
-current_plugin().settings:set("sync", preferences)
-coordinator:reschedule_heartbeat()
+choices[4].callback()
 assert(coordinator:interval_seconds() == 600 and heartbeat_schedule[#heartbeat_schedule] == 600,
     "default heartbeat schedules ten minutes")
 UIManager.scheduleIn = schedule_in

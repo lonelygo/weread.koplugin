@@ -242,7 +242,7 @@ function M:getOfflineSyncMenuItems()
             end,
             sub_item_table_func = function()
                 local items = {}
-                for _, minutes in ipairs({ 1, 2, 5, 10, 30, 60 }) do
+                for _i, minutes in ipairs({ 1, 2, 5, 10, 30, 60 }) do
                     table.insert(items, {
                         text = T(_("%1 min"), minutes),
                         checked_func = function() return self.offline_sync:interval_seconds() == minutes * 60 end,
