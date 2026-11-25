@@ -7,6 +7,10 @@ package.preload["weread.lib.content"] = function()
             calls[#calls + 1] = "reader"
             book.reader_url = "https://reader/book"
         end,
+        ensure_book_cover = function()
+            calls[#calls + 1] = "cover"
+            return "cover"
+        end,
         ensure_catalog = function(_client, _settings, book)
             book.chapters = book.chapters or {
                 { chapterUid = "2", title = "Two" },
@@ -97,8 +101,8 @@ assert(result.annotation_document and result.annotation_document.clean)
 assert(result.auth and result.auth.wr_ticket == "renewed")
 assert(flushes == 0, "child worker must not flush parent LuaSettings")
 assert(table.concat(calls, ",")
-    == "reader,workspace,source,images,epub,aggregate,cleanup")
+    == "reader,cover,workspace,source,images,epub,aggregate,cleanup")
 assert(table.concat(progress, ",")
-    == "reader,source,images,footnotes,epub")
+    == "reader,cover,source,images,footnotes,epub")
 
 print("chapter_prefetch_worker_spec: isolated settings and complete pipeline passed")

@@ -400,4 +400,17 @@ end
 probe_client.get_web_progress = function() error("503") end
 expect(not probe_client:probe_sync("book"), "a failed service probe authorized a write")
 
+-- Preserve the actual status for read-report delivery decisions. A decoded
+-- refusal and an unreadable error page must never resemble a success receipt.
+local report_client = setmetatable({ json_encode = function() return "{}" end }, { __index = Client })
+for _, refusal_code in ipairs({ 400, 401, 403, 422, 429 }) do
+    report_client.request = function() return "fixture", refusal_code, {} end
+    report_client.json_decode = function() return { errCode = -100, succ = 0 } end
+    local refusal, status = report_client:report_read({})
+    expect(status == refusal_code and refusal.succ == 0, "read refusal lost HTTP status " .. refusal_code)
+end
+report_client.json_decode = function() error("undecodable") end
+local invalid_body, failure_status = report_client:report_read({})
+expect(invalid_body == nil and failure_status == 429, "unreadable HTTP failure lost its status")
+
 print(("client_spec: %d checks"):format(checks))

@@ -5,6 +5,7 @@ local logger = require("weread.lib.logger")
 
 local Content = {}
 local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local module_dir = debug.getinfo(1, "S").source:match("^@(.*/)") or ""
 -- Forward declarations used by the resumable-download checkpoint helpers.
 local xml_escape
 local body_fragment
@@ -398,6 +399,193 @@ local function atomic_write(path, data)
         return nil, rename_err
     end
     return true
+end
+
+local function read_binary(path)
+    local file = type(path) == "string" and io.open(path, "rb") or nil
+    if not file then return nil end
+    local data = file:read("*a")
+    file:close()
+    return data
+end
+
+local function valid_cover_data(data)
+    if type(data) ~= "string" or #data < 32 then return false end
+    local ext, mime = media_type_for(data)
+    return ext ~= ".bin" and mime:match("^image/") ~= nil, ext
+end
+
+function Content.fallback_cover_path()
+    return module_dir .. "../../icons/offline-cover.jpg"
+end
+
+local function cover_cache_path(settings, book, kind, ext)
+    local book_id = book.book_id or book.bookId
+    local dir = Content.book_resolved_dir(settings, book_id, book)
+    return dir .. "/cover-" .. kind .. ext
+end
+
+local function find_cached_cover(settings, book, kind)
+    for _, ext in ipairs({ ".jpg", ".png", ".gif", ".webp" }) do
+        local path = cover_cache_path(settings, book, kind, ext)
+        local data = read_binary(path)
+        if valid_cover_data(data) then return data, path end
+    end
+end
+
+-- Return the book-local source cover first and the bundled fallback second.
+-- Keeping this outside the chapter workspace makes it survive cancellation and
+-- lets every later incremental rebuild expose the same cover to KOReader.
+function Content.load_book_cover(settings, book)
+    local data, path = find_cached_cover(settings, book, "source")
+    if data then return data, path, false end
+    data, path = find_cached_cover(settings, book, "fallback")
+    if data then return data, path, true end
+end
+
+local function cache_cover(settings, book, kind, data)
+    local valid, ext = valid_cover_data(data)
+    if not valid then return nil, "cover is not a supported image" end
+    local book_id = book.book_id or book.bookId
+    local dir = Content.book_resolved_dir(settings, book_id, book)
+    make_path(dir)
+    book.cache_dir = dir
+    local path = cover_cache_path(settings, book, kind, ext)
+    local saved, err = atomic_write(path, data)
+    if not saved then return nil, err or "could not cache cover" end
+    return data, path
+end
+
+local function managed_custom_cover_marker(settings, book)
+    local book_id = book.book_id or book.bookId
+    return Content.book_resolved_dir(settings, book_id, book)
+        .. "/managed-custom-cover-v1.meta"
+end
+
+local function read_managed_custom_cover_hash(settings, book)
+    local marker = read_binary(managed_custom_cover_marker(settings, book))
+    return marker and marker:match("^sha256=([0-9a-fA-F]+)%s*$") or nil
+end
+
+local function write_managed_custom_cover_hash(settings, book, data)
+    return atomic_write(managed_custom_cover_marker(settings, book),
+        "sha256=" .. Crypto.sha256_hex(data) .. "\n")
+end
+
+local function update_managed_custom_cover(settings, book, image_path, data)
+    local expected = read_managed_custom_cover_hash(settings, book)
+    if not expected or not book.incremental_reader_file then return false end
+    local ok, DocSettings = pcall(require, "docsettings")
+    if not ok or not DocSettings then return false end
+    local current = DocSettings:findCustomCoverFile(book.incremental_reader_file)
+    local current_data = read_binary(current)
+    if not current_data or Crypto.sha256_hex(current_data) ~= expected then
+        pcall(os.remove, managed_custom_cover_marker(settings, book))
+        return false
+    end
+    if not DocSettings:flushCustomCover(book.incremental_reader_file, image_path) then
+        return false
+    end
+    local current_after_flush = read_binary(current)
+    if current_after_flush ~= data
+        and Crypto.sha256_hex(current_after_flush or "") == expected then
+        pcall(os.remove, current)
+    end
+    local replaced = DocSettings:findCustomCoverFile(book.incremental_reader_file)
+    local replaced_data = read_binary(replaced)
+    if replaced_data and replaced_data == data then
+        write_managed_custom_cover_hash(settings, book, replaced_data)
+        return true
+    end
+    return false
+end
+
+-- Fetching the cover is independent of the chapter-image preference. A cached
+-- fallback is deliberately retried on a later download so a temporary CDN
+-- failure does not permanently replace the real book cover.
+function Content.ensure_book_cover(client, settings, book)
+    local data, path, fallback = Content.load_book_cover(settings, book)
+    if data and not fallback then
+        update_managed_custom_cover(settings, book, path, data)
+        return data, path, false
+    end
+
+    local url = WeRead.normalize_cover_url(book.cover)
+    if type(url) == "string" and url ~= "" and client
+        and type(client.get_binary) == "function" then
+        local ok, downloaded = pcall(client.get_binary, client, url, {
+            accept = "image/webp,image/png,image/jpeg,image/gif,*/*;q=0.2",
+            referer = "https://weread.qq.com/",
+        })
+        if ok and valid_cover_data(downloaded) then
+            local cached, cached_path = cache_cover(
+                settings, book, "source", downloaded)
+            if cached then
+                update_managed_custom_cover(
+                    settings, book, cached_path, cached)
+                return cached, cached_path, false
+            end
+        elseif not ok then
+            logger.warn("book cover download failed; using fallback:", tostring(downloaded))
+        end
+    end
+
+    if data then return data, path, true end
+    local bundled = read_binary(Content.fallback_cover_path())
+    if not valid_cover_data(bundled) then
+        return nil, "bundled fallback cover is unavailable"
+    end
+    local cached, cached_path = cache_cover(settings, book, "fallback", bundled)
+    if not cached then return nil, cached_path end
+    return cached, cached_path, true
+end
+
+function Content.ensure_fallback_book_cover(settings, book)
+    local data, path, fallback = Content.load_book_cover(settings, book)
+    if data then return data, path, fallback end
+    local bundled = read_binary(Content.fallback_cover_path())
+    if not valid_cover_data(bundled) then
+        return nil, "bundled fallback cover is unavailable"
+    end
+    local cached, cached_path = cache_cover(settings, book, "fallback", bundled)
+    if not cached then return nil, cached_path end
+    return cached, cached_path, true
+end
+
+-- v1.8.5 incremental EPUBs had no embedded cover. On opening that one current
+-- book, install KOReader's per-book custom cover from the best book-local image.
+-- Existing custom covers are user-owned and are never replaced. The hash marker
+-- lets a later real source cover replace only a fallback that we installed.
+function Content.install_legacy_custom_cover(settings, book, document_path)
+    if type(book) ~= "table" or document_path ~= book.incremental_reader_file
+        or Content.incremental_cover_ready(settings, book) then
+        return false
+    end
+    local ok, DocSettings = pcall(require, "docsettings")
+    if not ok or not DocSettings then return nil, "DocSettings is unavailable" end
+    local existing = DocSettings:findCustomCoverFile(document_path)
+    local managed_hash = read_managed_custom_cover_hash(settings, book)
+    if existing then
+        if managed_hash and Crypto.sha256_hex(read_binary(existing) or "") == managed_hash then
+            return false
+        end
+        pcall(os.remove, managed_custom_cover_marker(settings, book))
+        return false
+    end
+    local data, path = Content.ensure_fallback_book_cover(settings, book)
+    if not data then return nil, path end
+    if not DocSettings:flushCustomCover(document_path, path) then
+        return nil, "could not install legacy custom cover"
+    end
+    local custom = DocSettings:findCustomCoverFile(document_path)
+    local custom_data = read_binary(custom)
+    if not custom_data or custom_data ~= data then
+        return nil, "legacy custom cover could not be verified"
+    end
+    local saved, save_err = write_managed_custom_cover_hash(
+        settings, book, custom_data)
+    if not saved then return nil, save_err end
+    return true, custom
 end
 
 local function full_download_chapter_xhtml(chapter, chapter_index, xhtml)
@@ -1134,6 +1322,16 @@ local function incremental_manifest_path(settings, book)
         .. "/incremental-spine.meta"
 end
 
+local function incremental_cover_marker_path(settings, book)
+    local book_id = book.book_id or book.bookId
+    return Content.book_resolved_dir(settings, book_id, book)
+        .. "/incremental-cover-v1.meta"
+end
+
+function Content.incremental_cover_ready(settings, book)
+    return read_binary(incremental_cover_marker_path(settings, book)) ~= nil
+end
+
 local function read_incremental_manifest(settings, book)
     local file = io.open(incremental_manifest_path(settings, book), "rb")
     if not file then return { generation = "", uids = {} } end
@@ -1437,6 +1635,13 @@ function Content.save_incremental_book_epub(settings, book)
     if not publish_ok then return nil, publish_err end
     book.incremental_reader_file = published_path
     book.incremental_chapter_uids = included
+    if Content.load_book_cover(settings, book) then
+        local marker_ok, marker_err = atomic_write(
+            incremental_cover_marker_path(settings, book), "cover=1\n")
+        if not marker_ok then
+            logger.warn("could not record incremental cover:", tostring(marker_err))
+        end
+    end
     return published_path, included
 end
 
@@ -1502,6 +1707,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
         { name = "META-INF/container.xml", data = [[<?xml version="1.0" encoding="utf-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>]] },
     }
 
+    if cover_data == nil then cover_data = Content.load_book_cover(settings, book) end
     local cover_meta = ""
     if cover_data and #cover_data > 0 then
         local ext, mime = media_type_for(cover_data)
@@ -1509,7 +1715,6 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
         table.insert(entries, { name = "OEBPS/" .. cover_img_href, data = cover_data })
         table.insert(manifest_items, [[<item id="cover-image" href="]] .. xml_escape(cover_img_href) .. [[" media-type="]] .. xml_escape(mime) .. [[" properties="cover-image"/>]])
         table.insert(manifest_items, [[<item id="cover" href="text/cover.xhtml" media-type="application/xhtml+xml"/>]])
-        table.insert(spine_items, [[<itemref idref="cover"/>]])
         local cover_xhtml = [[<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN">

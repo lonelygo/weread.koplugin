@@ -146,7 +146,7 @@ end
 
 local function rejected(node)
     if type(node) ~= "table" then return false end
-    local code = node.errCode or node.errcode or node.errorCode
+    local code = node.errCode or node.errcode or node.errorCode or node.code
     return (code ~= nil and tonumber(code) ~= 0)
         or (node.succ ~= nil and not WeRead.is_success_response(node))
 end
@@ -163,6 +163,26 @@ local function response_accepted(result, http_code)
     local key_type = type(body.synckey)
     return WeRead.is_success_response(body)
         or ((key_type == "string" or key_type == "number") and tostring(body.synckey) ~= ""), body
+end
+
+-- A 2xx JSON response that explicitly carries a failed business result is a
+-- definitive refusal of this row. Other non-success replies are not receipts:
+-- the elapsed-time POST may have reached the service even when its response
+-- was lost or replaced, so callers must keep treating those as ambiguous.
+local function response_rejected(result, http_code)
+    local status = tonumber(http_code)
+    local carries_refusal = status and ((status >= 200 and status < 300)
+        or status == 400 or status == 422)
+    if type(result) ~= "table" or not carries_refusal then return false end
+    return rejected(result) or rejected(result.data) or rejected(result.result)
+end
+
+local function request_error_kind(err)
+    local text = tostring(err)
+    if text:match("HTTP%s+401%f[^%d]") or text:match("HTTP%s+403%f[^%d]") then
+        return "authentication"
+    end
+    return "transport"
 end
 
 local function full_response_body(client, result)
@@ -255,13 +275,26 @@ function ReadReport:_interval()
 end
 
 function ReadReport:status()
+    local persisted
+    if self.library_db and type(self.library_db.readTimeReceipts) == "function" then
+        persisted = self.library_db:readTimeReceipts()
+    end
+    local confirmed_count = self.count or 0
+    local confirmed_seconds = 0
+    local confirmed_last = self.last_time
+    if persisted then
+        confirmed_count = tonumber(persisted.count) or 0
+        confirmed_seconds = tonumber(persisted.seconds) or 0
+        confirmed_last = tonumber(persisted.last_time)
+    end
     return {
         running = self.task ~= nil,
         state = self.state,
-        count = self.count or 0,
+        count = confirmed_count,
+        confirmed_seconds = confirmed_seconds,
         failure_count = self.failure_count or 0,
         consecutive_failures = self.consecutive_failures or 0,
-        last_time = self.last_time,
+        last_time = confirmed_last,
         last_error = self.last_error,
         last_error_kind = self.last_error_kind,
         stop_reason = self.stop_reason,
@@ -286,13 +319,14 @@ local function release_network_lease(lease, outcome)
     end
 end
 
-function ReadReport:_acquire_network_gate(operation, book_id)
+function ReadReport:_acquire_network_gate(operation, book_id, details)
     if self.network_lease ~= nil then return false, "read_report_busy" end
     local context = {
         source = "read_report",
         operation = operation,
         book_id = tostring(book_id or ""),
     }
+    for key, value in pairs(details or {}) do context[key] = value end
     local allowed, lease_or_reason
     if type(self.gate) == "function" then
         local ok, first, second = pcall(self.gate, "weread_read_write", context)
@@ -473,6 +507,10 @@ function ReadReport:stop(reason)
         self.scheduler:unschedule(self.task)
         self.task = nil
     end
+    if self.replay_task then
+        self.scheduler:unschedule(self.replay_task)
+        self.replay_task = nil
+    end
     if self.job then
         self:_abandon_job(self.job)
     end
@@ -552,10 +590,19 @@ function ReadReport:_capture_active_time(position)
         and self.current_book_id then
         position = self.position_provider(self.current_book_id)
     end
+    local first_id
     if self.library_db and type(self.library_db.enqueueReadTime) == "function"
         and self.current_book_id then
-        if not self.library_db:enqueueReadTime(
-            self.current_book_id, elapsed, position) then
+        local queued
+        local enqueue_options
+        if self.is_online() then
+            enqueue_options = {
+                max_chunk_seconds = math.min(60, self:_interval()),
+            }
+        end
+        queued, first_id = self.library_db:enqueueReadTime(
+            self.current_book_id, elapsed, position, enqueue_options)
+        if not queued then
             return 0
         end
         self:_request_sync("read_time_captured", {
@@ -564,8 +611,8 @@ function ReadReport:_capture_active_time(position)
             elapsed_seconds = elapsed,
         })
     end
-    self.last_accounted_at = now
-    return elapsed
+    self.last_accounted_at = self.last_accounted_at + elapsed
+    return elapsed, first_id
 end
 
 function ReadReport:capture_for_manual()
@@ -583,17 +630,64 @@ function ReadReport:_schedule_next(generation, task, delay)
     end
 end
 
+function ReadReport:_schedule_replay(generation, delay)
+    if self.replay_task or self.generation ~= generation or not self.task
+        or not self.library_db
+        or (type(self.library_db.hasPendingOfflineWork) == "function"
+            and not self.library_db:hasPendingOfflineWork(true, false)) then
+        return false
+    end
+    delay = math.max(tonumber(delay) or 0.2,
+        (tonumber(self.next_replay_at) or 0) - self.now())
+    local replay_task
+    replay_task = function()
+        if self.replay_task ~= replay_task then return end
+        self.replay_task = nil
+        if self.generation ~= generation or not self.task then return end
+        if self.job or self.network_lease ~= nil then
+            self:_schedule_replay(generation, 0.5)
+            return
+        end
+        local proceed, book_id, position, queued, lease = self:_precheck(true)
+        if not proceed then return end
+        queued._background_replay = true
+        local spawned = self:_start_job(
+            book_id, self:_renewal_allowed(), generation, self.task,
+            position, queued.elapsed_seconds, queued, lease)
+        if spawned then return end
+        local ok, outcome = pcall(function()
+            return self:_run_pipeline(book_id, {
+                allow_renewal = self:_renewal_allowed(),
+                position = nil,
+                elapsed_seconds = queued.elapsed_seconds,
+                force_context = true,
+            })
+        end)
+        if not ok then
+            outcome = { accepted = false, error = tostring(outcome),
+                error_kind = "task", write_attempted = false }
+        end
+        self:_apply_queued_outcome(queued, outcome)
+    end
+    self.replay_task = replay_task
+    self.scheduler:scheduleIn(delay, replay_task)
+    return true
+end
+
+function ReadReport:_main_delay_after(queued)
+    if queued and not queued._fresh_online and not queued._background_replay then
+        return OFFLINE_REPLAY_INTERVAL_SECONDS
+    end
+    return nil
+end
+
 function ReadReport:_tick(generation, task)
     local claimed
     local ok, err = pcall(function()
         if self.job then
-            -- The job poller owns the next schedule. Never claim another
-            -- durable item while an earlier report is still in flight.
-            return
-        end
-        local replay_delay = (tonumber(self.next_replay_at) or 0) - self.now()
-        if replay_delay > 0 then
-            self:_schedule_next(generation, task, replay_delay)
+            -- A bounded replay can overlap the nominal live deadline. Retry
+            -- the live tick promptly; its monotonic clock preserves all time.
+            self:_schedule_next(generation, task, 0.5)
             return
         end
         local proceed, book_id, position, queued, lease = self:_precheck()
@@ -605,7 +699,7 @@ function ReadReport:_tick(generation, task)
         local allow_renewal = self:_renewal_allowed()
         local spawned, spawn_err = self:_start_job(
             book_id, allow_renewal, generation, task,
-            queued and nil or position,
+            position,
             queued and queued.elapsed_seconds or nil, queued, lease)
         if spawned then
             return
@@ -617,15 +711,16 @@ function ReadReport:_tick(generation, task)
         end
         local outcome = self:_run_pipeline(book_id, {
             allow_renewal = allow_renewal,
-            position = queued and nil or position,
+            position = position,
             elapsed_seconds = queued and queued.elapsed_seconds or nil,
-            force_context = queued ~= nil,
+            force_context = queued ~= nil and (not queued._fresh_online
+                or queued._force_context == true),
         })
         self:_apply_queued_outcome(queued, outcome)
         claimed = nil
         if not queued then self:_release_network_gate(lease, outcome) end
-        self:_schedule_next(generation, task,
-            queued and OFFLINE_REPLAY_INTERVAL_SECONDS or nil)
+        self:_schedule_next(generation, task)
+        if queued and queued._fresh_online then self:_schedule_replay(generation) end
     end)
     if not ok then
         if claimed and self.library_db
@@ -646,8 +741,8 @@ end
 
 -- Parent-side gate before any network work. Returns true, book_id when a
 -- report should be attempted. Must stay cheap: it runs on the UI loop.
-function ReadReport:_precheck()
-    local replay_only = self.manual_replay_tick
+function ReadReport:_precheck(replay_only)
+    replay_only = replay_only == true or self.manual_replay_tick == true
     self.manual_replay_tick = nil
     local config = self:_config()
     if not config.enabled then
@@ -686,37 +781,52 @@ function ReadReport:_precheck()
     -- A manual replay in the reader can take several 30-second slots. Do
     -- not append another slot on each replay tick. The active clock keeps
     -- running and normal reading, suspend and close still capture that time.
-    local elapsed = 0
+    local elapsed, fresh_id = 0, nil
     if not replay_only or not self.is_online() then
-        elapsed = self:_capture_active_time(position)
+        elapsed, fresh_id = self:_capture_active_time(position)
     end
     if self.library_db and type(self.library_db.claimReadTime) == "function" then
         if type(self.library_db.recoverStaleReadTimeClaims) == "function" then
             self.library_db:recoverStaleReadTimeClaims(
                 self.now() - JOB_TIMEOUT_SECONDS - 30)
         end
-        local has_pending = type(self.library_db.hasPendingOfflineWork) ~= "function"
-            or self.library_db:hasPendingOfflineWork(true, false)
-        if not has_pending then
-            self.state = "waiting"
-            return false
+        local fresh_online = fresh_id ~= nil and not replay_only
+        if not fresh_online then
+            local has_pending = type(self.library_db.hasPendingOfflineWork) ~= "function"
+                or self.library_db:hasPendingOfflineWork(true, false)
+            if not has_pending then
+                self.state = "waiting"
+                return false
+            end
+            if self.now() < (tonumber(self.next_replay_at) or 0) then
+                self.state = "waiting"
+                return false
+            end
         end
-        if self.now() < (tonumber(self.next_replay_at) or 0) then
-            self.state = "waiting"
-            return false
-        end
-        local pending_book_id = type(self.library_db.pendingOfflineBook) == "function"
-            and self.library_db:pendingOfflineBook(true, false) or book_id
+        local pending_book_id = fresh_online and book_id
+            or (type(self.library_db.pendingOfflineBook) == "function"
+                and self.library_db:pendingOfflineBook(true, false) or book_id)
         local allowed, lease_or_reason = self:_acquire_network_gate(
-            "reading_time", pending_book_id)
+            fresh_online and "live_reading_time" or "reading_time",
+            pending_book_id,
+            fresh_online and {
+                position = position,
+                position_verified = position ~= nil,
+                position_reason = position_reason,
+                position_applies = position_applies == true,
+            } or nil)
         if not allowed then
             self.state = lease_or_reason == "offline" and "offline" or "waiting"
             self:_log_skip(lease_or_reason)
             return false
         end
-        local queued = self.library_db:claimReadTime(self.session_id)
+        local queued = self.library_db:claimReadTime(
+            self.session_id, fresh_online and fresh_id or nil)
         if queued then
-            if pending_book_id and tostring(queued.book_id) ~= tostring(pending_book_id) then
+            if (fresh_online and fresh_id
+                    and tonumber(queued.id) ~= tonumber(fresh_id))
+                or (pending_book_id
+                    and tostring(queued.book_id) ~= tostring(pending_book_id)) then
                 if type(self.library_db.releaseReadTimeClaim) == "function" then
                     self.library_db:releaseReadTimeClaim(queued)
                 end
@@ -730,7 +840,11 @@ function ReadReport:_precheck()
                 return false
             end
             queued._network_lease = lease_or_reason
-            return true, queued.book_id, nil, queued, lease_or_reason
+            queued._fresh_online = fresh_online
+            queued._force_context = fresh_online and position == nil or nil
+            queued._background_replay = replay_only or nil
+            return true, queued.book_id,
+                fresh_online and position or nil, queued, lease_or_reason
         end
         self:_release_network_gate(lease_or_reason, {
             accepted = false, write_attempted = false,
@@ -799,7 +913,9 @@ function ReadReport:_start_job(book_id, allow_renewal, generation, task, positio
     remove_file(write_marker)
     local pid, read_fd = runner.run(function(_pid, child_write_fd)
         local outcome = self:_child_report(
-            book_id, allow_renewal, position, elapsed_seconds, queued ~= nil,
+            book_id, allow_renewal, position, elapsed_seconds,
+            queued ~= nil and (not queued._fresh_online
+                or queued._force_context == true),
             function() write_started_marker(write_marker) end)
         local ok, encoded = pcall(function()
             return self.client:json_encode(outcome)
@@ -859,16 +975,23 @@ function ReadReport:_poll_job(job, generation, task)
         if not job.queued then
             self:_release_network_gate(job.gate_lease, job.outcome)
         end
-        self:_schedule_next(generation, task,
-            job.queued and OFFLINE_REPLAY_INTERVAL_SECONDS or nil)
+        if not (job.queued and job.queued._background_replay) then
+            self:_schedule_next(generation, task,
+                self:_main_delay_after(job.queued))
+        end
+        if job.queued and job.queued._fresh_online then
+            self:_schedule_replay(generation)
+        end
         return
     end
     if self.now() - job.started_at > JOB_TIMEOUT_SECONDS then
         log("warn", "read report job timed out, terminating:", "pid=", job.pid)
         self:_abandon_job(job)
         self:_set_error("report job timed out", "transport", "read report job failed:")
-        self:_schedule_next(generation, task,
-            job.queued and OFFLINE_REPLAY_INTERVAL_SECONDS or nil)
+        if not (job.queued and job.queued._background_replay) then
+            self:_schedule_next(generation, task,
+                self:_main_delay_after(job.queued))
+        end
         return
     end
     job.poll_interval = math.min(job.poll_interval * 2, JOB_POLL_MAX_SECONDS)
@@ -888,6 +1011,19 @@ function ReadReport:_abandon_job(job)
     local runner = self.subprocess
     if job.poll then
         self.scheduler:unschedule(job.poll)
+    end
+    local done = runner.is_done(job.pid)
+    local readable = job.read_fd and runner.read_size(job.read_fd) or 0
+    if done or readable > 0 then
+        local payload = job.read_fd and runner.read_all(job.read_fd) or nil
+        job.read_fd = nil
+        self:_apply_job_outcome(job, self:_decode_outcome(payload))
+        remove_file(job.write_marker)
+        if not job.queued then
+            self:_release_network_gate(job.gate_lease, job.outcome)
+        end
+        if not done then self:_collect_pid(job.pid) end
+        return true
     end
     runner.terminate(job.pid)
     local function finalize()
@@ -976,6 +1112,7 @@ function ReadReport:_apply_job_outcome(job, outcome)
                     }, { replace_cookies = true })
                 end)
                 if not ok then
+                    outcome.auth_renewed = false
                     log("warn", "persist renewed auth failed:", tostring(err))
                 end
             end
@@ -1001,7 +1138,8 @@ end
 
 function ReadReport:_apply_queued_outcome(queued, outcome)
     local accepted = self:_apply_outcome(outcome)
-    if queued and (accepted or type(outcome) ~= "table"
+    if queued and not queued._fresh_online
+        and (accepted or type(outcome) ~= "table"
         or outcome.write_attempted ~= false) then
         self.next_replay_at = self.now() + OFFLINE_REPLAY_INTERVAL_SECONDS
     end
@@ -1011,8 +1149,13 @@ function ReadReport:_apply_queued_outcome(queued, outcome)
             if acknowledged then
                 require("weread.lib.sync_status").noteAck(self, self.now())
             end
+        elseif type(outcome) == "table"
+            and outcome.error_kind == "rejected"
+            and type(self.library_db.rejectReadTime) == "function" then
+            self.library_db:rejectReadTime(queued, outcome.error)
         elseif (type(outcome) ~= "table"
                 or outcome.error_kind == "transport"
+                or outcome.error_kind == "unknown"
                 or outcome.error_kind == "job"
                 or outcome.error_kind == "task")
             and not (type(outcome) == "table"
@@ -1022,7 +1165,9 @@ function ReadReport:_apply_queued_outcome(queued, outcome)
                 queued,
                 type(outcome) == "table" and outcome.error or "missing_result")
         elseif type(self.library_db.releaseReadTimeClaim) == "function" then
-            self.library_db:releaseReadTimeClaim(queued)
+            local kind = type(outcome) == "table" and outcome.error_kind
+            local retry_delay = (kind == "context" or kind == "rate_limited") and 60 or nil
+            self.library_db:releaseReadTimeClaim(queued, retry_delay)
         end
     end
     local lease = queued and queued._network_lease or nil
@@ -1130,7 +1275,9 @@ function ReadReport:_child_report(book_id, allow_renewal, position, elapsed_seco
     return outcome
 end
 
--- Full report attempt: context, send, refresh-retry, renewal, final retry.
+-- Full report attempt. Context is prepared before the elapsed-time POST. Once
+-- that mutation starts, its single response is the only receipt we classify:
+-- refreshing or retrying after an unclear reply could double-count time.
 -- Pure with respect to the parent state machine: everything the caller needs
 -- is described by the returned outcome table.
 function ReadReport:_run_pipeline(book_id, opts)
@@ -1170,81 +1317,32 @@ function ReadReport:_run_pipeline(book_id, opts)
     end
     if not ok then
         outcome.error = tostring(result)
-        outcome.error_kind = "transport"
+        outcome.error_kind = request_error_kind(result)
         outcome.error_prefix = "read report request failed:"
-        return outcome
-    end
-
-    local failure = response_summary(self.client, result, http_code)
-    local refresh_ok, refreshed = pcall(function()
-        return self:ensure_context(book_id, true)
-    end)
-    if refresh_ok then
-        outcome.book = self:_context_snapshot(refreshed)
-        local retry_ok, retry_result, retry_code = pcall(function()
-            return send(refreshed)
-        end)
-        outcome.book = self:_context_snapshot(refreshed)
-        local retry_accepted, retry_body = response_accepted(retry_result, retry_code)
-        if retry_ok and retry_accepted then
-            outcome.accepted = true
-            outcome.has_synckey = type(retry_body) == "table"
-                and retry_body.synckey ~= nil or false
-            return outcome
-        end
-        failure = "initial=" .. failure .. "; refreshed="
-            .. (retry_ok and response_summary(self.client, retry_result, retry_code)
-                or tostring(retry_result))
     else
-        failure = failure .. "; context_refresh=" .. tostring(refreshed)
+        local status = tonumber(http_code)
+        outcome.error = response_summary(self.client, result, http_code)
+        if status == 401 or status == 403 then
+            outcome.error_kind = "authentication"
+            outcome.error_prefix = "read report authentication failed:"
+        elseif status == 429 then
+            outcome.error_kind = "rate_limited"
+            outcome.error_prefix = "read report rate limited:"
+        elseif response_rejected(result, http_code) then
+            outcome.error_kind = outcome.write_attempted and "rejected" or "context"
+            outcome.error_prefix = "read report server rejected:"
+        else
+            outcome.error_kind = "unknown"
+            outcome.error_prefix = "read report returned no definitive receipt:"
+        end
     end
-
-    if not opts.allow_renewal then
-        outcome.error = failure
-        outcome.error_kind = "server"
-        outcome.error_prefix = "read report server rejected:"
-        return outcome
+    if outcome.error_kind == "authentication" and opts.allow_renewal then
+        -- Renew the login on an explicit denial. The durable row is retried
+        -- by a future delivery, after the parent has received the new cookies.
+        outcome.renew_attempted = true
+        local renewed, result_body = pcall(self.client.renew_cookie, self.client)
+        outcome.auth_renewed = renewed and WeRead.is_success_response(result_body) or false
     end
-    outcome.renew_attempted = true
-
-    local renew_ok, renew_result = pcall(function()
-        return self.client:renew_cookie()
-    end)
-    if not renew_ok or not WeRead.is_success_response(renew_result) then
-        outcome.error = failure .. "; renewal=" .. (renew_ok
-            and response_summary(self.client, renew_result)
-            or tostring(renew_result))
-        outcome.error_kind = "authentication"
-        outcome.error_prefix = "read report cookie renewal failed:"
-        return outcome
-    end
-
-    local final_context_ok, final_book = pcall(function()
-        return self:ensure_context(book_id, true)
-    end)
-    if not final_context_ok then
-        outcome.error = failure .. "; final_context=" .. tostring(final_book)
-        outcome.error_kind = "context"
-        outcome.error_prefix = "read report final context refresh failed:"
-        return outcome
-    end
-    outcome.book = self:_context_snapshot(final_book)
-    local final_ok, final_result, final_code = pcall(function()
-        return send(final_book)
-    end)
-    outcome.book = self:_context_snapshot(final_book)
-    local final_accepted, final_body = response_accepted(final_result, final_code)
-    if final_ok and final_accepted then
-        outcome.accepted = true
-        outcome.has_synckey = type(final_body) == "table"
-            and final_body.synckey ~= nil or false
-        return outcome
-    end
-    outcome.error = failure .. "; final=" .. (final_ok
-        and response_summary(self.client, final_result, final_code)
-        or tostring(final_result))
-    outcome.error_kind = final_ok and "server" or "transport"
-    outcome.error_prefix = "read report final retry failed:"
     return outcome
 end
 
@@ -1257,9 +1355,10 @@ function ReadReport:report_once()
     local ok, outcome = pcall(function()
         return self:_run_pipeline(book_id, {
             allow_renewal = self:_renewal_allowed(),
-            position = queued and nil or position,
+            position = position,
             elapsed_seconds = queued and queued.elapsed_seconds or nil,
-            force_context = queued ~= nil,
+            force_context = queued ~= nil and (not queued._fresh_online
+                or queued._force_context == true),
         })
     end)
     if not ok then
@@ -1288,6 +1387,9 @@ function ReadReport:on_network_connected()
         self.scheduler:scheduleIn(delay, self.task)
         return true
     end
+    if self.current_book_source == "current_document" then
+        return self:_schedule_replay(self.generation, delay)
+    end
     if self.job then return false end
     self.scheduler:unschedule(self.task)
     self.scheduler:scheduleIn(delay, self.task)
@@ -1296,9 +1398,7 @@ function ReadReport:on_network_connected()
 end
 
 function ReadReport:drain(manual)
-    local scheduled = self:on_network_connected()
-    if scheduled and manual then self.manual_replay_tick = true end
-    return scheduled
+    return self:on_network_connected()
 end
 
 -- ------------------------------------------------------------------
@@ -1479,10 +1579,13 @@ function ReadReport:_send(book_id, book, position, elapsed_seconds, on_write)
             psvts = book.psvts,
             pclts = book.pclts,
         }
-        self.client:report_read(
+        local entered, enter_code = self.client:report_read(
             enter_payload,
             book.reader_url or WeRead.reader_url(book_id)
         )
+        if (tonumber(enter_code) or 0) >= 400 or response_rejected(entered, enter_code) then
+            return entered, enter_code
+        end
         book.read_session_entered_at = self.now()
         book.read_session_id = self.session_id
     end

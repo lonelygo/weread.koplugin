@@ -677,6 +677,16 @@ function Downloader:start(book, chapters, suffix, options)
             end)
             if dl.cancelled then return end
             apply_reader_book(book, updated)
+            if type(Content.ensure_book_cover) == "function" then
+                local cover_ok = self:_runInterruptible(dl, function()
+                    local cover = Content.ensure_book_cover(
+                        self.client, self.settings, book)
+                    return cover ~= nil
+                end)
+                if not cover_ok then
+                    logger.warn("book cover unavailable; EPUB may have no cover")
+                end
+            end
             self:_setStage(dl, _("Preparing download..."))
             local cache = self.settings.get
                 and self.settings:get("cache", {}) or {}
@@ -1187,15 +1197,6 @@ function Downloader:_step(dl)
                 if not incremental then error(aggregate_err, 0) end
                 return incremental, paths
             end
-            local cover_data
-            local cover_url = WeRead.normalize_cover_url(dl.book.cover)
-            if cover_url and cover_url ~= "" then
-                pcall(function()
-                    cover_data = self:_runInterruptible(dl, function()
-                        return self.client:get_binary(cover_url)
-                    end)
-                end)
-            end
             if dl.cancelled then return end
             if dl.resumable then
                 for chapter_index, chapter in ipairs(dl.chapters) do
@@ -1211,7 +1212,7 @@ function Downloader:_step(dl)
                 dl.resumable and { __workspace_text_dir = dl.workspace.rendered_text_dir } or dl.bodies,
                 dl.suffix,
                 dl.resumable and Content.full_download_workspace_assets(dl.workspace) or dl.assets,
-                dl.state.css, cover_data
+                dl.state.css
             )
         end)
         if dl.cancelled then self:_step(dl); return end

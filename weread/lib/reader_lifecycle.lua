@@ -229,6 +229,17 @@ function M:onReaderReady()
     -- the whole book table on every screen tap.
     self._current_weread_book_id = weread_book_id
     if weread_book_id then
+        local current = self.settings:get("books", {})[tostring(weread_book_id)]
+        if current and Content.install_legacy_custom_cover then
+            local installed, cover_err = Content.install_legacy_custom_cover(
+                self.settings, current, self.ui.document.file)
+            if installed and self.ui.doc_settings
+                and self.ui.doc_settings.getCustomCoverFile then
+                self.ui.doc_settings:getCustomCoverFile(true)
+            elseif installed == nil then
+                logger.warn("legacy custom cover unavailable:", log_error(cover_err))
+            end
+        end
         -- Always register the tap interception: even when annotations are hidden
         -- we must intercept taps on thought links to suppress the native footnote
         -- popup. Visibility is decided inside _onThoughtTap / applyAnnotationVisibility.

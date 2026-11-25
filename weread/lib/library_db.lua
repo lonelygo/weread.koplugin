@@ -50,6 +50,22 @@ local function changed_rows(db)
     return row and tonumber(row[1]) or 0
 end
 
+local function safe_queue_reason(value)
+    -- Reasons may originate in a web error containing private text, cookies
+    -- or a response body. Persist only protocol codes and known local causes.
+    local text = tostring(value or "")
+    local http_status = text:match("http=(%d%d%d)") or text:match("HTTP (%d%d%d)")
+    local error_code = text:match("error_code=(%-?%d+)") or text:match("err[Cc]ode=(%-?%d+)")
+    local parts = {}
+    if http_status then parts[#parts + 1] = "HTTP " .. http_status end
+    if error_code then parts[#parts + 1] = "errCode=" .. error_code:sub(1, 16) end
+    if #parts > 0 then return table.concat(parts, ", ") end
+    for _, reason in ipairs({ "interrupted_claim", "report_abandoned", "server_rejected", "missing_result", "timeout" }) do
+        if text:find(reason, 1, true) then return reason end
+    end
+    return "unknown"
+end
+
 function LibraryDB:new(settings)
     local data_dir = settings.data_dir or settings.cache_dir or "."
     return setmetatable({
@@ -125,6 +141,7 @@ function LibraryDB:open()
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 book_id         TEXT NOT NULL,
                 elapsed_seconds INTEGER NOT NULL,
+                retry_after     INTEGER NOT NULL DEFAULT 0,
                 position_payload TEXT,
                 created_at      INTEGER NOT NULL,
                 state           TEXT NOT NULL DEFAULT 'pending',
@@ -174,6 +191,7 @@ function LibraryDB:open()
             db:exec("ALTER TABLE local_annotation_outbox ADD COLUMN replacement_id TEXT NOT NULL DEFAULT ''")
         end)
         pcall(function() db:exec("ALTER TABLE read_time_outbox ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''") end)
+        pcall(function() db:exec("ALTER TABLE read_time_outbox ADD COLUMN retry_after INTEGER NOT NULL DEFAULT 0") end)
         pcall(function() db:exec("ALTER TABLE read_time_outbox ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0") end)
         pcall(function() db:exec("ALTER TABLE local_annotation_outbox ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''") end)
         pcall(function() db:exec("ALTER TABLE local_annotation_outbox ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0") end)
@@ -195,13 +213,13 @@ function LibraryDB:open()
     return db
 end
 
--- Persist active reading in server-compatible chunks. The Web reader accepts
--- at most 30 seconds per report, so longer local intervals are split here and
--- replayed in order after connectivity returns.
-function LibraryDB:enqueueReadTime(book_id, elapsed_seconds, position)
+-- Offline replay uses 30-second slices. A normal connected report may
+-- reserve the full user-selected interval in one row, retaining the same WAL.
+function LibraryDB:enqueueReadTime(book_id, elapsed_seconds, position, options)
     book_id = tostring(book_id or "")
     local remaining = math.floor(tonumber(elapsed_seconds) or 0)
     if book_id == "" or remaining <= 0 then return false end
+    local limit = math.max(1, math.min(60, math.floor(tonumber(options and options.max_chunk_seconds) or 30)))
     local position_payload, encode_err = encode(position or {})
     if not position_payload then
         logger.warn("library_db read time encode failed:", encode_err)
@@ -211,6 +229,7 @@ function LibraryDB:enqueueReadTime(book_id, elapsed_seconds, position)
     if not db then return false end
     local transaction_open = false
     local stmt
+    local first_id
     local ok, err = pcall(function()
         db:exec("BEGIN")
         transaction_open = true
@@ -221,8 +240,14 @@ function LibraryDB:enqueueReadTime(book_id, elapsed_seconds, position)
         ]])
         local created_at = os.time()
         while remaining > 0 do
-            local seconds = math.min(30, remaining)
+            local seconds = math.min(limit, remaining)
             stmt:reset():bind(book_id, seconds, position_payload, created_at):step()
+            if not first_id then
+                local id_stmt = db:prepare("SELECT last_insert_rowid()")
+                local id_row = id_stmt:reset():step()
+                first_id = id_row and tonumber(id_row[1]) or nil
+                close_statement(id_stmt)
+            end
             remaining = remaining - seconds
         end
         close_statement(stmt)
@@ -235,7 +260,7 @@ function LibraryDB:enqueueReadTime(book_id, elapsed_seconds, position)
     pcall(function() db:close() end)
     if not ok then logger.warn("library_db read time write failed:", err)
     else status_changed(self) end
-    return ok
+    return ok, ok and first_id or nil
 end
 
 function LibraryDB:nextReadTime()
@@ -247,7 +272,7 @@ function LibraryDB:nextReadTime()
         stmt = db:prepare([[
             SELECT id, book_id, elapsed_seconds, position_payload, created_at
               FROM read_time_outbox
-             WHERE state='pending'
+             WHERE state='pending' AND retry_after<=strftime('%s','now')
              ORDER BY id LIMIT 1
         ]])
         local row = stmt:reset():step()
@@ -267,7 +292,7 @@ function LibraryDB:nextReadTime()
     return ok and item or nil
 end
 
-function LibraryDB:claimReadTime(owner)
+function LibraryDB:claimReadTime(owner, exact_id)
     local path = self:databasePath()
     local db = self:open()
     if not db then return nil end
@@ -279,27 +304,51 @@ function LibraryDB:claimReadTime(owner)
     local ok, err = pcall(function()
         db:exec("BEGIN IMMEDIATE")
         transaction_open = true
-        stmt = db:prepare([[
-            SELECT id, book_id, elapsed_seconds, position_payload, created_at
-              FROM read_time_outbox
-             WHERE state='pending' ORDER BY id LIMIT 1
-        ]])
-        local row = stmt:reset():step()
+        if exact_id ~= nil then
+            stmt = db:prepare([[
+                SELECT id, book_id, elapsed_seconds, position_payload, created_at
+                  FROM read_time_outbox
+                 WHERE id=? AND state='pending' LIMIT 1
+            ]])
+            stmt:reset():bind(tonumber(exact_id))
+        else
+            stmt = db:prepare([[
+                SELECT id, book_id, elapsed_seconds, position_payload, created_at
+                  FROM read_time_outbox
+                 WHERE state='pending' AND retry_after<=strftime('%s','now') ORDER BY id LIMIT 1
+            ]])
+            stmt:reset()
+        end
+        local row = stmt:step()
         close_statement(stmt)
         stmt = nil
         if row then
+            local seconds = tonumber(row[3]) or 0
+            if not exact_id and seconds > 30 then
+                -- A 60-second live reservation may have gone offline before
+                -- its first POST. Replay that untouched duration in 30s slices.
+                stmt = db:prepare([[
+                    INSERT INTO read_time_outbox (book_id, elapsed_seconds, position_payload, created_at, state)
+                    VALUES (?, ?, ?, ?, 'pending')
+                ]])
+                stmt:reset():bind(row[2], seconds - 30, row[4], row[5]):step()
+                close_statement(stmt)
+                seconds = 30
+            end
             stmt = db:prepare([[
                 UPDATE read_time_outbox
-                   SET state='claimed', claim_token=?, claimed_at=?
+                   SET state='claimed', claim_token=?, claimed_at=?, elapsed_seconds=?
                  WHERE id=? AND state='pending'
             ]])
-            stmt:reset():bind(token, os.time(), tonumber(row[1])):step()
-            item = {
-                id = tonumber(row[1]), book_id = tostring(row[2]),
-                elapsed_seconds = tonumber(row[3]) or 0,
-                position = decode(row[4]) or {}, created_at = tonumber(row[5]) or 0,
-                claim_token = token, database_path = path,
-            }
+            stmt:reset():bind(token, os.time(), seconds, tonumber(row[1])):step()
+            if changed_rows(db) == 1 then
+                item = {
+                    id = tonumber(row[1]), book_id = tostring(row[2]),
+                    elapsed_seconds = seconds,
+                    position = decode(row[4]) or {}, created_at = tonumber(row[5]) or 0,
+                    claim_token = token, database_path = path,
+                }
+            end
         end
         db:exec("COMMIT")
         transaction_open = false
@@ -329,12 +378,29 @@ function LibraryDB:ackReadTime(item)
         transaction_open = true
         stmt = db:prepare([[
             DELETE FROM read_time_outbox
-             WHERE id=? AND state='claimed' AND claim_token=?
+             WHERE id=? AND state='claimed' AND claim_token=? AND book_id=? AND elapsed_seconds=?
         ]])
-        stmt:reset():bind(tonumber(item.id), tostring(item.claim_token)):step()
+        stmt:reset():bind(tonumber(item.id), tostring(item.claim_token), item.book_id, item.elapsed_seconds):step()
         close_statement(stmt)
         stmt = nil
         affected = changed_rows(db)
+        if affected == 1 and (tonumber(item.elapsed_seconds) or 0) > 0 then
+            stmt = db:prepare([[
+                INSERT INTO sync_status_meta (name, value) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET value=value+excluded.value
+            ]])
+            stmt:reset():bind("read_time_receipt_count", 1):step()
+            stmt:reset():bind("read_time_receipt_seconds",
+                math.floor(tonumber(item.elapsed_seconds) or 0)):step()
+            close_statement(stmt)
+            stmt = db:prepare([[
+                INSERT INTO sync_status_meta (name, value) VALUES ('read_time_receipt_last', ?)
+                ON CONFLICT(name) DO UPDATE SET value=excluded.value
+            ]])
+            stmt:reset():bind(os.time()):step()
+            close_statement(stmt)
+            stmt = nil
+        end
         db:exec("COMMIT")
         transaction_open = false
     end)
@@ -344,6 +410,32 @@ function LibraryDB:ackReadTime(item)
     if not ok then logger.warn("library_db read time ack failed:", err)
     elseif affected == 1 then status_changed(self) end
     return ok and affected == 1
+end
+
+function LibraryDB:readTimeReceipts()
+    local result = { count = 0, seconds = 0, last_time = nil }
+    local db = self:open()
+    if not db then return result end
+    local stmt
+    local ok, err = pcall(function()
+        stmt = db:prepare([[
+            SELECT name, value FROM sync_status_meta
+             WHERE name IN ('read_time_receipt_count',
+                 'read_time_receipt_seconds', 'read_time_receipt_last')
+        ]])
+        local row = stmt:reset():step()
+        while row do
+            local name, value = tostring(row[1]), tonumber(row[2]) or 0
+            if name == "read_time_receipt_count" then result.count = value
+            elseif name == "read_time_receipt_seconds" then result.seconds = value
+            elseif name == "read_time_receipt_last" then result.last_time = value end
+            row = stmt:step()
+        end
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if not ok then logger.warn("library_db read time receipts failed:", err) end
+    return result
 end
 
 -- An ambiguous write may already have reached the server. Quarantine it rather
@@ -359,7 +451,7 @@ function LibraryDB:quarantineReadTime(item, err)
                SET state='unknown', last_error=?, claim_token='', claimed_at=0
              WHERE id=? AND state='claimed' AND claim_token=?
         ]])
-        stmt:reset():bind(tostring(err or "unknown"), tonumber(item.id),
+        stmt:reset():bind(safe_queue_reason(err), tonumber(item.id),
             tostring(item.claim_token)):step()
         close_statement(stmt)
         stmt = nil
@@ -372,7 +464,107 @@ function LibraryDB:quarantineReadTime(item, err)
     return ok and affected == 1
 end
 
-function LibraryDB:releaseReadTimeClaim(item)
+-- A decoded WeRead response can explicitly reject one slot. It is safe to
+-- move that row out of the replay lane because no response was lost. Keeping
+-- it for review makes the missing time visible without blocking newer rows.
+function LibraryDB:rejectReadTime(item, err)
+    local db = claim_database(self, item)
+    if not db then return false end
+    local stmt
+    local affected = 0
+    local ok, write_err = pcall(function()
+        stmt = db:prepare([[
+            UPDATE read_time_outbox
+               SET state='rejected', last_error=?, claim_token='', claimed_at=0
+             WHERE id=? AND state='claimed' AND claim_token=?
+        ]])
+        stmt:reset():bind(safe_queue_reason(err or "server_rejected"),
+            tonumber(item.id), tostring(item.claim_token)):step()
+        close_statement(stmt)
+        stmt = nil
+        affected = changed_rows(db)
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if not ok then logger.warn("library_db read time rejection failed:", write_err)
+    elseif affected == 1 then status_changed(self) end
+    return ok and affected == 1
+end
+
+function LibraryDB:listReadTimeReview()
+    local db = self:open()
+    if not db then return {} end
+    local stmt
+    local rows = {}
+    local database_path = self:databasePath()
+    local ok, err = pcall(function()
+        stmt = db:prepare([[
+            SELECT id, book_id, elapsed_seconds, created_at, state, last_error
+              FROM read_time_outbox
+             WHERE state IN ('unknown','rejected') ORDER BY id
+        ]])
+        local row = stmt:reset():step()
+        while row do
+            rows[#rows + 1] = {
+                database_path = database_path, id = tonumber(row[1]), book_id = tostring(row[2]),
+                elapsed_seconds = tonumber(row[3]) or 0,
+                created_at = tonumber(row[4]) or 0,
+                state = tostring(row[5]), reason = safe_queue_reason(row[6]),
+            }
+            row = stmt:step()
+        end
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if not ok then
+        logger.warn("library_db read time review read failed:", err)
+        return {}
+    end
+    return rows
+end
+
+local function update_review_row(self, record, operation)
+    if type(record) ~= "table" or (record.state ~= "unknown" and record.state ~= "rejected") then
+        return false
+    end
+    local db = claim_database(self, record)
+    if not db then return false end
+    local stmt
+    local affected = 0
+    local ok, err = pcall(function()
+        if operation == "retry" then
+            stmt = db:prepare([[
+                UPDATE read_time_outbox
+                   SET state='pending', last_error=NULL, claim_token='', claimed_at=0, retry_after=0
+                 WHERE id=? AND state=? AND book_id=?
+            ]])
+        else
+            stmt = db:prepare([[
+                DELETE FROM read_time_outbox
+                 WHERE id=? AND state=? AND book_id=?
+            ]])
+        end
+        stmt:reset():bind(record.id, record.state, record.book_id):step()
+        close_statement(stmt)
+        stmt = nil
+        affected = changed_rows(db)
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if not ok then logger.warn("library_db read time review update failed:", err)
+    elseif affected == 1 then status_changed(self) end
+    return ok and affected == 1
+end
+
+function LibraryDB:retryReadTimeReview(record)
+    return update_review_row(self, record, "retry")
+end
+
+function LibraryDB:dismissReadTimeReview(record)
+    return update_review_row(self, record, "dismiss")
+end
+
+function LibraryDB:releaseReadTimeClaim(item, retry_delay)
     local db = claim_database(self, item)
     if not db then return false end
     local stmt
@@ -380,10 +572,11 @@ function LibraryDB:releaseReadTimeClaim(item)
     local ok = pcall(function()
         stmt = db:prepare([[
             UPDATE read_time_outbox
-               SET state='pending', claim_token='', claimed_at=0
+               SET state='pending', claim_token='', claimed_at=0, retry_after=?
              WHERE id=? AND state='claimed' AND claim_token=?
         ]])
-        stmt:reset():bind(tonumber(item.id), tostring(item.claim_token)):step()
+        local after = retry_delay and (os.time() + retry_delay) or 0
+        stmt:reset():bind(after, tonumber(item.id), tostring(item.claim_token)):step()
         close_statement(stmt)
         stmt = nil
         affected = changed_rows(db)
@@ -399,6 +592,7 @@ function LibraryDB:offlineStatus()
     if not db then return { available = false, annotations = {} } end
     local result = {
         available = true, pending_seconds = 0, unknown_seconds = 0,
+        rejected_seconds = 0, review_records = {},
         annotations = {}, last_confirmed_at = nil,
     }
     local time_stmt, annotation_stmt, meta_stmt
@@ -414,16 +608,24 @@ function LibraryDB:offlineStatus()
                 result.pending_seconds = result.pending_seconds + seconds
             elseif state == "unknown" then
                 result.unknown_seconds = result.unknown_seconds + seconds
+            elseif state == "rejected" then
+                result.rejected_seconds = result.rejected_seconds + seconds
             end
             row = time_stmt:step()
         end
         annotation_stmt = db:prepare([[
-            SELECT sync_state, COUNT(*) FROM local_annotation_outbox
+            SELECT sync_state, COUNT(*), SUM(CASE WHEN upload_payload IS NULL OR upload_payload='' THEN 1 ELSE 0 END)
+              FROM local_annotation_outbox
              GROUP BY sync_state
         ]])
         row = annotation_stmt:reset():step()
         while row do
-            result.annotations[tostring(row[1])] = tonumber(row[2]) or 0
+            local state = tostring(row[1])
+            result.annotations[state] = tonumber(row[2]) or 0
+            if state == "local_only" or state == "update_pending" or state == "delete_pending"
+                or state == "replace_delete_pending" then
+                result.unlocated_annotations = (result.unlocated_annotations or 0) + (tonumber(row[3]) or 0)
+            end
             row = annotation_stmt:step()
         end
         meta_stmt = db:prepare([[
@@ -439,6 +641,10 @@ function LibraryDB:offlineStatus()
     if not ok then
         logger.warn("library_db offline status read failed:", err)
         return { available = false, annotations = {} }
+    end
+    result.review_records = {}
+    if (result.unknown_seconds or 0) + (result.rejected_seconds or 0) > 0 then
+        result.review_records = self:listReadTimeReview()
     end
     return result
 end
@@ -487,9 +693,9 @@ end
 
 function LibraryDB:readTimeStatus()
     local db = self:open()
-    if not db then return { pending = 0, unknown = 0 } end
+    if not db then return { pending = 0, unknown = 0, rejected = 0 } end
     local stmt
-    local status = { pending = 0, unknown = 0 }
+    local status = { pending = 0, unknown = 0, rejected = 0 }
     local ok = pcall(function()
         stmt = db:prepare([[
             SELECT state, COALESCE(SUM(elapsed_seconds), 0)
@@ -503,13 +709,15 @@ function LibraryDB:readTimeStatus()
                 status.pending = status.pending + seconds
             elseif state == "unknown" then
                 status.unknown = status.unknown + seconds
+            elseif state == "rejected" then
+                status.rejected = status.rejected + seconds
             end
             row = stmt:step()
         end
     end)
     close_statement(stmt)
     pcall(function() db:close() end)
-    return ok and status or { pending = 0, unknown = 0 }
+    return ok and status or { pending = 0, unknown = 0, rejected = 0 }
 end
 
 -- Return the first book that has replayable offline work.  This intentionally
@@ -527,7 +735,7 @@ function LibraryDB:pendingOfflineBook(include_time, include_annotations)
         queries[#queries + 1] = [[
             SELECT book_id, 0 AS work_order, id AS item_order
               FROM read_time_outbox
-             WHERE state='pending'
+             WHERE state='pending' AND retry_after<=strftime('%s','now')
         ]]
     end
     if include_annotations then
@@ -776,7 +984,7 @@ function LibraryDB:putLocalAnnotationSnapshot(book_id, document_path, annotation
                     state = remote_id ~= "" and "synced" or "local_only"
                 end
             end
-            if not upload_payload and state == "local_only" then
+            if upload_payload == "" and state == "local_only" then
                 last_error = last_error or "position_pending"
             end
             upsert:reset():bind(
@@ -902,7 +1110,7 @@ function LibraryDB:nextLocalAnnotationWork()
     return ok and item or nil
 end
 
-function LibraryDB:claimLocalAnnotationWork(owner)
+function LibraryDB:claimLocalAnnotationWork(owner, book_id)
     local path = self:databasePath()
     local db = self:open()
     if not db then return nil end
@@ -922,10 +1130,11 @@ function LibraryDB:claimLocalAnnotationWork(owner)
             )
               AND upload_payload IS NOT NULL AND upload_payload<>''
               AND (last_attempt_at=0 OR last_attempt_at<=?)
+              AND (?='' OR book_id=?)
             ORDER BY updated_at, local_id LIMIT 1
         ]])
         item = annotation_outbox_row(
-            stmt:reset():bind(os.time() - 60):step())
+            stmt:reset():bind(os.time() - 60, book_id or "", book_id or ""):step())
         close_statement(stmt)
         stmt = nil
         if item then

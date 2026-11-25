@@ -47,6 +47,11 @@ local full_book_save_count = 0
 local saved_cover_data
 package.preload["weread.lib.content"] = function()
     return {
+        ensure_book_cover = function(client, _settings, book)
+            local url = require("weread.lib.protocol").normalize_cover_url(book.cover)
+            saved_cover_data = client:get_binary(url)
+            return saved_cover_data
+        end,
         ensure_catalog = function(_client, _settings, book)
             return book.chapters or { { chapterUid = 22 } }
         end,
@@ -59,7 +64,7 @@ package.preload["weread.lib.content"] = function()
         end,
         save_book_epub = function(_settings, _book, _chapters, _bodies, _suffix, _assets, _css, cover_data)
             full_book_save_count = full_book_save_count + 1
-            saved_cover_data = cover_data
+            saved_cover_data = cover_data or saved_cover_data
             return "/cache/book/replacement-full.epub"
         end,
     }
@@ -241,6 +246,7 @@ for _, token in ipairs({ "s", "t6", "t12", "t9" }) do
         requested_url = url
         return "synthetic cover bytes"
     end
+    saved_cover_data = "synthetic cover bytes"
     local full = {
         book = { book_id = "book", title = "Book", cover = source },
         chapters = { chapter }, selected = { chapter },
@@ -249,8 +255,8 @@ for _, token in ipairs({ "s", "t6", "t12", "t9" }) do
         annotation_failed_batches = 0, silent_completion = true, started_at = 999,
     }
     downloader:_step(full)
-    eq(requested_url, expected, token .. " downloader requested upgraded cover")
-    eq(saved_cover_data, "synthetic cover bytes", token .. " cover passed to EPUB packaging")
+    eq(requested_url, nil, token .. " packaging did not refetch the cached cover")
+    eq(saved_cover_data, "synthetic cover bytes", token .. " cached cover used by EPUB packaging")
 end
 eq(Protocol.normalize_cover_url(nil), nil, "nil cover preserved")
 eq(Protocol.normalize_cover_url(""), "", "empty cover preserved")

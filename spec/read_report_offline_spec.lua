@@ -124,6 +124,7 @@ report.task = function() end
 assert(report:drain())
 assert(scheduled_delays[#scheduled_delays] == 30,
     "rapid drain bypassed the 30-second reading-time replay interval")
+report.replay_task = nil
 report.task = nil
 
 acked = nil
@@ -202,9 +203,9 @@ report.current_book_source = "current_document"
 report.task = function() end
 local captured = #captures
 assert(report:drain(true))
-report:_precheck()
 assert(#captures == captured and report.last_accounted_at == clock - 30,
     "a manual replay slice created a new slice or dropped the active clock")
+report.replay_task = nil
 assert(report:_capture_active_time() == 30, "reading during replay must still be counted")
 report.task = nil
 
@@ -337,6 +338,36 @@ assert(gate_releases[#gate_releases].outcome.write_attempted == true,
     "termination race did not preserve its write-started evidence")
 assert(io.open(racing_job.write_marker, "rb") == nil,
     "termination-race subprocess marker was not cleaned up")
+
+-- Closing can race with the next poll after the child has already written its
+-- definitive result. Consume that result before terminating, otherwise a real
+-- ACK would be replaced by an unnecessary unknown row.
+acked = nil
+local terminated_after_reply = false
+local saved_decode = report._decode_outcome
+report._decode_outcome = function()
+    return { accepted = true, write_attempted = true }
+end
+report.subprocess = {
+    is_done = function() return false end,
+    read_size = function() return 24 end,
+    read_all = function() return "encoded accepted outcome" end,
+    terminate = function() terminated_after_reply = true end,
+}
+queued._network_lease = function() end
+local completed_job = {
+    pid = 91, read_fd = 92, book_id = "queued-book", queued = queued,
+    gate_lease = queued._network_lease, write_marker = os.tmpname(),
+}
+local marker = assert(io.open(completed_job.write_marker, "wb"))
+marker:write("reading-time-write-started\n")
+marker:close()
+report.job = completed_job
+assert(report:_abandon_job(completed_job) and acked == queued.id,
+    "completed child ACK was not salvaged during close")
+assert(not terminated_after_reply and io.open(completed_job.write_marker, "rb") == nil,
+    "completed child was terminated or left its write marker behind")
+report._decode_outcome = saved_decode
 
 report.ensure_context = original_ensure_context
 report._send = original_send

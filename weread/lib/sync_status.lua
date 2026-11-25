@@ -73,6 +73,7 @@ local function offline_work(offline)
     local annotations = offline.annotations or {}
     return (tonumber(offline.pending_seconds) or 0) > 0
         or (tonumber(offline.unknown_seconds) or 0) > 0
+        or (tonumber(offline.rejected_seconds) or 0) > 0
         or sum(annotations, PENDING_ANNOTATION_STATES) > 0
         or sum(annotations, UNKNOWN_ANNOTATION_STATES) > 0
 end
@@ -101,7 +102,7 @@ local function read_progress_status(settings, id)
         end
         return left.title < right.title
     end)
-    return pending, conflicts
+    return pending, conflicts, books
 end
 
 local function unavailable(state, signed_in)
@@ -142,7 +143,7 @@ end
 
 local function read_cached_progress(settings, id, entry)
     if not entry.progress_loaded then
-        entry.pending_progress, entry.conflicts = read_progress_status(settings, id)
+        entry.pending_progress, entry.conflicts, entry.books = read_progress_status(settings, id)
         entry.progress_loaded = entry.pending_progress ~= nil
     end
     return entry.pending_progress, entry.conflicts
@@ -162,26 +163,40 @@ local function build(plugin, entry, offline_snapshot)
     local progress, conflicts = read_cached_progress(settings, id, entry)
     if progress == nil then return unavailable("unavailable", true) end
     local annotations = offline.annotations or {}
+    local review_records = copy(offline.review_records or {})
+    local books = entry.books or {}
+    for _, record in ipairs(review_records) do
+        local book = books[tostring(record.book_id)] or books[record.book_id]
+        record.title = type(book) == "table"
+            and tostring(book.title or book.summary or record.book_id)
+            or tostring(record.book_id)
+    end
     local snapshot = {
         available = true,
         signed_in = true,
         account_key = account_key,
         pending_seconds = tonumber(offline.pending_seconds) or 0,
         pending_annotations = sum(annotations, PENDING_ANNOTATION_STATES),
+        unlocated_annotations = tonumber(offline.unlocated_annotations) or 0,
         pending_progress = progress,
         conflict_count = #conflicts,
         conflicts = conflicts,
         unknown_seconds = tonumber(offline.unknown_seconds) or 0,
+        rejected_seconds = tonumber(offline.rejected_seconds) or 0,
         unknown_annotations = sum(annotations, UNKNOWN_ANNOTATION_STATES),
+        review_records = review_records,
+        review_time_count = #review_records,
         last_confirmed_at = tonumber(offline.last_confirmed_at),
     }
     if snapshot.conflict_count > 0 then
         snapshot.state = "conflict"
-    elseif snapshot.unknown_seconds > 0 or snapshot.unknown_annotations > 0 then
-        snapshot.state = "unknown"
     elseif snapshot.pending_seconds > 0 or snapshot.pending_annotations > 0
         or snapshot.pending_progress > 0 then
         snapshot.state = "pending"
+    elseif snapshot.unknown_seconds > 0 or snapshot.unknown_annotations > 0 then
+        snapshot.state = "unknown"
+    elseif snapshot.rejected_seconds > 0 then
+        snapshot.state = "review"
     elseif snapshot.last_confirmed_at then
         snapshot.state = "synced"
     else
@@ -217,6 +232,7 @@ function SyncStatus.invalidateProgress(settings)
     if entry then
         entry.pending_progress = nil
         entry.conflicts = nil
+        entry.books = nil
         entry.progress_loaded = false
     end
     request_refresh()

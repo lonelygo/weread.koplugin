@@ -199,6 +199,9 @@ local book = {
     intro = "简介 & <精彩> \"引号\"\n第二行\0\1",
     cache_dir = root,
 }
+local cover = assert(io.open(root .. "/cover-source.jpg", "wb"))
+cover:write("\255\216\255", string.rep("cover", 16))
+cover:close()
 local output = Content.save_book_epub(settings, book,
     { { chapterUid = 7, title = "Chapter" } },
     { ["7"] = "<p>body</p>" }, "book", assets, "body{}")
@@ -230,6 +233,18 @@ expect(opf:find(
     "book introduction was not safely embedded as dc:description")
 expect(opf:find("\0", 1, true) == nil and opf:find("\1", 1, true) == nil,
     "XML-illegal control characters remained in the OPF metadata")
+expect(opf:find('properties="cover-image"', 1, true) ~= nil
+        and opf:find('<meta name="cover" content="cover-image"/>', 1, true) ~= nil,
+    "cached book cover was not declared for EPUB 2 and EPUB 3 readers")
+expect(opf:find('<itemref idref="cover"/>', 1, true) == nil,
+    "cover page shifted the existing chapter spine")
+local embedded_cover = false
+for _, call in ipairs(archive_calls) do
+    if call.kind == "memory" and call.name == "OEBPS/images/cover.jpg" then
+        embedded_cover = call.data:sub(1, 3) == "\255\216\255"
+    end
+end
+expect(embedded_cover, "cached cover bytes were not embedded in the EPUB")
 
 local old = assert(io.open(output, "wb"))
 old:write("known-good-old-epub")

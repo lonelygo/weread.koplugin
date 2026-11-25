@@ -207,7 +207,7 @@ local _, lost = feedback:gate("weread_read_write", { operation = "reading_time" 
 work(0, 20)
 lost({ accepted = false, write_attempted = true, error_kind = "transport" })
 step()
-notices("unknown")
+notices("uploaded_with_review") -- this tap received an ACK before the later lost reply
 work(10)
 feedback:startManual()
 step()
@@ -255,4 +255,37 @@ reader_state.account = "separate-login"
 assert(not feedback:startManual(), "a Home tap cannot start work on behalf of a different login")
 reader:deactivate()
 feedback:deactivate()
+-- A connected reader uses the normal reporting interval even when an old
+-- ambiguous write is awaiting review and progress polling cannot run.
+local live, l, _, live_run = fixture()
+live:activate()
+live_run()
+l.unknown, l.seconds, l.queued, l.probe_book = 14, 5223, "other", "other"
+local live_ctx = { operation = "live_reading_time", book_id = "here", position_verified = true }
+local live_ok, live_ack = live:gate("weread_read_write", live_ctx)
+assert(live_ok and l.probes == 0, "live reports must not wait for offline replay or a progress probe")
+assert(not live:gate("weread_read_write", live_ctx), "live reports must serialize with other read writes")
+local ann_ok, ann_ack = live:gate("annotation_write", { operation = "live_annotation", book_id = "here" })
+assert(ann_ok, "a live note should be able to upload while a time write is in flight")
+ann_ack({ accepted = true })
+live_ack({ accepted = true })
+assert(live:_verified(l.account), "a real write receipt confirms service reachability")
+live.plugin.ui = { document = { file = "book.epub" } }
+local hidden = fixture()
+hidden.plugin.ui = {}
+assert(not hidden:activate(), "a hidden FileManager stole the active reader's upload timers")
+assert(live:request("annotation_captured", {live = true, book_id = "here"}))
+assert(l.annotations == 1, "new online note waited for an offline progress probe")
+local relogin_ok, relogin = live:gate("weread_read_write", live_ctx)
+assert(relogin_ok)
+relogin({ accepted = false, write_attempted = true, error_kind = "authentication", auth_renewed = true })
+live_run()
+assert(l.probes == 1 and not live:_verified(l.account), "renewed credentials require a fresh service probe")
+l.job.on_done({ ok = true, value = true })
+l.conflict = "here"
+assert(not live:gate("weread_read_write", live_ctx), "respect in-book progress choices")
+l.conflict, l.online = nil, false
+assert(not live:gate("weread_read_write", live_ctx), "a disconnected reader must buffer locally")
+assert(not live:gate("annotation_write", {operation = "live_annotation"}))
+live:deactivate()
 print("offline_coordinator_spec: passive checks, replay gates, account and screen transitions passed")

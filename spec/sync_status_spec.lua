@@ -85,8 +85,9 @@ assert(db:quarantineReadTime(time, "ambiguous"))
 values.books["book-a"] = nil
 SyncStatus.invalidate(settings)
 local unknown = SyncStatus.get(plugin)
-assert(unknown.state == "unknown" and unknown.unknown_seconds == 30,
-    "ambiguous server write did not remain visible")
+assert(unknown.state == "pending" and unknown.unknown_seconds == 30
+    and unknown.pending_seconds == 450 and unknown.review_time_count == 1,
+    "ambiguous server write hid the still-actionable queue")
 
 values.account = { user_vid = unique .. "-bob" }
 values.books = {}
@@ -99,7 +100,12 @@ for key, value in pairs(first) do forged[key] = value end
 forged.claim_token = "wrong-token"
 assert(not db:ackReadTime(forged) and db:readTimeStatus().pending == 60,
     "conditional reading-time ACK reported a non-existent affected row")
+assert(db:readTimeReceipts().count == 0,
+    "failed acknowledgement created a receipt")
 assert(db:ackReadTime(first))
+local first_receipt = db:readTimeReceipts()
+assert(first_receipt.count == 1 and first_receipt.seconds == 30
+    and first_receipt.last_time, "first confirmed report was not persisted")
 local reads_before_partial_ack = book_reads
 assert(not SyncStatus.noteAck(plugin, 1234),
     "one item acknowledgement marked an unfinished batch complete")
@@ -109,6 +115,10 @@ assert(SyncStatus.get(plugin).last_confirmed_at == nil,
     "unfinished batch exposed a success timestamp")
 local second = assert(db:claimReadTime("spec"))
 assert(db:ackReadTime(second))
+local receipts = db:readTimeReceipts()
+assert(receipts.count == 2 and receipts.seconds == 60
+    and receipts.last_time >= first_receipt.last_time,
+    "account-local report receipts were incomplete")
 assert(SyncStatus.noteAck(plugin, 1235), "complete acknowledged batch was not recorded")
 assert(book_reads == reads_before_partial_ack + 1,
     "final ACK did not perform exactly one necessary progress rescan")
@@ -191,7 +201,45 @@ local current_status = SyncStatus.get({
 assert(current_status.state == "pending" and current_status.last_confirmed_at == nil,
     "late acknowledgement from an old account replaced the active account status")
 
-for _, path in ipairs({ alice_path, bob_path, stale_path, current_path }) do
+local review_settings = fixed_settings(unique .. "-review")
+local review_db = LibraryDB:new(review_settings)
+local review_path = review_db:databasePath()
+local queued_ok, exact_id = review_db:enqueueReadTime("short-book", 14, {})
+assert(queued_ok and exact_id, "short reading time did not return its durable id")
+local exact = assert(review_db:claimReadTime("review", exact_id))
+assert(exact.id == exact_id and exact.elapsed_seconds == 14,
+    "exact online claim selected another queue item")
+assert(review_db:rejectReadTime(exact,
+    "server_rejected; response_body={token=secret}"))
+local rejected = review_db:offlineStatus()
+assert(rejected.rejected_seconds == 14 and rejected.pending_seconds == 0
+    and #rejected.review_records == 1
+    and not rejected.review_records[1].reason:find("response_body", 1, true),
+    "explicit rejection was blocking or persisted a raw response")
+assert(review_db:readTimeReceipts().count == 0,
+    "rejected reading time was counted as confirmed")
+local shown = rejected.review_records[1]
+assert(not db:retryReadTimeReview(shown) and not db:dismissReadTimeReview(shown), "stale login can edit another account")
+assert(review_db:retryReadTimeReview(shown))
+local retried = assert(review_db:claimReadTime("review", exact_id))
+assert(review_db:quarantineReadTime(retried, "lost_reply"))
+assert(review_db:offlineStatus().unknown_seconds == 14,
+    "explicit retry did not retain ambiguous outcome for review")
+assert(not review_db:dismissReadTimeReview(shown), "stale rejected dialog dismissed an unknown row")
+assert(review_db:dismissReadTimeReview(review_db:listReadTimeReview()[1])
+    and #review_db:listReadTimeReview() == 0,
+    "mark handled did not remove exactly the reviewed row")
+
+local _, live_id = review_db:enqueueReadTime("live", 60, {}, {max_chunk_seconds=60})
+local reserved = assert(review_db:claimReadTime("reader", live_id))
+assert(reserved.elapsed_seconds == 60 and review_db:releaseReadTimeClaim(reserved))
+local half = assert(review_db:claimReadTime("replay"))
+assert(half.elapsed_seconds == 30 and review_db:ackReadTime(half))
+assert(review_db:offlineStatus().pending_seconds == 30)
+local other = assert(review_db:claimReadTime("replay"))
+assert(other.elapsed_seconds == 30 and review_db:ackReadTime(other))
+
+for _, path in ipairs({ alice_path, bob_path, stale_path, current_path, review_path }) do
     os.remove(path)
     os.remove(path .. "-wal")
     os.remove(path .. "-shm")

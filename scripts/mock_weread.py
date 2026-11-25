@@ -33,6 +33,7 @@ from fetch_weread_epub import swap_positions, weread_e
 
 REPO = Path(__file__).resolve().parent.parent
 BOOK_ID = "900001"
+DROP_RESPONSE = object()
 TITLES = ["启程", "雨中的小站", "山间来信", "海边的夜晚", "重逢", "归途"]
 QUOTE = "窗外的风穿过树梢，带来远处山谷的回声。"
 BOOKS = [dict(bookId=str(900001 + i), title=("山谷来信 · 离线测试" if i == 0 else f"合成读物 {i:02d}：用于长标题与分页验证"),
@@ -110,7 +111,8 @@ class MockServer(ThreadingHTTPServer):
         self.annotation_writes = []
         self.next_annotation_id = 1
         self.control = dict(delay=0, match="", status=503, times=0,
-                            empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1)
+                            empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1,
+                            read_replies=[])
 
     def record(self, event):
         with self.lock:
@@ -247,11 +249,22 @@ class MockServer(ThreadingHTTPServer):
         if path == "/web/book/read" and method == "POST":
             book_id = next(b["bookId"] for b in BOOKS if weread_e(b["bookId"]) == data["b"])
             uid = next(c["chapterUid"] for c in CHAPTERS if weread_e(c["chapterUid"]) == data["c"])
+            reply = "ok"
             with self.lock:
+                if data.get("rt", 0) > 0 and self.control["read_replies"]:
+                    reply = self.control["read_replies"].pop(0)
+                if reply == "reject":
+                    return 200, dict(succ=0, errCode=4001, errMsg="Injected reading-time rejection")
                 self.read_reports.append(dict(bookId=book_id, chapterUid=uid, rt=data.get("rt", 0),
-                                              chapterOffset=data["co"], progress=data["pr"]))
+                                              chapterOffset=data["co"], progress=data["pr"], reply=reply))
                 self.progress[book_id] = dict(chapterUid=uid, chapterIdx=data["ci"],
                                               chapterOffset=data["co"], progress=data["pr"], summary=data.get("sm", ""))
+            if reply == "blank":
+                return 200, {}
+            if reply == "timeout":
+                return 504, dict(errcode=-1, errmsg="Injected timeout after commit")
+            if reply == "drop":
+                return 200, DROP_RESPONSE
             return 200, dict(succ=1)
         if path in {"/mock/cover.png", "/mock/illustration.png"} and method == "GET":
             return 200, png()
@@ -312,6 +325,9 @@ class Handler(BaseHTTPRequestHandler):
         self.server.record(dict(method=self.command, host=parsed.hostname, path=parsed.path,
                                 api=data.get("api_name"), book=data.get("bookId"), chapter=data.get("chapterUid"),
                                 encoded_chapter=data.get("c"), status=status))
+        if result is DROP_RESPONSE:
+            self.close_connection = True
+            return
         if isinstance(result, bytes):
             content_type, body = "image/png", result
         elif isinstance(result, str):
@@ -345,7 +361,11 @@ class Handler(BaseHTTPRequestHandler):
             for key in ("empty_shelf", "empty_annotations"):
                 if type(candidate[key]) is not bool:
                     raise ValueError(key + " must be boolean")
-            self.server.control = candidate
+            if not isinstance(candidate["read_replies"], list) or len(candidate["read_replies"]) > 20:
+                raise ValueError("read_replies must be a list of at most 20 reply modes")
+            if any(reply not in {"ok", "blank", "reject", "timeout", "drop"} for reply in candidate["read_replies"]):
+                raise ValueError("read_replies contains an unknown reply mode")
+            self.server.control = dict(candidate, read_replies=list(candidate["read_replies"]))
 
 
 def prepare(run_dir, runtime, port):
@@ -398,7 +418,7 @@ def main():
     parser.add_argument("--koreader", type=Path, help="built KOReader runtime directory (not source root)")
     parser.add_argument("--log", type=Path, help="JSONL request log, without headers or private data")
     parser.add_argument("--smoke", action="store_true", help="run real KOReader offscreen smoke, save evidence, then exit")
-    parser.add_argument("--scenario", choices=("basic", "preparation", "continuous", "offline", "reading", "unified", "chunks"), default="basic",
+    parser.add_argument("--scenario", choices=("basic", "covers", "delivery", "preparation", "continuous", "offline", "reading", "unified", "chunks"), default="basic",
                         help="offscreen integration scenario (requires --smoke)")
     args = parser.parse_args()
     if bool(args.run_dir) != bool(args.koreader):
@@ -424,7 +444,7 @@ def main():
         log = args.run_dir / "evidence/smoke.log"
         try:
             with log.open("w") as out:
-                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "preparation": "weread_preparation_mock.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
+                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "covers": "weread_covers_mock.lua", "delivery": "weread_delivery_mock.lua", "preparation": "weread_preparation_mock.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
                                         cwd=args.koreader, env=env, stdout=out, stderr=subprocess.STDOUT, timeout=180)
             if result.returncode == 0 and args.scenario == "basic":
                 full_books = list((args.run_dir / "profile/weread-mock/cache").rglob("* - full.epub"))

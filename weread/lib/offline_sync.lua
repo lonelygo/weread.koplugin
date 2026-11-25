@@ -67,11 +67,17 @@ function Sync:deactivate()
 end
 
 function Sync:activate()
-    if active and active ~= self then active:deactivate() end
+    if active == self then return true end
+    -- KOReader may construct a FileManager behind a still-open ReaderUI.
+    -- Only the reader's CloseDocument handoff transfers that active session.
+    if active and active.plugin.ui and active.plugin.ui.document
+        and self.plugin.ui and not self.plugin.ui.document then return false end
+    if active then active:deactivate() end
     active = self
     self.paused = false
     self:reschedule_heartbeat()
     self:request("startup", { delay = 1 })
+    return true
 end
 
 function Sync:resume()
@@ -130,11 +136,15 @@ function Sync:_finishManual(reason)
     if progress.pulling or progress.uploading or progress.reconciling or progress:awaiting_choice() then return end
     local snapshot = require("weread.lib.sync_status").get(self.plugin)
     reason = reason or attempt.failure
+    local held = (snapshot.unknown_seconds or 0) > 0 or (snapshot.unknown_annotations or 0) > 0
+        or (snapshot.rejected_seconds or 0) > 0
     if not snapshot.available then reason = "unavailable"
-    elseif snapshot.state == "unknown" then reason = "unknown"
     elseif not reason then
         if snapshot.state == "conflict" then reason = "conflict"
+        elseif held and attempt.accepted then reason = "uploaded_with_review"
         elseif snapshot.state == "pending" then reason = "pending"
+        elseif (snapshot.rejected_seconds or 0) > 0 then reason = "review"
+        elseif held then reason = "unknown"
         elseif attempt.accepted then reason = "uploaded"
         elseif attempt.matched then reason = "matched"
         else reason = "empty" end
@@ -173,6 +183,13 @@ function Sync:request(reason, context)
     context = context or {}
     if self.stage and self.stage_account ~= self.plugin.library_db:accountKey() then
         self:_invalidate()
+    end
+    if reason == "annotation_captured" and context.live and self.plugin:isNetworkConnected() then
+        -- A newly edited note uses its own endpoint and is independent of
+        -- read-time receipts and cloud-position choices. Keep its durable row
+        -- until the normal writer returns the remote mark or review ID.
+        local annotations = self.plugin:_offlineAnnotationCoordinator()
+        if annotations then annotations:drain(context.book_id) end
     end
     if reason == "progress_pull_failed" then
         self.verified_until = nil
@@ -356,15 +373,20 @@ function Sync:gate(kind, context)
         self:disconnected()
         return false, "offline"
     end
-    if not self:_verified(account) then return false, "probe_needed" end
+    if not account then return false, "authentication_required" end
     local is_read = kind == "weread_read_write"
-    if not (is_read and context.operation == "progress") and not self.allow_data then
+    local live = (is_read and context.operation == "live_reading_time")
+        or (not is_read and context.operation == "live_annotation")
+    -- A fresh online mutation checks the service itself. Historical time
+    -- shares the progress endpoint and still goes through reconnect comparison.
+    if not live and not self:_verified(account) then return false, "probe_needed" end
+    if not live and not (is_read and context.operation == "progress") and not self.allow_data then
         return false, "progress_pending"
     end
     if (is_read and read_writer) or (not is_read and annotation_writer) then
         return false, "writer_busy"
     end
-    if is_read and context.operation == "reading_time" then
+    if is_read and context.operation ~= "progress" then
         local progress = self.plugin.progress_sync
         if self.stage == "progress" or progress.uploading or progress.reconciling or progress.pulling
             or (progress.awaiting_choice and progress:awaiting_choice(context.book_id)) then
@@ -377,19 +399,35 @@ function Sync:gate(kind, context)
         if is_read and read_writer == token then read_writer = nil
         elseif not is_read and annotation_writer == token then annotation_writer = nil
         else return end
-        local attempt = active and active:_manualAttempt()
-        if attempt and account == attempt.account and self.plugin.library_db.data_dir == attempt.data_dir and outcome then
+        local same_account = active and active.plugin.library_db:accountKey() == account
+            and active.plugin.library_db.data_dir == self.plugin.library_db.data_dir
+        if not same_account or not outcome then
+            if active then active:_schedule() end
+            return
+        end
+        local error_kind = outcome.error_kind
+        local time_row = is_read and context.operation ~= "progress"
+        local ambiguous = (time_row or not is_read) and outcome.write_attempted == true
+            and (error_kind == "transport" or error_kind == "unknown" or error_kind == "job")
+        local held_row = ambiguous or (time_row and (error_kind == "rejected" or error_kind == "context"))
+        local attempt = active:_manualAttempt()
+        if attempt then
             if outcome.accepted == true then
                 attempt.accepted = true
-            elseif outcome.error_kind ~= "empty_queue" and outcome.error_kind ~= "queue_changed" then
+            elseif not held_row and error_kind ~= "empty_queue" and error_kind ~= "queue_changed" then
                 attempt.failure = "unconfirmed"
             end
         end
-        if active and active.plugin.library_db:accountKey() == account and outcome
-            and (outcome.error_kind == "transport" or outcome.error_kind == "authentication"
-                or outcome.error_kind == "context") then
+        if outcome.accepted == true then
+            active.verified_account = account
+            active.verified_until = active.now() + math.min(60, active:interval_seconds())
+            active.probe_failed = nil
+        elseif error_kind == "transport" or error_kind == "authentication"
+            or (not time_row and error_kind == "context") then
             active:_invalidate()
-            active.probe_failed = account
+            -- An uncertain POST is held individually. Probe before replaying
+            -- the next item, so a single lost reply doesn't stall the account.
+            if not ambiguous and not outcome.auth_renewed then active.probe_failed = account end
         end
         if active then active:_schedule() end
     end

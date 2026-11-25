@@ -184,7 +184,7 @@ expect(retry_download.index == 2 and retry_download.failed[1] == "30",
 
 -- Preparation must already be painted while DNS/session/cache work blocks.
 local Content = require("weread.lib.content")
-local pending_init, painted, reader_calls = nil, false, 0
+local pending_init, painted, reader_calls, cover_calls = nil, false, 0, 0
 downloader.refresh_ui = function()
     expect(dialog.visible, "preparation dialog was not shown before repaint")
     painted = true
@@ -199,6 +199,12 @@ Content.ensure_reader_state = function()
     reader_calls = reader_calls + 1
     expect(dialog.visible and dialog.title == "Connecting to WeRead...",
         "reader session request ran without a visible stage")
+end
+Content.ensure_book_cover = function()
+    cover_calls = cover_calls + 1
+    expect(dialog.visible and dialog.title == "Connecting to WeRead...",
+        "cover request ran without a visible stage")
+    return "cover"
 end
 Content.create_download_workspace = function()
     expect(dialog.visible and dialog.title == "Preparing download...",
@@ -221,7 +227,8 @@ expect(start_selected(), "selected chapter download did not start")
 local preparing_dialog = dialog
 expect(not start_selected(), "duplicate preparation was accepted")
 pending_init()
-expect(reader_calls == 1 and dialog == preparing_dialog and dialog.visible,
+expect(reader_calls == 1 and cover_calls == 1
+        and dialog == preparing_dialog and dialog.visible,
     "initialization replaced or closed the preparation dialog")
 expect(downloader._active_job.standby_guard, "download did not acquire standby guard")
 dialog.options.buttons[1][1].callback()
@@ -295,10 +302,10 @@ end
 expect(start_selected(), "interruptible preparation did not start")
 cancel_job(downloader._active_job, 0)
 
-for _, stage in ipairs({ "source", "images", "cover" }) do
+for _, stage in ipairs({ "source", "images" }) do
     local dl = {
         book = { title = "Book", cover = "https://example.com/cover.jpg" },
-        chapters = chapters, total = 2, index = stage == "cover" and 3 or 1,
+        chapters = chapters, total = 2, index = 1,
         selected = {}, bodies = {}, state = {}, assets = {}, failed = {},
         standby_guard = true, trapper = trapper, workspace = {},
         resumable = true, completed = {}, completed_count = 0,
@@ -309,7 +316,6 @@ for _, stage in ipairs({ "source", "images", "cover" }) do
         end,
     }
     if stage == "images" then dl.current = { chapter = chapters[1], xhtml = "body" } end
-    if stage == "cover" then dl.selected = chapters end
     downloader._active_job = dl
     downloader:_beginStandby()
     downloader:_ensureProgressDialog(dl)
@@ -320,7 +326,7 @@ for _, stage in ipairs({ "source", "images", "cover" }) do
     end)
     cancel_job(dl, 0)
 end
-expect(completion_calls == 3, "network-stage cancellation duplicated completion")
+expect(completion_calls == 2, "network-stage cancellation duplicated completion")
 
 local transferred = {
     book = { book_id = "book", token = "stale" }, chapters = chapters, total = 2, index = 1,

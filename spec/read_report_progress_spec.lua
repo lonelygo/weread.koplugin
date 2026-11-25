@@ -158,6 +158,22 @@ test("one reader session enters once and reports live position", function()
     eq(records[3].elapsed_seconds, 30, "time report keeps interval")
 end)
 
+test("a refused session entry preserves elapsed time for a future login", function()
+    local report = fixture()
+    local requests = {}
+    report.client.report_read = function(_client, payload)
+        requests[#requests + 1] = payload.kind
+        return { succ = 0 }, 401
+    end
+    local book = { book_id = "book", chapter_uid = 11 }
+    report.ensure_context = function() return book end
+    local result = report:_run_pipeline("book", { elapsed_seconds = 30 })
+    eq(table.concat(requests, ","), "enter", "only session entry requested")
+    eq(result.error_kind, "authentication", "login refusal")
+    eq(result.write_attempted, false, "elapsed time was never sent")
+    eq(book.read_session_entered_at, nil, "a denied session is not marked entered")
+end)
+
 test("report context restores SQLite catalog and backfills disk", function()
     local report = fixture()
     local db_catalog = { { chapterUid = 11, chapterIdx = 1 } }

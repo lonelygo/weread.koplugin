@@ -152,6 +152,9 @@ function M:onShowWeReadReportStatus()
     local err = report_status.last_error or ""
     local msg = T(_("Report book: %1\nStatus: %2"), target, status)
         .. "\n" .. T(_("Reported: %1 times, last: %2"), tostring(count), last)
+    if report_status.confirmed_seconds then
+        msg = msg .. "\n" .. T(_("Reading time confirmed by WeRead: %1 s"), report_status.confirmed_seconds)
+    end
     if err ~= "" then
         msg = msg .. "\n" .. T(_("Last error: %1"), err)
     end

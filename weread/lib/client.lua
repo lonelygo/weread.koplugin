@@ -492,6 +492,12 @@ function Client:post_json(url, data, opts)
             headers = resp_headers,
         }), code, resp_headers
     end
+    if opts.json_error_statuses and opts.json_error_statuses[code] then
+        -- The reading-time caller needs to distinguish refusal from a lost
+        -- receipt without repeating this POST to discover its outcome.
+        local decoded, value = pcall(self.json_decode, self, text)
+        return decoded and value or nil, code, resp_headers
+    end
     error(http_error(self, code, text, resp_headers))
 end
 
@@ -787,8 +793,11 @@ function Client:get_mp_content(review_id, opts)
     error(http_error(self, code, text, resp_headers))
 end
 
+local read_error_statuses = { [400] = true, [401] = true, [403] = true, [422] = true, [429] = true }
+
 function Client:report_read(payload, referer)
     return self:post_json("https://weread.qq.com/web/book/read", payload, {
+        json_error_statuses = read_error_statuses,
         referer = referer or "https://weread.qq.com/",
     })
 end

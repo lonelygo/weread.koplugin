@@ -10,6 +10,9 @@ function M.run(settings, client, book, chapter, context)
     local ok, result = xpcall(function()
         context.emit { stage = "reader" }
         Content.ensure_reader_state(client, book)
+        context.emit { stage = "cover" }
+        Content.ensure_book_cover(client, settings, book)
+        context.checkCancelled()
         local chapters, catalog_err = Content.ensure_catalog(
             client, settings, book)
         if not chapters then error(catalog_err or "chapter catalog is unavailable") end

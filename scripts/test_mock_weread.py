@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run with python3 scripts/test_mock_weread.py; no KOReader or network account."""
 import base64
+from http.client import RemoteDisconnected
 import json
 import threading
 import time
@@ -45,7 +46,8 @@ class MockTests(unittest.TestCase):
 
     def setUp(self):
         self.request("/__control", dict(delay=0, match="", status=503, times=0,
-                                        empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1))
+                                        empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1,
+                                        read_replies=[]))
 
     def test_contract_and_real_reference_decoder(self):
         status, shelf = self.gateway("/shelf/sync")
@@ -144,6 +146,29 @@ class MockTests(unittest.TestCase):
         self.request("/__control", dict(empty_shelf=True, empty_annotations=True))
         self.assertEqual(self.gateway("/shelf/sync")[1]["books"], [])
         self.assertEqual(self.gateway("/book/underlines", bookId=BOOK_ID, chapterUid=1)[1]["underlines"], [])
+
+    def test_scripted_read_replies_distinguish_commit_reject_and_lost_reply(self):
+        payload = dict(b=weread_e(BOOK_ID), c=weread_e(1), ci=1, co=120, pr=25, rt=30)
+        self.assertEqual(self.request("/__control", dict(read_replies=["blank", "reject", "timeout", "drop", "ok"]))[0], 200)
+        self.assertEqual(self.request("/web/book/read", payload), (200, {}))
+        status, rejected = self.request("/web/book/read", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(rejected["succ"], 0)
+        self.assertEqual(self.request("/web/book/read", payload)[0], 504)
+        with self.assertRaises(RemoteDisconnected):
+            self.request("/web/book/read", payload)
+        self.assertEqual(self.request("/web/book/read", payload)[1]["succ"], 1)
+        state = self.request("/__state")[1]
+        self.assertEqual([item["reply"] for item in state["read_reports"][-4:]], ["blank", "timeout", "drop", "ok"])
+        self.assertEqual(state["control"]["read_replies"], [])
+
+    def test_read_reply_control_is_bounded_and_ignores_zero_time_progress(self):
+        self.assertEqual(self.request("/__control", dict(read_replies=["unknown"]))[0], 400)
+        self.assertEqual(self.request("/__control", dict(read_replies=["blank"] * 21))[0], 400)
+        self.assertEqual(self.request("/__control", dict(read_replies=["reject"]))[0], 200)
+        payload = dict(b=weread_e(BOOK_ID), c=weread_e(1), ci=1, co=120, pr=25, rt=0)
+        self.assertEqual(self.request("/web/book/read", payload)[1]["succ"], 1)
+        self.assertEqual(self.request("/__state")[1]["control"]["read_replies"], ["reject"])
 
     def test_unknown_routes_and_malformed_control_fail(self):
         with self.assertRaises(ValueError):

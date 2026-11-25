@@ -55,11 +55,11 @@ function OfflineAnnotations:_request_sync(reason, context)
     if not ok then logger.warn("annotation sync request failed:", tostring(err)) end
 end
 
-function OfflineAnnotations:_acquire_gate(book_id)
+function OfflineAnnotations:_acquire_gate(book_id, live)
     if self.network_lease ~= nil then return false, "annotation_inflight" end
     local context = {
         source = "offline_annotations",
-        operation = "annotation",
+        operation = live and "live_annotation" or "annotation",
         book_id = tostring(book_id or ""),
     }
     local allowed, lease_or_reason
@@ -137,7 +137,7 @@ function OfflineAnnotations:capture(book_id, path, annotations, modified_items)
         book_id, path, snapshot, { changed = modified })
     if saved and self:_has_pending() then
         self:_request_sync("annotation_captured", {
-            source = "offline_annotations", book_id = book_id,
+            source = "offline_annotations", book_id = book_id, live = type(modified_items) == "table",
         })
         if not self.has_request_sync then self:wake() end
     end
@@ -307,7 +307,12 @@ function OfflineAnnotations:_finish(row, result)
     return 1
 end
 
-function OfflineAnnotations:wake()
+function OfflineAnnotations:wake(live_book_id)
+    local account = self.library_db:accountKey()
+    if not self.is_online() or self.live_account ~= account then self.live_book = nil end
+    if live_book_id and account and self.is_online() then
+        self.live_book, self.live_account = live_book_id, account
+    end
     if self.settings:get("sync", {}).upload_annotations == false then
         self:_cancel_retry()
         return false
@@ -317,6 +322,7 @@ function OfflineAnnotations:wake()
     end
     self.library_db:recoverLocalAnnotationInflight(self.now() - 90)
     if not self:_has_pending() then
+        self.live_book = nil
         self:_cancel_retry()
         return false
     end
@@ -326,12 +332,13 @@ function OfflineAnnotations:wake()
         self:_schedule_retry(2)
         return true
     end
-    local book_id = type(self.library_db.pendingOfflineBook) == "function"
-        and self.library_db:pendingOfflineBook(false, true) or nil
-    local allowed, lease_or_reason = self:_acquire_gate(book_id)
+    local book_id = self.live_book or (type(self.library_db.pendingOfflineBook) == "function"
+        and self.library_db:pendingOfflineBook(false, true) or nil)
+    local allowed, lease_or_reason = self:_acquire_gate(book_id, self.live_book ~= nil)
     if not allowed then return false end
-    local row = self.library_db:claimLocalAnnotationWork("offline-annotations")
+    local row = self.library_db:claimLocalAnnotationWork("offline-annotations", self.live_book)
     if not row then
+        self.live_book = nil
         self:_release_gate(lease_or_reason, {
             accepted = false, write_attempted = false,
             error_kind = "empty_queue",
@@ -386,8 +393,8 @@ function OfflineAnnotations:wake()
     return true
 end
 
-function OfflineAnnotations:drain()
-    return self:wake()
+function OfflineAnnotations:drain(live_book_id)
+    return self:wake(live_book_id)
 end
 
 function OfflineAnnotations:on_network_connected()
