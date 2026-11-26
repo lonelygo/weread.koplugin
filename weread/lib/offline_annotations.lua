@@ -2,12 +2,18 @@
 -- Coordinate extraction happens while the document is open. Network writes run
 -- in BackgroundWorker and are never retried blindly after an ambiguous result.
 local LibraryDB = require("weread.lib.library_db")
+local WorkerSettings = require("weread.lib.worker_settings")
 local logger_module = require("weread.lib.logger")
 local logger = type(logger_module.scoped) == "function"
     and logger_module.scoped("OfflineAnnotations") or logger_module
 
 local OfflineAnnotations = {}
 OfflineAnnotations.__index = OfflineAnnotations
+
+-- These tasks process one annotation or one chapter and share the existing
+-- serial worker slot. Keep the 64 MiB default for downloads and larger jobs.
+local ANNOTATION_MIN_AVAILABLE_KB = 32 * 1024
+local SOURCE_REPAIR_CHAPTER_LIMIT = 1
 
 local function copy(value)
     if type(value) ~= "table" then return value end
@@ -42,12 +48,188 @@ function OfflineAnnotations:new(options)
         get_document = options.get_document or function() return nil end,
         get_book = options.get_book or function() return nil end,
         get_store = options.get_store or function() return nil end,
+        get_annotations = options.get_annotations or function() return nil end,
+        get_session = options.get_session or function() return nil end,
         now = options.now or os.time,
     }, self)
     if type(object.library_db.recoverLocalAnnotationInflight) == "function" then
         object.library_db:recoverLocalAnnotationInflight(object.now() - 90)
     end
     return object
+end
+
+local function source_repairable(reason)
+    return reason == "missing_source" or reason == "missing_source_version"
+end
+
+function OfflineAnnotations:_source_repair_context(repair)
+    if not repair or self.settings:get("sync", {}).upload_annotations == false
+        or self.library_db:accountKey() ~= repair.account_key
+        or self.library_db.data_dir ~= repair.data_dir
+        or self.get_session() ~= repair.session then return false end
+    local document = self.get_document()
+    local annotations = self.get_annotations()
+    if not document or document.file ~= repair.path
+        or type(annotations) ~= "table" then return false end
+    return true, document, annotations
+end
+
+local function retry_delay(repair, reason)
+    repair.attempts = (tonumber(repair.attempts) or 0) + 1
+    local base = tostring(reason or ""):find("low_memory", 1, true) and 120 or 60
+    return math.min(600, base * (2 ^ math.min(3, repair.attempts - 1)))
+end
+
+function OfflineAnnotations:_start_source_repair()
+    local repair = self.source_repair_pending
+    if not repair then
+        self:_cancel_source_retry()
+        return false
+    end
+    if self.source_repair_request then return false end
+    local context_valid = self:_source_repair_context(repair)
+    if not context_valid then
+        if self.source_repair_pending == repair then self.source_repair_pending = nil end
+        self:_cancel_source_retry()
+        return false
+    end
+    if not self.is_online() then
+        return false
+    end
+    local retry_after = (repair.next_attempt_at or 0) - self.now()
+    if retry_after > 0 then
+        self:_schedule_source_retry(retry_after)
+        return false
+    end
+    if self.worker:busy() then
+        self:_schedule_source_retry(2)
+        return true
+    end
+    self:_cancel_source_retry()
+    local fingerprint = WorkerSettings.fingerprint(self.settings)
+    local request_state = { repair = repair }
+    self.source_repair_pending = nil
+    self.source_repair_request = request_state
+    local started, request_or_error = self.worker:start {
+        kind = "annotation_source_repair",
+        queue = false,
+        timeout = 90,
+        min_available_kb = ANNOTATION_MIN_AVAILABLE_KB,
+        task = function(context)
+            return require("weread.lib.annotation_source_worker").run(
+                self.settings, self.client, repair.book, repair.chapters, context)
+        end,
+        on_done = function(result)
+            if self.source_repair_request ~= request_state then return end
+            self.source_repair_request = nil
+            local valid, document, annotations = self:_source_repair_context(repair)
+            if valid and result and result.ok and type(result.value) == "table" then
+                local applied, apply_error = pcall(function()
+                    local value = result.value
+                    if type(value.catalog) == "table" then
+                        local Content = require("weread.lib.content")
+                        local saved, save_error = Content.save_catalog_cache(
+                            self.client, self.settings, repair.book, value.catalog)
+                        if not saved then
+                            error(save_error or "could not save current chapter catalog", 0)
+                        end
+                    end
+                    if type(value.sources) == "table" then
+                        local changes = {}
+                        for _, source in ipairs(value.sources) do
+                            local uid = tostring(source.chapter_uid or "")
+                            if uid == "" or type(source.spans) ~= "table"
+                                or source.version == nil then
+                                error("invalid staged annotation source", 0)
+                            end
+                            changes[#changes + 1] = {
+                                kind = "original", key = uid, uid = uid,
+                                value = source.spans,
+                            }
+                            changes[#changes + 1] = {
+                                kind = "original_version", key = uid, uid = uid,
+                                value = source.version,
+                            }
+                        end
+                        if #changes > 0 then
+                            require("weread.lib.annotation_store"):new(
+                                self.settings):write(repair.book_id, changes)
+                        end
+                    end
+                end)
+                if not applied then
+                    result = { ok = false, error = tostring(apply_error) }
+                end
+            end
+            if valid and result and result.ok and type(result.value) == "table" then
+                if result.value.auth and not WorkerSettings.merge(
+                    self.settings, fingerprint, result.value.auth) then
+                    logger.info("skip annotation source auth write-back: parent auth changed")
+                end
+                local pending_before = self.source_repair_pending
+                if document and type(annotations) == "table" then
+                    local books = self.settings:get("books", {})
+                    local current = books[repair.book_id]
+                    local descriptor = current and current.annotation_documents
+                        and current.annotation_documents[repair.path]
+                    if descriptor and type(result.value.repaired) == "table" then
+                        local repaired = {}
+                        for _, chapter in ipairs(result.value.repaired) do
+                            repaired[tostring(chapter.chapterUid or chapter.chapterId)] = chapter
+                        end
+                        for index, chapter in ipairs(descriptor.chapters or {}) do
+                            local updated = repaired[tostring(
+                                chapter.chapterUid or chapter.chapterId)]
+                            if updated then descriptor.chapters[index] = updated end
+                        end
+                        current.book_version = tonumber(result.value.book_version)
+                            or current.book_version
+                        books[repair.book_id] = current
+                        if type(self.settings.set) == "function" then
+                            self.settings:set("books", books)
+                            self.settings:flush()
+                        end
+                    end
+                    self:capture(repair.book_id, repair.path, annotations, nil)
+                    -- A capture that still needs source data installs a fresh
+                    -- pending object. Otherwise any edit queued while the old
+                    -- worker ran has now been resolved by the same source.
+                    if self.source_repair_pending == pending_before then
+                        self.source_repair_pending = nil
+                    end
+                end
+                self:_start_source_repair()
+                return
+            end
+            if valid and not self.source_repair_pending then
+                local reason = result and result.error or "worker_no_result"
+                local delay = retry_delay(repair, reason)
+                repair.next_attempt_at = self.now() + delay
+                self.source_repair_pending = repair
+                logger.warn("annotation source repair failed:", tostring(reason))
+                self:_schedule_source_retry(delay)
+            else
+                self:_start_source_repair()
+            end
+        end,
+    }
+    request_state.handle = request_or_error
+    if not started then
+        -- BackgroundWorker reports low-memory and launch failures through
+        -- on_done synchronously. Custom/legacy runners may only return false.
+        if self.source_repair_request == request_state then
+            self.source_repair_request = nil
+            if self:_source_repair_context(repair) and not self.source_repair_pending then
+                local delay = retry_delay(repair, request_or_error)
+                repair.next_attempt_at = self.now() + delay
+                self.source_repair_pending = repair
+                self:_schedule_source_retry(delay)
+            end
+        end
+        logger.info("annotation source repair worker unavailable:", tostring(request_or_error))
+        return false
+    end
+    return true
 end
 
 function OfflineAnnotations:_request_sync(reason, context)
@@ -111,23 +293,39 @@ function OfflineAnnotations:capture(book_id, path, annotations, modified_items)
     if book_id == "" or path == "" then return false end
     annotations = type(annotations) == "table" and annotations or {}
     local modified = changed_ids(book_id, path, modified_items)
+    local needs_repair = type(self.library_db.localAnnotationRepairIds) == "function"
+        and self.library_db:localAnnotationRepairIds(book_id, path) or {}
     local resolve_all = modified_items == nil
     local document = self.get_document()
     local book = self.get_book(book_id)
     local store = self.get_store()
-    local snapshot = {}
+    local snapshot, repair_chapters, repair_seen = {}, {}, {}
+    local active_document = document and document.file == path and document or nil
 
     for _, annotation in ipairs(annotations) do
         local item = copy(annotation)
         local local_id = LibraryDB.annotationLocalId(book_id, path, annotation)
-        if document and book and (resolve_all or modified[local_id]) then
+        if active_document and book and (resolve_all or modified[local_id]) then
             local ok, payload, reason = pcall(
                 self.resolver.resolve,
-                document, book, annotation, store)
+                active_document, book, annotation, store)
             if ok and type(payload) == "table" then
                 item._weread_upload = payload
             else
                 item._weread_upload_error = ok and reason or payload
+                if ok and source_repairable(reason)
+                    and (modified[local_id] or needs_repair[local_id])
+                    and type(self.resolver.chapter) == "function" then
+                    local chapter = self.resolver.chapter(
+                        active_document, book, annotation)
+                    local uid = chapter and tostring(
+                        chapter.chapterUid or chapter.chapterId or "") or ""
+                    if uid ~= "" and not repair_seen[uid]
+                        and #repair_chapters < SOURCE_REPAIR_CHAPTER_LIMIT then
+                        repair_seen[uid] = true
+                        repair_chapters[#repair_chapters + 1] = chapter
+                    end
+                end
             end
         end
         snapshot[#snapshot + 1] = item
@@ -135,6 +333,19 @@ function OfflineAnnotations:capture(book_id, path, annotations, modified_items)
 
     local saved = self.library_db:putLocalAnnotationSnapshot(
         book_id, path, snapshot, { changed = modified })
+    if saved and #repair_chapters > 0 then
+        self.source_repair_sequence = (self.source_repair_sequence or 0) + 1
+        self.source_repair_pending = {
+            book_id = book_id, path = path, book = copy(book),
+            chapters = repair_chapters,
+            account_key = self.library_db:accountKey(),
+            data_dir = self.library_db.data_dir,
+            session = self.get_session(),
+            sequence = self.source_repair_sequence,
+            attempts = 0, next_attempt_at = 0,
+        }
+        self:_start_source_repair()
+    end
     if saved and self:_has_pending() then
         self:_request_sync("annotation_captured", {
             source = "offline_annotations", book_id = book_id, live = type(modified_items) == "table",
@@ -162,6 +373,29 @@ function OfflineAnnotations:_cancel_retry()
         self.scheduler:unschedule(self.retry_task)
     end
     self.retry_task = nil
+end
+
+function OfflineAnnotations:_cancel_source_retry()
+    if not self.source_retry_task then return end
+    if type(self.scheduler.unschedule) == "function" then
+        self.scheduler:unschedule(self.source_retry_task)
+    end
+    self.source_retry_task = nil
+end
+
+function OfflineAnnotations:_schedule_source_retry(delay)
+    if self.source_retry_task then return false end
+    local task
+    task = function()
+        if self.source_retry_task ~= task then return end
+        self.source_retry_task = nil
+        if self.settings:get("sync", {}).upload_annotations ~= false then
+            self:_start_source_repair()
+        end
+    end
+    self.source_retry_task = task
+    self.scheduler:scheduleIn(math.max(1, tonumber(delay) or 60), task)
+    return true
 end
 
 function OfflineAnnotations:_schedule_retry(delay)
@@ -315,16 +549,21 @@ function OfflineAnnotations:wake(live_book_id)
     end
     if self.settings:get("sync", {}).upload_annotations == false then
         self:_cancel_retry()
+        self:_cancel_source_retry()
         return false
     end
+    -- Reconnect and manual-sync both enter through wake(). Source repair must
+    -- run first because its local-only rows have no upload payload yet.
+    local source_working = self:_start_source_repair()
+        or self.source_repair_request ~= nil
     if self.request or self.network_lease ~= nil then
-        return false
+        return source_working
     end
     self.library_db:recoverLocalAnnotationInflight(self.now() - 90)
     if not self:_has_pending() then
         self.live_book = nil
         self:_cancel_retry()
-        return false
+        return source_working
     end
     if self.worker:busy() then
         -- The prefetch worker is shared. This drain is still in progress
@@ -347,34 +586,44 @@ function OfflineAnnotations:wake(live_book_id)
         return false
     end
     self:_cancel_retry()
+    local launching, synchronous_result = true, nil
+    local function finish_request(result)
+        local delay = self:_finish(row, result)
+        local value = result and result.ok and result.value or nil
+        self:_release_gate(lease_or_reason, {
+            accepted = type(value) == "table" and value.accepted == true,
+            write_attempted = true,
+            error_kind = not (result and result.ok) and "task"
+                or (type(value) == "table" and value.reason == "unknown"
+                    and "transport" or nil),
+            error = not (result and result.ok) and result.error
+                or (type(value) == "table" and value.reason or nil),
+        })
+        if self:_has_pending() then
+            self:_request_sync("annotation_remaining", {
+                source = "offline_annotations", book_id = row.book_id,
+            })
+        end
+        self:_schedule_retry(delay or 1)
+    end
     local started, request_or_error = self.worker:start {
         kind = "offline_annotation_upload",
         queue = false,
         timeout = 60,
+        min_available_kb = ANNOTATION_MIN_AVAILABLE_KB,
         task = function(context)
             context.checkCancelled()
             return perform(self.client, row)
         end,
         on_done = function(result)
-            local delay = self:_finish(row, result)
-            local value = result and result.ok and result.value or nil
-            self:_release_gate(lease_or_reason, {
-                accepted = type(value) == "table" and value.accepted == true,
-                write_attempted = true,
-                error_kind = not (result and result.ok) and "task"
-                    or (type(value) == "table" and value.reason == "unknown"
-                        and "transport" or nil),
-                error = not (result and result.ok) and result.error
-                    or (type(value) == "table" and value.reason or nil),
-            })
-            if self:_has_pending() then
-                self:_request_sync("annotation_remaining", {
-                    source = "offline_annotations", book_id = row.book_id,
-                })
+            if launching then
+                synchronous_result = result
+                return
             end
-            self:_schedule_retry(delay or 1)
+            finish_request(result)
         end,
     }
+    launching = false
     if not started then
         self.library_db:updateLocalAnnotationWork(row, {
             sync_state = row.original_state,
@@ -386,10 +635,13 @@ function OfflineAnnotations:wake(live_book_id)
             accepted = false, write_attempted = false,
             error_kind = "worker_unavailable", error = request_or_error,
         })
-        self:_schedule_retry(5)
+        local delay = tostring(request_or_error or ""):find(
+            "low_memory", 1, true) and 120 or 5
+        self:_schedule_retry(delay)
         return false
     end
     self.request = request_or_error
+    if synchronous_result then finish_request(synchronous_result) end
     return true
 end
 

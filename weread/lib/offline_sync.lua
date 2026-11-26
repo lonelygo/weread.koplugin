@@ -3,6 +3,7 @@
 -- its own completion, even across a screen change.
 local Sync = {}
 Sync.__index = Sync
+local WorkerSettings = require("weread.lib.worker_settings")
 
 local active
 local read_writer
@@ -10,10 +11,41 @@ local annotation_writer
 -- FileManager and ReaderUI can trade places while an acknowledged write is
 -- returning. Only an explicit tap subscribes the current login to a result.
 local manual
+local last_probe_renewal
+local BOOK_RETRY_SECONDS = 15
+local PROBE_RENEWAL_COOLDOWN_SECONDS = 10 * 60
 
 local connection_checks = {
     heartbeat = true, network_connected = true, resume = true, manual_sync = true,
 }
+
+local function probe_with_optional_renewal(client, book_id, allow_renewal,
+        capture_auth)
+    local verified, reason, auth_code = client:probe_sync(book_id)
+    local value = {
+        ok = verified == true,
+        reason = reason,
+        auth_code = auth_code,
+    }
+    if verified or reason ~= "authentication_required"
+        or tonumber(auth_code) ~= -2012 or not allow_renewal then
+        return value
+    end
+
+    local auth_result
+    if capture_auth and client.settings then
+        auth_result = WorkerSettings.capture(client.settings)
+    end
+    local renewed, renewed_reason, details = client:renew_probe_sync(book_id)
+    details = type(details) == "table" and details or {}
+    value.ok = renewed == true
+    value.reason = renewed_reason
+    value.auth_code = details.auth_code
+    value.renew_attempted = details.renew_attempted == true
+    value.auth_renewed = details.auth_renewed == true
+    if auth_result then value.auth = auth_result() end
+    return value
+end
 
 function Sync.new(class, plugin, scheduler, probe_worker, now)
     local self = setmetatable({
@@ -28,6 +60,10 @@ function Sync.new(class, plugin, scheduler, probe_worker, now)
     self.run = function()
         self.due = nil
         if active == self and not self.paused then self:_run() end
+    end
+    self.book_retry = function()
+        self.book_retry_due = nil
+        if active == self and not self.paused then self:_schedule() end
     end
     return self
 end
@@ -56,7 +92,9 @@ function Sync:pause()
     self:_invalidate()
     self.scheduler:unschedule(self.heartbeat)
     self.scheduler:unschedule(self.run)
+    self.scheduler:unschedule(self.book_retry)
     self.due = nil
+    self.book_retry_due = nil
 end
 
 function Sync:deactivate()
@@ -120,6 +158,9 @@ function Sync:startManual(book_id)
     if self.paused then return false end
     if self:_manualAttempt() then return true end
     manual = { account = account, data_dir = db.data_dir }
+    if db.readTimeReceipts then
+        manual.start_seconds = db:readTimeReceipts().seconds
+    end
     self.plugin.read_report:capture_for_manual()
     if self.plugin:isNetworkConnected() then self.plugin:showManualSyncResult("started") end
     return self:request("manual_sync", {
@@ -135,6 +176,10 @@ function Sync:_finishManual(reason)
     local progress = self.plugin.progress_sync
     if progress.pulling or progress.uploading or progress.reconciling or progress:awaiting_choice() then return end
     local snapshot = require("weread.lib.sync_status").get(self.plugin)
+    local db = self.plugin.library_db
+    if attempt.start_seconds and db.readTimeReceipts then
+        snapshot.newly_confirmed_seconds = math.max(0, (db:readTimeReceipts().seconds or 0) - attempt.start_seconds)
+    end
     reason = reason or attempt.failure
     local held = (snapshot.unknown_seconds or 0) > 0 or (snapshot.unknown_annotations or 0) > 0
         or (snapshot.rejected_seconds or 0) > 0
@@ -142,7 +187,11 @@ function Sync:_finishManual(reason)
     elseif not reason then
         if snapshot.state == "conflict" then reason = "conflict"
         elseif held and attempt.accepted then reason = "uploaded_with_review"
-        elseif snapshot.state == "pending" then reason = "pending"
+        elseif snapshot.state == "pending" and (snapshot.unlocated_annotations or 0) > 0
+            and snapshot.pending_annotations == snapshot.unlocated_annotations
+            and (snapshot.pending_seconds or 0) == 0 and (snapshot.pending_progress or 0) == 0 then
+            reason = "locate_annotations"
+        elseif snapshot.state == "pending" then reason = attempt.row_reason or (attempt.accepted and "partial" or "pending")
         elseif (snapshot.rejected_seconds or 0) > 0 then reason = "review"
         elseif held then reason = "unknown"
         elseif attempt.accepted then reason = "uploaded"
@@ -151,6 +200,7 @@ function Sync:_finishManual(reason)
     end
     manual = nil
     if self.explicit and self.explicit.manual then self.explicit = nil end
+    if db.saveManualSyncResult then db:saveManualSyncResult(reason, os.time()) end
     self.plugin:showManualSyncResult(reason, snapshot)
 end
 
@@ -178,11 +228,25 @@ function Sync:_schedule(delay)
     self.scheduler:scheduleIn(delay, self.run)
 end
 
+function Sync:_schedule_book_retry(delay)
+    if active ~= self or self.paused then return end
+    delay = math.max(0, tonumber(delay) or BOOK_RETRY_SECONDS)
+    local due = self.now() + delay
+    if self.book_retry_due and self.book_retry_due <= due then return end
+    self.scheduler:unschedule(self.book_retry)
+    self.book_retry_due = due
+    self.scheduler:scheduleIn(delay, self.book_retry)
+end
+
 function Sync:request(reason, context)
     if active ~= self or self.paused then return false end
     context = context or {}
     if self.stage and self.stage_account ~= self.plugin.library_db:accountKey() then
         self:_invalidate()
+    end
+    if reason == "login_completed" then
+        self:_invalidate()
+        self.recheck = true
     end
     if reason == "annotation_captured" and context.live and self.plugin:isNetworkConnected() then
         -- A newly edited note uses its own endpoint and is independent of
@@ -217,6 +281,20 @@ end
 function Sync:_verified(account)
     return account and account == self.verified_account and self.verified_until
         and self.now() < self.verified_until
+end
+
+function Sync:_probeRenewalAllowed(account, fingerprint)
+    local last = last_probe_renewal
+    return not last or last.account ~= account or last.fingerprint ~= fingerprint
+        or last.data_dir ~= self.plugin.library_db.data_dir
+        or self.now() - last.at >= PROBE_RENEWAL_COOLDOWN_SECONDS
+end
+
+function Sync:_noteProbeRenewal(account, fingerprint)
+    last_probe_renewal = {
+        at = self.now(), account = account, fingerprint = fingerprint,
+        data_dir = self.plugin.library_db.data_dir,
+    }
 end
 
 function Sync:_finish()
@@ -289,12 +367,29 @@ function Sync:_run()
         local current = self:_manualAttempt()
         if current and status == "synced" then current.matched = true end
         if status == "error" or (status == "deferred" and result.reason == "online_task_unavailable") then
-            self.verified_until = nil
-            self.probe_failed = account
+            local failed_book = tostring(result and result.book_id or book_id or "")
+            if failed_book ~= ""
+                and type(plugin.library_db.deferPendingReadTimeForBook) == "function" then
+                plugin.library_db:deferPendingReadTimeForBook(
+                    failed_book, BOOK_RETRY_SECONDS)
+            end
             if current then
                 current.failure = "progress_failed"
-                self:_finishManual()
             end
+            -- The service probe was already confirmed. A catalog or
+            -- book-position failure must not revoke the whole account.
+            -- Located annotations use an independent endpoint and may proceed;
+            -- this book's time remains delayed until progress is safe.
+            self.allow_data = true
+            local annotations = plugin:_offlineAnnotationCoordinator()
+            local scheduled = with_annotations and annotations
+                and annotations:drain() or false
+            if current and not scheduled then self:_finishManual() end
+            -- The immediate rerun may still process another book. Keep a
+            -- separate delayed wakeup for this row's retry window rather
+            -- than letting that earlier pass consume the only timer.
+            self:_schedule()
+            self:_schedule_book_retry(BOOK_RETRY_SECONDS)
             return
         end
         if status == "uploading" or status == "pulling" or status == "stale"
@@ -317,16 +412,85 @@ function Sync:_probe(account, book_id)
     self.stage, self.stage_account = "probe", account
     local generation = self.generation
     local complete = false
+    local inline_fallback_attempted = false
+    local client = self.plugin.client
+    local auth_fingerprint = WorkerSettings.fingerprint(
+        self.plugin.settings)
+    local allow_renewal = self:_probeRenewalAllowed(
+        account, auth_fingerprint)
+    local function inline_probe(can_renew)
+        return probe_with_optional_renewal(
+            client, book_id, can_renew == true, false)
+    end
+    local function local_failure_reason(reason)
+        if reason == "low_memory" then return "probe_low_memory" end
+        if reason == "worker_timeout" then return "probe_timeout" end
+        if reason == "worker_unavailable" or reason == "worker_no_result" then
+            return "probe_worker_unavailable"
+        end
+        return "probe_worker_failed"
+    end
     local function finish(result)
         if complete then return end
-        complete = true
-        if active ~= self or self.paused or self.generation ~= generation then return end
-        self.stage = nil
+        -- A late callback belongs to the account and generation captured when
+        -- the worker started. Never run its inline fallback (especially
+        -- renewal) against a newly logged-in account or a replacement UI.
+        if active ~= self or self.paused or self.generation ~= generation then
+            return
+        end
         if self.plugin.library_db:accountKey() ~= account then
+            complete = true
+            self:_invalidate()
             self:_schedule()
             return
         end
-        if result and result.ok and result.value == true and self.plugin:isNetworkConnected() then
+        if not (result and result.ok)
+            and self:_manualAttempt()
+            and self.plugin:isNetworkConnected()
+            and not inline_fallback_attempted then
+            -- A timed-out/no-result child may already have sent renewal or be
+            -- waiting on its verification GET. The bounded fallback remains
+            -- read-only in that case. Renewal is safe only when no child ever
+            -- started (low memory, unavailable runner, launch failure).
+            local error_code = result and result.error
+            local child_never_started = result and result.not_started == true
+                or error_code == "low_memory"
+                or error_code == "worker_unavailable"
+            inline_fallback_attempted = true
+            local ok, value = pcall(inline_probe,
+                allow_renewal and child_never_started)
+            result = {
+                ok = ok,
+                value = ok and value or {
+                    ok = false,
+                    reason = local_failure_reason(result and result.error),
+                },
+            }
+        end
+        complete = true
+        self.stage = nil
+        local value = result and result.ok and result.value or nil
+        local renew_attempted = type(value) == "table"
+            and value.renew_attempted == true
+        local verified = value == true
+            or (type(value) == "table" and value.ok == true)
+        local failure_reason = type(value) == "table" and value.reason or nil
+        local auth_merge_failed = false
+        if type(value) == "table" and type(value.auth) == "table" then
+            if not WorkerSettings.merge(
+                self.plugin.settings, auth_fingerprint, value.auth) then
+                verified = false
+                failure_reason = "authentication_required"
+                auth_merge_failed = true
+            end
+            value.auth = nil
+        end
+        if renew_attempted then
+            self:_noteProbeRenewal(account,
+                auth_merge_failed and auth_fingerprint
+                    or WorkerSettings.fingerprint(self.plugin.settings))
+        end
+        if verified and self.plugin:isNetworkConnected() then
             self.verified_account = account
             self.verified_until = self.now() + math.min(60, self:interval_seconds())
             self.rerun = nil
@@ -336,23 +500,36 @@ function Sync:_probe(account, book_id)
             self.probe_failed = account
             local attempt = self:_manualAttempt()
             if attempt then
-                attempt.failure = self.plugin:isNetworkConnected() and "unreachable" or "offline"
+                if not self.plugin:isNetworkConnected() then
+                    attempt.failure = "offline"
+                elseif failure_reason then
+                    attempt.failure = failure_reason
+                elseif result and result.ok then
+                    attempt.failure = "response_unrecognized"
+                else
+                    attempt.failure = local_failure_reason(
+                        result and result.error)
+                end
                 self:_finishManual()
             end
         end
     end
-    local client = self.plugin.client
     if not self.worker:available() then
         -- Some ports have no subprocess runner. Use the same bounded read.
-        local ok, value = pcall(client.probe_sync, client, book_id)
-        finish({ ok = ok, value = value })
+        local ok, value = pcall(inline_probe, allow_renewal)
+        finish({ ok = ok, value = ok and value or {
+            ok = false, reason = "service_unreachable",
+        } })
         return
     end
     local started, reason = self.worker:start{
-        kind = "sync_probe", timeout = 10,
+        -- At most three bounded requests: initial GET, renewal POST, and the
+        -- mandatory verification GET (6 s each plus fork/file overhead).
+        kind = "sync_probe", timeout = 24,
         task = function(context)
             context.checkCancelled()
-            return client:probe_sync(book_id)
+            return probe_with_optional_renewal(
+                client, book_id, allow_renewal, true)
         end,
         on_done = finish,
     }
@@ -361,7 +538,7 @@ function Sync:_probe(account, book_id)
             self.stage = nil
             self:_schedule(1)
         else
-            finish({ ok = false })
+            finish({ ok = false, error = reason, not_started = true })
         end
     end
 end
@@ -414,6 +591,14 @@ function Sync:gate(kind, context)
         if attempt then
             if outcome.accepted == true then
                 attempt.accepted = true
+            elseif time_row and error_kind == "context" then
+                attempt.row_reason = "time_position_pending"
+            elseif error_kind == "authentication" then
+                attempt.failure = outcome.auth_renewed and "login_renewed" or "authentication_required"
+            elseif error_kind == "rate_limited" then
+                attempt.failure = "service_busy"
+            elseif error_kind == "transport" and outcome.write_attempted == false then
+                attempt.failure = "service_unreachable"
             elseif not held_row and error_kind ~= "empty_queue" and error_kind ~= "queue_changed" then
                 attempt.failure = "unconfirmed"
             end

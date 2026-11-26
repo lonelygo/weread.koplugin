@@ -72,6 +72,15 @@ assert(pending.state == "pending" and pending.pending_seconds == 480
     and pending.pending_annotations == 2 and pending.pending_progress == 1,
     "combined pending counts were incomplete")
 assert(book_reads == 2, "progress invalidation did not perform exactly one rescan")
+local groups = SyncStatus.reviewBooks(plugin, pending)
+assert(#groups == 1 and groups[1].title == "Alpha" and groups[1].seconds == 480
+    and groups[1].segments == 16 and groups[1].annotations == 2 and groups[1].progress)
+assert(db:saveManualSyncResult("service_unreachable", 1000)
+    and second_db:lastManualSyncResult().reason == "service_unreachable")
+assert(db:saveManualSyncResult("authentication_required", 1000)
+    and second_db:lastManualSyncResult().reason == "authentication_required"
+    and second_db:lastManualSyncResult().at == 1000)
+assert(not db:saveManualSyncResult("credentials in a raw response", 1001))
 
 values.books["book-a"].pending_upload_blocked = true
 SyncStatus.invalidate(settings)
@@ -238,6 +247,15 @@ assert(half.elapsed_seconds == 30 and review_db:ackReadTime(half))
 assert(review_db:offlineStatus().pending_seconds == 30)
 local other = assert(review_db:claimReadTime("replay"))
 assert(other.elapsed_seconds == 30 and review_db:ackReadTime(other))
+
+-- A status read from another KOReader host can overlap a receipt transaction.
+-- It must see the last commit, even while a writer holds the WAL write lock.
+local writer = assert(review_db:open())
+writer:exec("BEGIN IMMEDIATE")
+writer:exec("UPDATE sync_status_meta SET value=99999 WHERE name='read_time_receipt_seconds'")
+assert(LibraryDB:new(review_settings):readTimeReceipts().seconds == 60)
+writer:exec("ROLLBACK")
+writer:close()
 
 for _, path in ipairs({ alice_path, bob_path, stale_path, current_path, review_path }) do
     os.remove(path)

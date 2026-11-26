@@ -47,7 +47,7 @@ class MockTests(unittest.TestCase):
     def setUp(self):
         self.request("/__control", dict(delay=0, match="", status=503, times=0,
                                         empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1,
-                                        read_replies=[]))
+                                        progress_reply="ok", renew_reply="ok", read_replies=[]))
 
     def test_contract_and_real_reference_decoder(self):
         status, shelf = self.gateway("/shelf/sync")
@@ -123,6 +123,40 @@ class MockTests(unittest.TestCase):
         for key in ("progress", "read_reports", "annotation_writes", "bookmarks", "private_reviews"):
             self.assertEqual(after[key], before[key])
 
+    def test_readonly_progress_probe_can_return_expired_login_without_mutation(self):
+        before = self.request("/__state")[1]
+        self.assertEqual(self.request("/__control", dict(progress_reply="authentication"))[0], 200)
+        status, body = self.request("/web/book/getProgress?bookId=" + BOOK_ID)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["errCode"], -2010)
+        status, body = self.gateway("/book/getprogress", bookId=BOOK_ID)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["errCode"], -2010)
+        after = self.request("/__state")[1]
+        for key in ("progress", "read_reports", "annotation_writes", "bookmarks", "private_reviews"):
+            self.assertEqual(after[key], before[key])
+
+    def test_expired_login_renews_then_requires_a_fresh_probe(self):
+        before = self.request("/__state")[1]
+        self.request("/__control", dict(progress_reply="expired", renew_reply="ok"))
+        status, body = self.request("/web/book/getProgress?bookId=" + BOOK_ID)
+        self.assertEqual((status, body["errCode"]), (200, -2012))
+        status, body = self.request("/web/login/renewal", dict(rq="%2Fweb%2Fbook%2Fread", ql=False))
+        self.assertEqual((status, body["succ"]), (200, 1))
+        status, body = self.request("/web/book/getProgress?bookId=" + BOOK_ID)
+        self.assertEqual(status, 200)
+        self.assertIn("book", body)
+        after = self.request("/__state")[1]
+        for key in ("progress", "read_reports", "annotation_writes", "bookmarks", "private_reviews"):
+            self.assertEqual(after[key], before[key])
+
+    def test_rejected_renewal_leaves_expired_probe_blocked(self):
+        self.request("/__control", dict(progress_reply="expired", renew_reply="reject"))
+        status, body = self.request("/web/login/renewal", dict(rq="%2Fweb%2Fbook%2Fread", ql=False))
+        self.assertEqual((status, body["succ"], body["errCode"]), (200, 0, -2012))
+        status, body = self.request("/web/book/getProgress?bookId=" + BOOK_ID)
+        self.assertEqual((status, body["errCode"]), (200, -2012))
+
     def test_successful_probe_followed_by_failed_progress_sources(self):
         before = self.request("/__state")[1]
         self.request("/__control", dict(progress_successes_before_failure=1))
@@ -184,6 +218,8 @@ class MockTests(unittest.TestCase):
         self.assertEqual(self.request("/web/book/chapterInfos", dict(bookIds=["unknown"]))[0], 400)
         self.assertEqual(self.request("/__control", dict(delay=-1))[0], 400)
         self.assertEqual(self.request("/__control", dict(times="forever"))[0], 400)
+        self.assertEqual(self.request("/__control", dict(progress_reply="unknown"))[0], 400)
+        self.assertEqual(self.request("/__control", dict(renew_reply="unknown"))[0], 400)
         self.assertEqual(self.request("/__control", dict(unknown=True))[0], 400)
         self.assertEqual(self.request("/web/book/chapter/e_0", dict(b="unknown", c="bad"))[0], 400)
         self.assertEqual(self.request("/__control", [1, 2])[0], 400)

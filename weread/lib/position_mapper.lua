@@ -1,4 +1,5 @@
 local PositionMapper = {}
+local RemoteProgress = require("weread.lib.remote_progress")
 
 local function clamp(value, minimum, maximum)
     value = tonumber(value) or minimum
@@ -49,27 +50,6 @@ local function catalog(chapters)
     return result
 end
 
-local function find_progress_node(value, book_id, depth)
-    if type(value) ~= "table" or (depth or 0) > 7 then
-        return nil
-    end
-    local has_progress = value.progress ~= nil
-        or value.readingProgress ~= nil
-        or value.bookProgress ~= nil
-    local value_book_id = value.bookId or value.book_id
-    if has_progress and (value_book_id == nil
-        or tostring(value_book_id) == tostring(book_id or "")) then
-        return value
-    end
-    for _key, child in pairs(value) do
-        if type(child) == "table" then
-            local found = find_progress_node(child, book_id, (depth or 0) + 1)
-            if found then return found end
-        end
-    end
-    return nil
-end
-
 local function raw_field(value, ...)
     for index = 1, select("#", ...) do
         local key = select(index, ...)
@@ -83,34 +63,28 @@ function PositionMapper.catalog(chapters)
 end
 
 function PositionMapper.normalize_remote(value, book_id, source, chapters)
-    local node = find_progress_node(value, book_id)
-    if not node then return nil, "progress_not_found" end
-    local percent = tonumber(raw_field(
-        node, "progress", "readingProgress", "bookProgress"
-    ))
+    local node, find_error = RemoteProgress.find_node(value, book_id)
+    if not node then return nil, find_error end
+    local percent = RemoteProgress.percent(node)
     if not percent then return nil, "progress_invalid" end
 
-    local raw_offset = raw_field(
-        node, "chapterOffset", "chapterPos", "offset", "chapter_offset"
-    )
+    local uid, offset = RemoteProgress.location(node)
     local remote = {
         book_id = raw_field(node, "bookId", "book_id") or book_id,
         percent = clamp(percent, 0, 100),
         raw_percent = percent,
-        chapter_uid = raw_field(
-            node, "chapterUid", "chapterId", "chapter_uid"
-        ),
+        chapter_uid = uid,
         chapter_idx = tonumber(raw_field(
             node, "chapterIdx", "chapterIndex", "chapter_idx"
         )) or 0,
-        chapter_offset = math.max(0, tonumber(raw_offset) or 0),
-        has_chapter_offset = raw_offset ~= nil
-            and tonumber(raw_offset) ~= nil,
+        chapter_offset = offset or 0,
+        has_chapter_offset = offset ~= nil,
         updated_at = tonumber(raw_field(
             node, "updateTime", "updatedAt", "update_time"
         )) or 0,
         summary = raw_field(node, "summary", "chapterTitle") or "",
         source = source or "unknown",
+        raw_node = node,
     }
 
     local map = catalog(chapters)
@@ -118,9 +92,9 @@ function PositionMapper.normalize_remote(value, book_id, source, chapters)
         and map.by_uid[tostring(remote.chapter_uid)] or nil
     if item and remote.has_chapter_offset
         and item.words > 0 and map.total_words > 0 then
-        local offset = clamp(remote.chapter_offset, 0, item.words)
+        local within_chapter = clamp(remote.chapter_offset, 0, item.words)
         remote.percent = clamp(
-            (item.before + offset) / map.total_words * 100,
+            (item.before + within_chapter) / map.total_words * 100,
             0,
             100
         )

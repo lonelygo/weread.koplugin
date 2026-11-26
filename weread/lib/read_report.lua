@@ -1,5 +1,7 @@
 local Content = require("weread.lib.content")
 local WeRead = require("weread.lib.protocol")
+local PositionMapper = require("weread.lib.position_mapper")
+local RemoteProgress = require("weread.lib.remote_progress")
 
 local logger = require("weread.lib.logger").scoped("ReadReport")
 
@@ -145,10 +147,7 @@ local function table_keys(value)
 end
 
 local function rejected(node)
-    if type(node) ~= "table" then return false end
-    local code = node.errCode or node.errcode or node.errorCode or node.code
-    return (code ~= nil and tonumber(code) ~= 0)
-        or (node.succ ~= nil and not WeRead.is_success_response(node))
+    return RemoteProgress.response_error(node) ~= nil
 end
 
 local function response_accepted(result, http_code)
@@ -177,12 +176,31 @@ local function response_rejected(result, http_code)
     return rejected(result) or rejected(result.data) or rejected(result.result)
 end
 
+local function response_failure_kind(result, http_code)
+    local status = tonumber(http_code)
+    if status == 401 or status == 403 then return "authentication" end
+    if not status or not ((status >= 200 and status < 300)
+        or status == 400 or status == 422) then return nil end
+    return RemoteProgress.response_error(result)
+end
+
 local function request_error_kind(err)
     local text = tostring(err)
     if text:match("HTTP%s+401%f[^%d]") or text:match("HTTP%s+403%f[^%d]") then
         return "authentication"
     end
     return "transport"
+end
+
+local function context_error_kind(message)
+    local reason = message:match("remote progress unavailable: ([%w_]+)")
+    if not reason and message:match("HTTP%s+[%w]+") then
+        reason = RemoteProgress.request_reason(message)
+    end
+    if reason == "authentication_required" then return "authentication" end
+    if reason == "service_unreachable" then return "transport" end
+    if reason == "service_busy" then return "rate_limited" end
+    return "context"
 end
 
 local function full_response_body(client, result)
@@ -1285,6 +1303,16 @@ function ReadReport:_run_pipeline(book_id, opts)
     local outcome = {
         accepted = false, renew_attempted = false, write_attempted = false,
     }
+    local function renew_if_allowed()
+        if outcome.error_kind ~= "authentication" or not opts.allow_renewal then
+            return
+        end
+        outcome.renew_attempted = true
+        local renewed, result_body = pcall(
+            self.client.renew_cookie, self.client)
+        outcome.auth_renewed = renewed
+            and WeRead.is_success_response(result_body) or false
+    end
 
     local function send(book)
         return self:_send(
@@ -1295,13 +1323,23 @@ function ReadReport:_run_pipeline(book_id, opts)
             end)
     end
 
+    if type(opts.position) == "table"
+        and opts.position.book_id ~= nil
+        and tostring(opts.position.book_id) ~= tostring(book_id) then
+        outcome.error = "explicit position belongs to another book"
+        outcome.error_kind = "context"
+        outcome.error_prefix = "read report context initialization failed:"
+        return outcome
+    end
+
     local context_ok, book = pcall(function()
         return self:ensure_context(book_id, opts.force_context == true)
     end)
     if not context_ok then
         outcome.error = tostring(book)
-        outcome.error_kind = "context"
+        outcome.error_kind = context_error_kind(outcome.error)
         outcome.error_prefix = "read report context initialization failed:"
+        renew_if_allowed()
         return outcome
     end
     local ok, result, http_code = pcall(function()
@@ -1322,13 +1360,14 @@ function ReadReport:_run_pipeline(book_id, opts)
     else
         local status = tonumber(http_code)
         outcome.error = response_summary(self.client, result, http_code)
-        if status == 401 or status == 403 then
+        local business_failure = response_failure_kind(result, http_code)
+        if business_failure == "authentication" then
             outcome.error_kind = "authentication"
             outcome.error_prefix = "read report authentication failed:"
         elseif status == 429 then
             outcome.error_kind = "rate_limited"
             outcome.error_prefix = "read report rate limited:"
-        elseif response_rejected(result, http_code) then
+        elseif business_failure or response_rejected(result, http_code) then
             outcome.error_kind = outcome.write_attempted and "rejected" or "context"
             outcome.error_prefix = "read report server rejected:"
         else
@@ -1336,13 +1375,9 @@ function ReadReport:_run_pipeline(book_id, opts)
             outcome.error_prefix = "read report returned no definitive receipt:"
         end
     end
-    if outcome.error_kind == "authentication" and opts.allow_renewal then
-        -- Renew the login on an explicit denial. The durable row is retried
-        -- by a future delivery, after the parent has received the new cookies.
-        outcome.renew_attempted = true
-        local renewed, result_body = pcall(self.client.renew_cookie, self.client)
-        outcome.auth_renewed = renewed and WeRead.is_success_response(result_body) or false
-    end
+    -- Renew only after a definite denial. The durable row is retried by a
+    -- future delivery after the parent has received the new cookies.
+    renew_if_allowed()
     return outcome
 end
 
@@ -1406,20 +1441,23 @@ end
 -- ------------------------------------------------------------------
 
 function ReadReport:_merge_remote_progress(book_id, book)
-    local ok, result = pcall(function()
-        return self.client:get_progress(book_id)
-    end)
-    if not ok or type(result) ~= "table" then
-        return
+    local remote, remote_error = RemoteProgress.fetch(
+        self.client, self.settings, book_id, book.chapters, {
+            require_web = true,
+        })
+    if not remote then return nil, remote_error end
+    if remote.chapter_uid == nil then
+        return nil, "remote_chapter_unavailable"
     end
-    local remote = type(result.book) == "table" and result.book or result
-    book.progress = tonumber(remote.progress) or tonumber(book.progress) or 0
-    book.chapter_uid = remote.chapterUid or remote.chapterId or remote.chapter_uid or book.chapter_uid
-    book.chapter_idx = tonumber(remote.chapterIdx or remote.chapterIndex or remote.chapter_idx)
-        or tonumber(book.chapter_idx)
-    book.chapter_offset = tonumber(remote.chapterOffset or remote.chapterPos or remote.offset)
-        or tonumber(book.chapter_offset) or 0
-    book.summary = remote.summary or book.summary or ""
+    if not remote.has_chapter_offset then
+        return nil, "remote_offset_unavailable"
+    end
+    book.progress = remote.raw_percent
+    book.chapter_uid = remote.chapter_uid
+    book.chapter_idx = remote.chapter_idx
+    book.chapter_offset = remote.chapter_offset
+    book.summary = remote.summary or ""
+    return remote
 end
 
 -- Build (and refresh when stale) the reader context on the given book
@@ -1463,13 +1501,20 @@ function ReadReport:_build_context(book_id, force, book)
         return book
     end
 
+    local catalog_version = tonumber(
+        book.book_version or book.bookVersion or book.version)
     Content.ensure_reader_state(self.client, book)
+    local reader_version = tonumber(
+        book.book_version or book.bookVersion or book.version)
+    local catalog_version_changed = catalog_version and reader_version
+        and catalog_version ~= reader_version
     if book.pclts == nil or book.pclts == "" or tonumber(book.pclts) == 0 then
         book.pclts = WeRead.e(self.now())
     end
     book.read_session_entered_at = nil
     book.read_session_id = self.session_id
-    if force or type(book.chapters) ~= "table" or #book.chapters == 0 then
+    if catalog_version_changed
+        or type(book.chapters) ~= "table" or #book.chapters == 0 then
         local chapters = Content.fetch_catalog(self.client, book)
         local cache_ok, cache_err = Content.save_catalog_cache(
             self.client, self.settings, book, chapters)
@@ -1480,7 +1525,14 @@ function ReadReport:_build_context(book_id, force, book)
             self.library_db:putChapters(book_id, chapters)
         end
     end
-    self:_merge_remote_progress(book_id, book)
+    local remote
+    local remote_error
+    if force then
+        remote, remote_error = self:_merge_remote_progress(book_id, book)
+        if not remote then
+            error("remote progress unavailable: " .. tostring(remote_error))
+        end
+    end
 
     local selected
     for _i, chapter in ipairs(book.chapters or {}) do
@@ -1489,9 +1541,41 @@ function ReadReport:_build_context(book_id, force, book)
             break
         end
     end
-    selected = selected or Content.first_readable_chapter(book.chapters)
+    if force and not selected then
+        local chapters = Content.fetch_catalog(self.client, book)
+        local cache_ok, cache_err = Content.save_catalog_cache(
+            self.client, self.settings, book, chapters)
+        if not cache_ok then
+            log("warn", "save refreshed chapter catalog failed:",
+                tostring(cache_err))
+        end
+        if self.library_db then
+            self.library_db:putChapters(book_id, chapters)
+        end
+        remote, remote_error = PositionMapper.normalize_remote(
+            remote.raw_node, book_id, remote.source, chapters)
+        if not remote or remote.chapter_uid == nil
+            or not remote.has_chapter_offset then
+            error("remote progress unavailable: "
+                .. tostring(remote_error or "remote_location_invalid"))
+        end
+        book.progress = remote.raw_percent
+        book.chapter_uid = remote.chapter_uid
+        book.chapter_idx = remote.chapter_idx
+        book.chapter_offset = remote.chapter_offset
+        book.summary = remote.summary or ""
+        for _i, chapter in ipairs(chapters) do
+            if tostring(chapter.chapterUid or chapter.chapterId or "")
+                == tostring(book.chapter_uid) then
+                selected = chapter
+                break
+            end
+        end
+    end
+    selected = selected or (not force
+        and Content.first_readable_chapter(book.chapters) or nil)
     if not selected then
-        error("no readable chapter found for report context")
+        error("remote chapter is absent from the current catalog")
     end
     book.chapter_uid = selected.chapterUid or book.chapter_uid
     book.chapter_idx = tonumber(selected.chapterIdx) or tonumber(book.chapter_idx) or 0

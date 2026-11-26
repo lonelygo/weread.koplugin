@@ -4,6 +4,7 @@ local socketutil = require("socketutil")
 local http = require("socket.http")
 local Cookie = require("weread.lib.cookie")
 local WeRead = require("weread.lib.protocol")
+local RemoteProgress = require("weread.lib.remote_progress")
 
 local ok_json, json = pcall(require, "json")
 if not ok_json then
@@ -208,7 +209,7 @@ function Client:decode_http_json(text, context)
     local ok, data = pcall(self.json_decode, self, text)
     if not ok then
         log_response("HTTP JSON decode failed:", context, text)
-        error(data, 0)
+        error("invalid_json_response: " .. tostring(data), 0)
     end
 
     if type(data) == "table" then
@@ -560,7 +561,8 @@ function Client:get_binary(url, opts)
     error(http_error(self, code, text, resp_headers))
 end
 
-function Client:renew_cookie()
+function Client:renew_cookie(options)
+    options = options or {}
     local result, code, resp_headers = self:post_json("https://weread.qq.com/web/login/renewal", {
         rq = "%2Fweb%2Fbook%2Fread",
         ql = false,
@@ -568,6 +570,7 @@ function Client:renew_cookie()
         -- Do not persist renewal cookies until the response explicitly confirms
         -- success; failed renewals must leave the current credential set intact.
         persist_response_cookies = false,
+        timeout = options.timeout,
     })
     if not WeRead.is_success_response(result) then
         error("Cookie renewal response did not include succ=1")
@@ -689,19 +692,37 @@ function Client:probe_sync(book_id)
     local ok, response = pcall(self.get_web_progress, self, book_id, {
         timeout = { 3, 6 }, persist_response_cookies = false,
     })
-    if not ok or type(response) ~= "table" then return false end
-    local data = type(response.data) == "table" and response.data or response
-    local book = type(data.book) == "table" and data.book or data
-    local function rejected(node)
-        local err = node.errCode or node.errcode or node.errorCode
-        return (err ~= nil and tonumber(err) ~= 0)
-            or (node.succ ~= nil and node.succ ~= true and tonumber(node.succ) ~= 1)
+    if not ok then
+        return false, RemoteProgress.request_reason(response)
     end
-    local progress, chapter = tonumber(book.progress), tonumber(book.chapterUid)
-    return not rejected(response) and not rejected(data) and not rejected(book)
-        and (book.bookId == nil or tostring(book.bookId) == tostring(book_id))
-        and ((progress ~= nil and progress >= 0 and progress <= 100)
-            or (chapter ~= nil and chapter > 0))
+    if type(response) ~= "table" then return false, "response_unrecognized" end
+    local kind, code = RemoteProgress.response_error(response)
+    local verified, reason = RemoteProgress.probe(response, book_id)
+    return verified, reason, kind == "authentication" and tonumber(code) or nil
+end
+
+-- Called only after a read-only probe returned the empirically verified
+-- login-timeout code (-2012). Renewal itself must be explicitly confirmed,
+-- and its result never authorizes writes: a second read-only progress probe
+-- has to verify the refreshed cookie first.
+function Client:renew_probe_sync(book_id)
+    local renewed, err = pcall(self.renew_cookie, self, { timeout = { 3, 6 } })
+    if not renewed then
+        local message = tostring(err)
+        local reason = "authentication_required"
+        if message:match("HTTP%s+[%w]+") or message:find("invalid_json_response:", 1, true) then
+            reason = RemoteProgress.request_reason(message)
+        end
+        return false, reason, {
+            renew_attempted = true, auth_renewed = false,
+        }
+    end
+    local verified, reason, auth_code = self:probe_sync(book_id)
+    return verified, reason, {
+        renew_attempted = true,
+        auth_renewed = true,
+        auth_code = auth_code,
+    }
 end
 
 -- Reading statistics detail.

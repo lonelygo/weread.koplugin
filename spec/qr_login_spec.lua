@@ -83,10 +83,17 @@ local function run_login(fingerprint)
             saved = credentials
         end,
     }
-    local protocol_login = QRLogin:new({}, protocol_client, settings)
+    local resumed
+    local protocol_login = QRLogin:new({ offline_sync = {
+        request = function(_sync, reason)
+            expect(saved ~= nil, "login must be saved before checking queued records")
+            resumed = reason
+        end,
+    } }, protocol_client, settings)
     local uid = protocol_login:_begin_protocol()
     local result = protocol_login:_poll_protocol(uid)
     protocol_login:_complete_protocol(result, protocol_login.generation)
+    expect(resumed == "login_completed", "fresh login should recheck pending records")
     local expected_urls = {
         "https://weread.qq.com/r/weread-skills",
         "https://weread.qq.com/api/auth/getLoginUid",

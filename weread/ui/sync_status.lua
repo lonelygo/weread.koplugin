@@ -57,11 +57,24 @@ local result_messages = {
     matched = "Reading progress matches WeRead. Nothing to upload.",
     offline = "Offline. Pending records stay on this device.",
     unreachable = "Could not reach WeRead. Check your connection and login, then try again.",
+    authentication_required = "WeRead declined this login. Open Saved account in the WeRead menu to scan again.",
+    service_unreachable = "The WeRead connection failed or timed out. Your records are saved.",
+    service_busy = "WeRead is temporarily unavailable or limiting requests. Your records are saved.",
+    response_rejected = "WeRead responded but declined the progress request.",
+    response_unrecognized = "WeRead responded without recognizable reading progress.",
+    probe_low_memory = "KOReader had too little memory to run the connection check.",
+    probe_timeout = "The background connection check timed out.",
+    probe_worker_unavailable = "KOReader could not start the background connection check.",
+    probe_worker_failed = "The background connection check did not finish.",
     unconfirmed = "WeRead did not confirm the upload.",
     progress_failed = "Could not sync reading progress with WeRead.",
     unknown = "The upload result is uncertain. Check these records in WeRead before retrying.",
     conflict = "Sync paused. Choose which reading progress to keep to continue.",
-    pending = "Some records could not be uploaded yet.",
+    pending = "Pending records are saved. Open Review records for details by book.",
+    partial = "WeRead confirmed part of the upload. The remaining records are listed below.",
+    locate_annotations = "The remaining annotations need a location. Review records shows the book and reason.",
+    login_renewed = "WeRead renewed the login. Pending records will be tried again.",
+    time_position_pending = "Reading time is saved. The book's current cloud position could not be confirmed.",
     uploaded_with_review = "New records were uploaded. Some earlier records still need review.",
     review = "Some records need review before they can be handled.",
     unavailable = "Sync status unavailable",
@@ -75,6 +88,9 @@ function M:showManualSyncResult(reason, status)
     end
     status = status or SyncStatus.get(self)
     local message = _(result_messages[reason] or result_messages.pending)
+    if (status.newly_confirmed_seconds or 0) > 0 then
+        message = message .. "\n" .. T(_("Reading time confirmed during this sync: %1 s"), status.newly_confirmed_seconds)
+    end
     if status.available and (status.state == "pending" or status.state == "unknown" or status.state == "conflict") then
         if status.pending_seconds > 0 and self.settings:get("read_report", {}).enabled ~= true then
             message = message .. "\n" .. _("Reading time reporting is turned off.")
@@ -96,7 +112,21 @@ function M:showManualSyncResult(reason, status)
     self:showInfo(message)
 end
 
-local function details(status)
+local function lastAttemptText(db)
+    local last = db and db.lastManualSyncResult and db:lastManualSyncResult()
+    if last and last.at and result_messages[last.reason] then
+        return T(_("Last manual sync (%1): %2"), confirmedTime(last.at), _(result_messages[last.reason]))
+    end
+end
+
+local function lastReceiptText(db)
+    local receipts = db:readTimeReceipts()
+    if receipts.last_time then
+        return T(_("Last reading-time receipt: %1"), confirmedTime(receipts.last_time))
+    end
+end
+
+local function details(status, db)
     if not status.available then return summary(status) end
     local lines = {}
     if status.state ~= "pending" then
@@ -123,9 +153,15 @@ local function details(status)
         lines[#lines + 1] = T(_("Rejected reading time: %1 s"), status.rejected_seconds)
         lines[#lines + 1] = _("Rejected records will not block newer uploads.")
     end
+    if db and (status.pending_seconds or 0) > 0 then
+        local receipt = lastReceiptText(db)
+        if receipt then lines[#lines + 1] = receipt end
+    end
     if status.last_confirmed_at and status.state ~= "synced" then
         lines[#lines + 1] = T(_("Last fully confirmed: %1"), confirmedTime(status.last_confirmed_at))
     end
+    local last = lastAttemptText(db)
+    if last then lines[#lines + 1] = last end
     return table.concat(lines, "\n")
 end
 
@@ -212,6 +248,78 @@ function M:showReadTimeReview(records, index)
     UIManager:show(dialog)
 end
 
+local location_reasons = {
+    missing_source = "The chapter source text is missing.",
+    missing_source_version = "The source edition could not be verified.",
+    unmapped_document = "The local file could not be matched to its WeRead edition.",
+    unmapped_chapter = "The original chapter could not be identified.",
+    ambiguous_chapter = "More than one chapter matches.",
+    ambiguous_selection = "The selection could not be matched uniquely.",
+    cross_chapter_selection = "The selection spans multiple chapters.",
+    missing_selection = "The saved selection is incomplete.",
+    position_pending = "A verified text location is not available yet.",
+}
+
+local function hasRecords(status)
+    return status.state == "pending" or status.state == "conflict"
+        or status.state == "unknown" or status.state == "review"
+end
+
+function M:showPendingSyncReview()
+    local status = SyncStatus.get(self)
+    if not hasRecords(status) then
+        self:showInfo(summary(status))
+        return
+    end
+    local held = status.review_time_count or 0
+    if held > 0 and (status.pending_seconds or 0) == 0 and (status.pending_annotations or 0) == 0
+        and (status.pending_progress or 0) == 0 and (status.unknown_annotations or 0) == 0 then
+        self:showReadTimeReview(status.review_records, 1)
+        return
+    end
+    local lines = {}
+    for _i, book in ipairs(SyncStatus.reviewBooks(self, status)) do
+        if #lines > 0 then lines[#lines + 1] = "" end
+        lines[#lines + 1] = T(_("Book: %1"), book.title)
+        if (book.seconds or 0) > 0 then
+            lines[#lines + 1] = T(_("Reading time: %1 s in %2 queued segments"), book.seconds, book.segments)
+        end
+        if book.progress then lines[#lines + 1] = _("Reading progress is pending for this book.") end
+        if (book.annotations or 0) > 0 then
+            lines[#lines + 1] = T(_("Highlights and notes pending: %1"), book.annotations)
+        end
+        for _j, issue in ipairs(book.issues) do
+            lines[#lines + 1] = T(_("%1 annotations without a location: %2"),
+                issue.count, _(location_reasons[issue.reason] or location_reasons.position_pending))
+            local file = issue.document_path and issue.document_path:match("([^/]+)$")
+            if file then lines[#lines + 1] = T(_("Original file: %1"), file) end
+        end
+    end
+    if (status.unknown_annotations or 0) > 0 then
+        lines[#lines + 1] = T(_("WeRead has not confirmed %1 annotations. Check them in WeRead."), status.unknown_annotations)
+    end
+    if (status.pending_seconds or 0) > 0 then
+        lines[#lines + 1] = lastReceiptText(self.library_db)
+            or _("No reading-time receipt has been recorded for this account yet.")
+    end
+    if held > 0 then lines[#lines + 1] = T(_("Records waiting for review: %1"), held) end
+    if #lines == 0 then lines[1] = summary(status) end
+    local UIManager = require("ui/uimanager")
+    local dialog
+    local actions = {{ id = "close", text = _("Close"), callback = function() UIManager:close(dialog) end }}
+    if held > 0 then
+        actions[#actions + 1] = { id = "review_time", text = _("Review reading time"), callback = function()
+            UIManager:close(dialog)
+            self:showReadTimeReview()
+        end }
+    end
+    dialog = require("ui/widget/buttondialog"):new{
+        title = _("Pending sync records"), use_info_style = false, width_factor = 0.86, buttons = { actions },
+    }
+    addStatusText(dialog, table.concat(lines, "\n"))
+    UIManager:show(dialog)
+end
+
 addStatusText = function(dialog, text)
     local width = dialog:getAddedWidgetAvailableWidth()
     local face = require("ui/font"):getFace("cfont", 20)
@@ -248,12 +356,12 @@ function M:showOfflineSyncStatus()
             end),
         },
     }}
-    if (status.review_time_count or 0) > 0 then
+    if hasRecords(status) then
         table.insert(buttons, 1, {{
             id = "review", text = _("Review records"),
             callback = function()
                 UIManager:close(dialog)
-                self:showReadTimeReview(status.review_records, 1)
+                self:showPendingSyncReview()
             end,
         }})
     end
@@ -263,7 +371,7 @@ function M:showOfflineSyncStatus()
         width_factor = 0.82,
         buttons = buttons,
     }
-    addStatusText(dialog, details(status))
+    addStatusText(dialog, details(status, self.library_db))
     UIManager:show(dialog)
 end
 

@@ -109,6 +109,7 @@ end
 local Event = require("ui/event")
 local FileManager = require("apps/filemanager/filemanager")
 local Protocol = require("weread.lib.protocol")
+local I18n = require("weread.lib.i18n")
 local choice = os.getenv("WEREAD_SYNC_CHOICE") or "local"
 local surface = os.getenv("WEREAD_SYNC_SURFACE") or "reader"
 assert(choice == "local" or choice == "remote" or choice == "default" or choice == "auto", "valid choice")
@@ -157,18 +158,22 @@ end
 local function select_conflict()
     for _, entry in ipairs(UIManager._window_stack) do
         local widget = entry.widget
-        local wanted = choice == "remote" and "Use WeRead progress" or "Keep KOReader progress"
-        if choice == "auto" and (widget.ok_text == wanted or widget.cancel_text == wanted) then
+        local wanted = choice == "remote"
+            and "Use WeRead progress" or "Keep KOReader progress"
+        local translated = I18n.tr(wanted)
+        local ok_matches = widget.ok_text == wanted or widget.ok_text == translated
+        local cancel_matches = widget.cancel_text == wanted or widget.cancel_text == translated
+        if choice == "auto" and (ok_matches or cancel_matches) then
             error("disabled conflict prompts must keep the local position automatically")
         end
-        if choice == "default" and widget.cancel_text == wanted then
+        if choice == "default" and cancel_matches then
             error("local choice must be the default primary button")
         end
-        if widget.ok_text == wanted then
+        if ok_matches then
             UIManager:close(widget)
             widget.ok_callback()
             return true
-        elseif widget.cancel_text == wanted then
+        elseif cancel_matches then
             UIManager:close(widget)
             widget.cancel_callback()
             return true
@@ -236,6 +241,8 @@ if os.getenv("WEREAD_COMPARE_FAILURE") == "1" then
     local baseline = api("/__state")
     local start = #baseline.requests
     local baseline_mutations = mutations(baseline)
+    local baseline_reads = #baseline.read_reports
+    local baseline_annotations = #baseline.annotation_writes
     api("/__control", { progress_successes_before_failure = 1 })
     heartbeat()
     local probe_ok, gateway_failed, web_failed = false, false, false
@@ -247,19 +254,30 @@ if os.getenv("WEREAD_COMPARE_FAILURE") == "1" then
             if probe_ok and request.api == "/book/getprogress" and request.status == 503 then gateway_failed = true end
             if probe_ok and request.path == "/web/book/getProgress" and request.status == 503 then web_failed = true end
         end
-        assert(mutations(state) == baseline_mutations, "failed progress comparison must not issue any write")
+        assert(#state.read_reports == baseline_reads,
+            "failed progress comparison must not write progress or time")
+        assert(#state.annotation_writes <= baseline_annotations + 1,
+            "failed comparison duplicated an independent annotation")
         return probe_ok and gateway_failed and web_failed
             and current_plugin().offline_sync.stage == nil
     end)
     spin(0.5)
     local failed_state = api("/__state")
-    assert(mutations(failed_state) == baseline_mutations, "no delayed drain after failed comparison")
+    assert(#failed_state.read_reports == baseline_reads,
+        "no delayed progress or time write after failed comparison")
+    assert(#failed_state.annotation_writes == baseline_annotations + 1
+        and failed_state.annotation_writes[#failed_state.annotation_writes].id,
+        "one independently located annotation should receive an ACK")
     local proof = assert(io.open(root .. "/evidence/compare-failure.json", "wb"))
     local events = {}
     for i = start + 1, #failed_state.requests do events[#events + 1] = failed_state.requests[i] end
     proof:write(json.encode({ events = events, probe_success = probe_ok,
         gateway_failed = gateway_failed, web_failed = web_failed,
-        writes_before = baseline_mutations, writes_after = mutations(failed_state) }))
+        writes_before = baseline_mutations, writes_after = mutations(failed_state),
+        read_writes_before = baseline_reads,
+        read_writes_after = #failed_state.read_reports,
+        annotation_writes_before = baseline_annotations,
+        annotation_writes_after = #failed_state.annotation_writes }))
     proof:close()
     comparison_failure_checked = true
     api("/__control", { progress_successes_before_failure = -1 })
@@ -284,8 +302,12 @@ end)
 local first = api("/__state")
 assert(first.annotation_writes[1].payload.isPrivate == 1, "private note uploaded")
 local function completion()
+    local expected = "Sync complete. WeRead confirmed the upload."
+    local translated = I18n.tr(expected)
     for _, entry in ipairs(UIManager._window_stack) do
-        if entry.widget.text == "Sync complete. WeRead confirmed the upload." then return entry.widget end
+        if entry.widget.text == expected or entry.widget.text == translated then
+            return entry.widget
+        end
     end
 end
 if manual then

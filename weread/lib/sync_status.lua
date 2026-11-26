@@ -213,6 +213,47 @@ function SyncStatus.get(plugin)
     return copy(build(plugin, entry))
 end
 
+function SyncStatus.reviewBooks(plugin, status)
+    local db = plugin.library_db
+    if not status.available or db:accountKey() ~= status.account_key then return {} end
+    local _, entry = account_entry(plugin.settings)
+    read_cached_progress(plugin.settings, entry.account_id, entry)
+    local books = entry.books or {}
+    local items, by_id = {}, {}
+    local function add(id)
+        id = tostring(id)
+        if not by_id[id] then
+            local book = books[id]
+            local title = type(book) == "table" and book.title
+            local item = { book_id = id, title = type(title) == "string" and title ~= "" and title or id, issues = {} }
+            by_id[id] = item
+            items[#items + 1] = item
+        end
+        return by_id[id]
+    end
+    for _, group in ipairs(db:listPendingSyncBooks()) do
+        local item = add(group.book_id)
+        item.seconds, item.segments, item.annotations = group.seconds, group.segments, group.annotations
+    end
+    for id, book in pairs(books) do
+        if type(book) == "table" and type(book.pending_upload_position) == "table"
+            and tostring(book.pending_upload_account or "") == entry.account_id then
+            add(id).progress = true
+        end
+    end
+    if (status.unlocated_annotations or 0) > 0 then
+        for _, issue in ipairs(db:listUnlocatedAnnotations()) do
+            local item = add(issue.book_id)
+            item.issues[#item.issues + 1] = issue
+        end
+    end
+    table.sort(items, function(a, b)
+        if a.title == b.title then return a.book_id < b.book_id end
+        return a.title < b.title
+    end)
+    return items
+end
+
 function SyncStatus.invalidate(settings)
     if settings then cache[cache_key(settings)] = nil end
     request_refresh()

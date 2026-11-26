@@ -1,7 +1,233 @@
 -- Chapter identity and bounds, independent of the book download form.
 local Chapters = {}
+local MAX_ARCHIVE_ENTRIES = 10000
+local MAX_PACKAGE_BYTES = 2 * 1024 * 1024
+local MAX_CHAPTER_BYTES = 8 * 1024 * 1024
+local MAX_ARCHIVE_CHAPTERS = 4096
+
 function Chapters.uid(chapter)
     return tostring(chapter.chapterUid or chapter.chapterId or chapter.chapter_uid or "")
+end
+
+local function archive_identity(path)
+    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok then ok, lfs = pcall(require, "lfs") end
+    if not ok or type(lfs.attributes) ~= "function" then return nil end
+    local attributes = lfs.attributes(path)
+    if type(attributes) ~= "table" then return nil end
+    local size = tonumber(attributes.size)
+    local modified = tonumber(attributes.modification)
+    if not size or not modified then return nil end
+    return { size = size, modification = modified }
+end
+
+local function same_archive(identity, path)
+    if type(identity) ~= "table" then return true end
+    local current = archive_identity(path)
+    return current and current.size == tonumber(identity.size)
+        and current.modification == tonumber(identity.modification) or false
+end
+
+local function xml_text(value)
+    value = tostring(value or "")
+    value = value:gsub("&#x([%da-fA-F]+);", function(hex)
+        local number = tonumber(hex, 16)
+        return number and number < 128 and string.char(number) or ""
+    end)
+    value = value:gsub("&#(%d+);", function(decimal)
+        local number = tonumber(decimal)
+        return number and number < 128 and string.char(number) or ""
+    end)
+    return value:gsub("&quot;", '"'):gsub("&apos;", "'")
+        :gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&")
+end
+
+local function xml_attributes(tag)
+    local result = {}
+    for key, value in tostring(tag or ""):gmatch(
+        '([%w_:%.%-]+)%s*=%s*"([^"]*)"') do
+        result[key] = xml_text(value)
+    end
+    for key, value in tostring(tag or ""):gmatch(
+        "([%w_:%.%-]+)%s*=%s*'([^']*)'") do
+        if result[key] == nil then result[key] = xml_text(value) end
+    end
+    return result
+end
+
+local function archive_path(base, href)
+    href = xml_text(href):match("^[^#?]*") or ""
+    if href == "" or href:find("\\", 1, true) or href:sub(1, 1) == "/" then
+        return nil
+    end
+    local parts = {}
+    for part in (tostring(base or "") .. "/" .. href):gmatch("[^/]+") do
+        if part == ".." then
+            if #parts == 0 then return nil end
+            parts[#parts] = nil
+        elseif part ~= "." and part ~= "" then
+            parts[#parts + 1] = part
+        end
+    end
+    return table.concat(parts, "/")
+end
+
+local function extract_bounded(archive, entries, path, limit)
+    local entry = entries[path]
+    if not entry or (entry.size and entry.size > limit) then return nil end
+    local value = archive:extractToMemory(path)
+    if type(value) ~= "string" or #value > limit then return nil end
+    return value
+end
+
+-- Legacy full-book EPUBs predate annotation_documents. Their filenames and
+-- manifest IDs are package-local ordinals, not WeRead chapter UIDs. Accept the
+-- archive only when every catalog chapter is bound exactly once by the UID
+-- marker written into the generated XHTML itself.
+local function recover_archive_descriptor(book, path)
+    if path ~= book.cached_full_book and path ~= book.cached_file then return nil end
+    local identity = archive_identity(path)
+    if not identity then return nil end
+    local ok_archiver, Archiver = pcall(require, "ffi/archiver")
+    if not ok_archiver or not Archiver.Reader then return nil end
+    local archive = Archiver.Reader:new()
+    if not archive:open(path) then return nil end
+    local descriptor
+    local ok = xpcall(function()
+        local entries, count = {}, 0
+        for entry in archive:iterate() do
+            count = count + 1
+            if count > MAX_ARCHIVE_ENTRIES then error("too many archive entries", 0) end
+            local name = tostring(entry.path or "")
+            if name == "" or entries[name] or name:sub(1, 1) == "/"
+                or name:find("\\", 1, true) then
+                error("unsafe archive entry", 0)
+            end
+            entries[name] = { size = tonumber(entry.size) }
+        end
+        local container = extract_bounded(archive, entries,
+            "META-INF/container.xml", MAX_PACKAGE_BYTES)
+        if not container then error("missing EPUB container", 0) end
+        local rootfile
+        for tag in container:gmatch("<[^>]+>") do
+            local name = tag:match("^<%s*([%w_:%.%-]+)")
+            if name and name:match("([^:]+)$") == "rootfile" then
+                rootfile = xml_attributes(tag)["full-path"]
+                break
+            end
+        end
+        rootfile = archive_path("", rootfile)
+        local opf = rootfile and extract_bounded(
+            archive, entries, rootfile, MAX_PACKAGE_BYTES) or nil
+        if not opf then error("missing EPUB package", 0) end
+        local identifier = opf:match(
+            "<[%w_:%.%-]*identifier[^>]*>(.-)</[%w_:%.%-]*identifier%s*>")
+        identifier = xml_text(identifier):gsub("^%s+", ""):gsub("%s+$", "")
+        local book_id = tostring(book.book_id or book.bookId or "")
+        if book_id == "" or identifier:sub(1, #book_id + 8)
+            ~= "weread-" .. book_id .. "-" then
+            error("EPUB book identity mismatch", 0)
+        end
+
+        local manifest, spine, navigation_item = {}, {}, nil
+        for tag in opf:gmatch("<[^>]+>") do
+            local name = tag:match("^<%s*([%w_:%.%-]+)")
+            name = name and name:match("([^:]+)$")
+            local attributes = name and xml_attributes(tag) or nil
+            if name == "item" then
+                local id = attributes.id
+                if not id or manifest[id] then error("ambiguous manifest", 0) end
+                manifest[id] = attributes
+                if attributes["media-type"] == "application/x-dtbncx+xml" then
+                    if navigation_item then error("ambiguous navigation", 0) end
+                    navigation_item = attributes
+                end
+            elseif name == "itemref" then
+                if not attributes.idref then error("missing spine reference", 0) end
+                spine[#spine + 1] = attributes.idref
+            end
+        end
+        if #spine == 0 or #spine > MAX_ARCHIVE_CHAPTERS + 1 then
+            error("invalid spine size", 0)
+        end
+        local catalog, by_uid = {}, {}
+        for _, chapter in ipairs(book.chapters or {}) do
+            local uid = Chapters.uid(chapter)
+            if uid == "" or by_uid[uid] then error("ambiguous catalog", 0) end
+            catalog[#catalog + 1], by_uid[uid] = chapter, chapter
+        end
+        if #catalog == 0 or #catalog > MAX_ARCHIVE_CHAPTERS then
+            error("invalid catalog size", 0)
+        end
+
+        local base = rootfile:match("^(.*)/[^/]+$") or ""
+        local selected, selected_paths, seen, cover_seen = {}, {}, {}, false
+        for index, idref in ipairs(spine) do
+            local item = manifest[idref]
+            if not item or item["media-type"] ~= "application/xhtml+xml" then
+                error("unresolved spine item", 0)
+            end
+            local chapter_path = archive_path(base, item.href)
+            local xhtml = chapter_path and extract_bounded(
+                archive, entries, chapter_path, MAX_CHAPTER_BYTES) or nil
+            if not xhtml then error("missing spine document", 0) end
+            local uid = xhtml:match(
+                "<!%-%-%s*weread%-chapter%-uid:%s*([^%s<>]+)%s*%-%->")
+            if uid then
+                uid = xml_text(uid)
+                if not by_uid[uid] or seen[uid] then
+                    error("unknown or duplicate chapter marker", 0)
+                end
+                selected[#selected + 1], seen[uid] = by_uid[uid], true
+                selected_paths[#selected_paths + 1] = chapter_path
+            else
+                local properties = tostring(item.properties or ""):lower()
+                local is_cover = tostring(idref):lower() == "cover"
+                    or properties:find("cover", 1, true) ~= nil
+                if index ~= 1 or cover_seen or not is_cover then
+                    error("unmarked spine document", 0)
+                end
+                cover_seen = true
+            end
+            if index % 16 == 0 then collectgarbage("step", 256) end
+        end
+        if #selected ~= #catalog then error("incomplete chapter marker set", 0) end
+        for uid in pairs(by_uid) do
+            if not seen[uid] then error("catalog chapter absent from spine", 0) end
+        end
+        if not navigation_item then error("missing NCX navigation", 0) end
+        local navigation_path = archive_path(base, navigation_item.href)
+        local navigation = navigation_path and extract_bounded(
+            archive, entries, navigation_path, MAX_PACKAGE_BYTES) or nil
+        if not navigation then error("missing NCX document", 0) end
+        local navigation_base = navigation_path:match("^(.*)/[^/]+$") or ""
+        local navigation_paths = {}
+        for tag in navigation:gmatch("<[^>]+>") do
+            local name = tag:match("^<%s*([%w_:%.%-]+)")
+            if name and name:match("([^:]+)$") == "content" then
+                local source = xml_attributes(tag).src
+                local resolved = source and archive_path(navigation_base, source)
+                if not resolved then error("invalid NCX target", 0) end
+                navigation_paths[#navigation_paths + 1] = resolved
+            end
+        end
+        if #navigation_paths ~= #selected_paths then
+            error("navigation and spine size mismatch", 0)
+        end
+        for index, selected_path in ipairs(selected_paths) do
+            if navigation_paths[index] ~= selected_path then
+                error("navigation and spine order mismatch", 0)
+            end
+        end
+        descriptor = {
+            chapters = selected,
+            recovered = true,
+            source = "archive_uid_markers",
+            archive_identity = identity,
+        }
+    end, debug.traceback)
+    pcall(function() archive:close() end)
+    return ok and descriptor or nil
 end
 local UPDATE_SUFFIX_KEYWORDS = { "更", "求", "订", "阅", "票", "藏", "赏" }
 local CHAPTER_ENDINGS = { "章", "节", "回", "卷", "部", "集", "篇" }
@@ -301,15 +527,75 @@ end
 function Chapters.descriptor(book, path)
     if not book then return nil end
     local explicit = book.annotation_documents and book.annotation_documents[path]
-    if explicit then return explicit end
+    if explicit then
+        return same_archive(explicit.archive_identity, path) and explicit or nil
+    end
+    if path == book.cached_full_book then return nil end
     local selected = {}
     for _, chapter in ipairs(book.chapters or {}) do
         if book.cached_chapters and book.cached_chapters[Chapters.uid(chapter)] == path then
             selected[#selected + 1] = chapter
         end
     end
-    if #selected > 0 then return { chapters = selected, legacy = true } end
+    -- A single-chapter cache has an unambiguous spine. Older multi-chapter
+    -- cache aliases did not persist their spine order, so catalog/UID order
+    -- must not be used to manufacture one.
+    if #selected == 1 then return { chapters = selected, legacy = true } end
     -- Legacy combined EPUBs have no trustworthy full/partial distinction.
     -- The caller maps their actual TOC and only includes chapters with bounds.
+end
+
+-- v1.8.5 incremental EPUBs may predate the persisted annotation_documents
+-- entry. Reconstruct it only from exact chapter identities already recorded
+-- for this file. Titles and TOC positions are deliberately not used here.
+function Chapters.recoverDescriptor(book, path)
+    if type(book) ~= "table" or type(path) ~= "string" or path == "" then
+        return nil, false
+    end
+    local explicit = book.annotation_documents and book.annotation_documents[path]
+    if explicit and same_archive(explicit.archive_identity, path) then
+        return explicit, false
+    end
+
+    local requested = {}
+    if path == book.incremental_reader_file then
+        for _, uid in ipairs(book.incremental_chapter_uids or {}) do
+            requested[#requested + 1] = tostring(uid)
+        end
+    else
+        local archive_descriptor = recover_archive_descriptor(book, path)
+        if archive_descriptor then
+            book.annotation_documents = book.annotation_documents or {}
+            book.annotation_documents[path] = archive_descriptor
+            return archive_descriptor, true
+        end
+        if path == book.cached_full_book then return nil, false end
+        local descriptor = Chapters.descriptor(book, path)
+        if descriptor then return descriptor, false end
+        for uid, source in pairs(book.cached_chapters or {}) do
+            if source == path then requested[#requested + 1] = tostring(uid) end
+        end
+        if #requested ~= 1 then return nil, false end
+    end
+    if #requested == 0 then return nil, false end
+
+    local catalog = {}
+    for _, chapter in ipairs(book.chapters or {}) do
+        catalog[Chapters.uid(chapter)] = chapter
+    end
+    local selected = {}
+    for _, uid in ipairs(requested) do
+        local chapter = catalog[uid]
+        if not chapter then return nil, false end
+        selected[#selected + 1] = {
+            chapterUid = chapter.chapterUid or chapter.chapterId,
+            title = chapter.title,
+            chapterIdx = chapter.chapterIdx,
+        }
+    end
+    local descriptor = { chapters = selected, recovered = true }
+    book.annotation_documents = book.annotation_documents or {}
+    book.annotation_documents[path] = descriptor
+    return descriptor, true
 end
 return Chapters

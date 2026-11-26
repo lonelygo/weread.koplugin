@@ -15,6 +15,27 @@ function WeRead.is_success_response(result, field)
     return value == true or tonumber(value) == 1
 end
 
+-- Web endpoints sometimes report an expired login in a successful HTTP
+-- response. Keep the small, empirically verified code set in one place so
+-- read-only probes and write-result handling do not label it as a network
+-- failure.
+function WeRead.classify_response_error(result)
+    if type(result) ~= "table" then return nil end
+    local code = result.errCode or result.errcode
+        or result.errorCode or result.code
+    local numeric = tonumber(code)
+    if numeric == -2012 or numeric == -2010 then
+        return "authentication", numeric
+    end
+    if code ~= nil and numeric ~= 0 then
+        return "rejected", numeric or code
+    end
+    if result.succ ~= nil
+        and result.succ ~= true and tonumber(result.succ) ~= 1 then
+        return "rejected"
+    end
+end
+
 local function is_digit_string(value)
     return tostring(value):match("^%d+$") ~= nil
 end

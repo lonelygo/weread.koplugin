@@ -112,7 +112,7 @@ class MockServer(ThreadingHTTPServer):
         self.next_annotation_id = 1
         self.control = dict(delay=0, match="", status=503, times=0,
                             empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1,
-                            read_replies=[])
+                            progress_reply="ok", renew_reply="ok", read_replies=[])
 
     def record(self, event):
         with self.lock:
@@ -147,6 +147,19 @@ class MockServer(ThreadingHTTPServer):
             return control["status"], dict(errcode=-1, errmsg="Injected mock failure")
 
         book_id = str(data.get("bookId") or query.get("bookId", [BOOK_ID])[0])
+        if progress_read and control["progress_reply"] in {"authentication", "expired"}:
+            code = -2010 if control["progress_reply"] == "authentication" else -2012
+            return 200, dict(errCode=code, errMsg="login expired")
+        if path == "/web/login/renewal" and method == "POST":
+            if control["renew_reply"] == "reject":
+                return 200, dict(succ=0, errCode=-2012, errMsg="login expired")
+            with self.lock:
+                if self.control["progress_reply"] == "expired":
+                    self.control["progress_reply"] = "ok"
+            return 200, dict(succ=1), {
+                "Set-Cookie": "wr_skey=XXX-mock-renewed; Path=/",
+                "x-wr-ticket": "mock-renewed-ticket",
+            }
         if path == "/api/agent/gateway" and method == "POST":
             if api in {"/book/info", "/book/getprogress", "/review/list", "/book/underlines", "/book/readreviews"}:
                 if "bookId" not in data or not any(b["bookId"] == book_id for b in BOOKS):
@@ -289,6 +302,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_request(self):
         target = self.path
         data = {}
+        response_headers = {}
         try:
             size = int(self.headers.get("Content-Length", 0))
             if not 0 <= size <= 1024 * 1024:
@@ -313,7 +327,10 @@ class Handler(BaseHTTPRequestHandler):
                     target = parse_qs(path.query)["url"][0]
                 else:
                     target = "https://weread.qq.com" + self.path
-                status, result = self.server.route(self.command, target, data)
+                routed = self.server.route(self.command, target, data)
+                status, result = routed[:2]
+                if len(routed) > 2:
+                    response_headers = routed[2]
         except (ValueError, KeyError, TypeError, StopIteration) as exc:
             status, result = 400, dict(errcode=-1, errmsg="Invalid mock request: " + str(exc))
         except LookupError as exc:
@@ -337,6 +354,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in response_headers.items():
+            self.send_header(name, value)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -354,6 +373,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("times must be -1 (always) or a non-negative integer")
             if type(candidate["progress_successes_before_failure"]) is not int or candidate["progress_successes_before_failure"] < -1:
                 raise ValueError("progress_successes_before_failure must be -1 or a non-negative integer")
+            if candidate["progress_reply"] not in {"ok", "authentication", "expired"}:
+                raise ValueError("progress_reply must be ok, authentication or expired")
+            if candidate["renew_reply"] not in {"ok", "reject"}:
+                raise ValueError("renew_reply must be ok or reject")
             if type(candidate["status"]) is not int or not 400 <= candidate["status"] <= 599:
                 raise ValueError("status must be 400..599")
             if not isinstance(candidate["match"], str):
@@ -418,7 +441,7 @@ def main():
     parser.add_argument("--koreader", type=Path, help="built KOReader runtime directory (not source root)")
     parser.add_argument("--log", type=Path, help="JSONL request log, without headers or private data")
     parser.add_argument("--smoke", action="store_true", help="run real KOReader offscreen smoke, save evidence, then exit")
-    parser.add_argument("--scenario", choices=("basic", "covers", "delivery", "preparation", "continuous", "offline", "reading", "unified", "chunks"), default="basic",
+    parser.add_argument("--scenario", choices=("basic", "covers", "delivery", "menu", "pending", "preparation", "continuous", "offline", "reading", "unified", "chunks"), default="basic",
                         help="offscreen integration scenario (requires --smoke)")
     args = parser.parse_args()
     if bool(args.run_dir) != bool(args.koreader):
@@ -444,7 +467,7 @@ def main():
         log = args.run_dir / "evidence/smoke.log"
         try:
             with log.open("w") as out:
-                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "covers": "weread_covers_mock.lua", "delivery": "weread_delivery_mock.lua", "preparation": "weread_preparation_mock.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
+                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "covers": "weread_covers_mock.lua", "delivery": "weread_delivery_mock.lua", "menu": "weread_menu_consistency.lua", "pending": "weread_pending_diagnostics.lua", "preparation": "weread_preparation_mock.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
                                         cwd=args.koreader, env=env, stdout=out, stderr=subprocess.STDOUT, timeout=180)
             if result.returncode == 0 and args.scenario == "basic":
                 full_books = list((args.run_dir / "profile/weread-mock/cache").rglob("* - full.epub"))

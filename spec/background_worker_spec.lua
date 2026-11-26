@@ -148,6 +148,37 @@ expect(not low_ok and low_err == "low_memory" and next_pid == launches_before,
 expect(low_result and low_result.available_kb == 32 * 1024,
     "low-memory result omitted available memory")
 
+local small_result
+local small = new_worker(40 * 1024)
+local small_ok = small:start {
+    min_available_kb = 32 * 1024,
+    task = function() return "small annotation" end,
+    on_done = function(value) small_result = value end,
+}
+local small_pid = next_pid
+expect(small_ok and small:busy(),
+    "a 40 MB device could not start an explicitly bounded small task")
+callbacks[small_pid](); done[small_pid] = true; poll()
+expect(small_result and small_result.ok
+        and small_result.value == "small annotation",
+    "the bounded small task did not complete")
+
+local very_low_result
+local very_low = new_worker(31 * 1024)
+local very_low_ok, very_low_error = very_low:start {
+    min_available_kb = 32 * 1024,
+    task = function() return true end,
+    on_done = function(value) very_low_result = value end,
+}
+expect(not very_low_ok and very_low_error == "low_memory"
+        and very_low_result and very_low_result.available_kb == 31 * 1024,
+    "a bounded small task ignored its conservative memory floor")
+local default_40_ok, default_40_error = new_worker(40 * 1024):start {
+    task = function() return true end,
+}
+expect(not default_40_ok and default_40_error == "low_memory",
+    "a request override changed the default 64 MB download gate")
+
 local annotation_result, chapter_result
 local annotation_ok = worker:start {
     kind = "annotation",

@@ -8,7 +8,17 @@ package.preload["weread.lib.sync_status"] = function()
     return { noteAck = function() end }
 end
 package.preload["weread.lib.protocol"] = function()
-    return { is_success_response = function(value) return value and value.succ == 1 end }
+    return {
+        is_success_response = function(value) return value and value.succ == 1 end,
+        classify_response_error = function(value)
+            local code = type(value) == "table"
+                and tonumber(value.errCode or value.errcode) or nil
+            if code == -2010 or code == -2012 then return "authentication" end
+            if code and code ~= 0 then return "rejected" end
+            if type(value) == "table" and value.succ ~= nil
+                and tonumber(value.succ) ~= 1 then return "rejected" end
+        end,
+    }
 end
 
 local ReadReport = require("weread.lib.read_report")
@@ -304,6 +314,25 @@ assert(send_calls == 1 and renewals == 1 and released[#released] == 20,
     "the refused row must stay pending until a separate delivery with the new login")
 assert(not report:_renewal_allowed(), "the renewal cooldown was lost")
 
+replies = { { { errCode = -2012, errMsg = "login expired" }, 200 } }
+send_calls = 0
+wall_clock = wall_clock + 601
+local business_expired = report:_run_pipeline("book", { allow_renewal = true })
+assert(business_expired.error_kind == "authentication"
+    and business_expired.renew_attempted and business_expired.auth_renewed,
+    "HTTP 200 login expiry did not renew for a future delivery")
+assert(send_calls == 1 and renewals == 2,
+    "HTTP 200 login expiry repeated the elapsed POST")
+
+report._send = function(_self, _book_id, _book, _position, _elapsed, on_write)
+    on_write()
+    error("HTTP 503, content_type=application/json")
+end
+local unavailable = report:_run_pipeline("book", { allow_renewal = true })
+assert(unavailable.error_kind == "transport" and unavailable.write_attempted
+    and not unavailable.renew_attempted,
+    "a 5xx elapsed write was not kept as an uncertain single attempt")
+
 report._send = function(_self, _book_id, _book, _position, _elapsed, on_write)
     on_write()
     error("HTTP 401, error_code=-202, error_message=login expired")
@@ -311,6 +340,6 @@ end
 local expired = report:_run_pipeline("book", { allow_renewal = false })
 assert(expired.error_kind == "authentication" and expired.write_attempted,
     "definitive authentication refusal was quarantined as an unknown write")
-assert(renewals == 1 and not expired.renew_attempted)
+assert(renewals == 2 and not expired.renew_attempted)
 
 print("read_report_online_spec: fresh exact delivery, replay isolation and receipts passed")

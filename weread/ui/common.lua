@@ -124,7 +124,11 @@ function M:showOffline(label)
 end
 
 function M:runOnlineTask(label, callback, delay, options)
-    if not self:isNetworkOnline() then
+    -- Progress reads and writes check WeRead itself. KOReader's independent
+    -- Internet test resolves a Microsoft hostname which may be unavailable
+    -- even while the Kindle has a route to WeRead.
+    local check = options and options.check_link_only and self.isNetworkConnected or self.isNetworkOnline
+    if not check(self) then
         if not (options and options.silent_offline) then
             self:showOffline(label)
         end
@@ -226,14 +230,26 @@ function M:showAccountStatus()
     local login_method = account.login_method == "qr" and _("QR login") or _("Unknown")
     local cookie_status = self.settings:is_cookie_configured() and _("configured") or _("missing")
     local api_status = self.settings:is_api_configured() and _("configured") or _("missing")
-    self:showInfo(T(
+    local message = T(
         _("Account: %1\nLogin method: %2\nCookie: %3\nOfficial API key: %4\nCache directory:\n%5"),
         account_name,
         login_method,
         cookie_status,
         api_status,
         BD.dirpath(self.settings.cache_dir)
-    ))
+    )
+    if self.settings.mock_endpoint or account.login_method ~= "qr" then
+        self:showInfo(message)
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text = message,
+        cancel_text = _("Close"),
+        ok_text = _("Scan again to sign in"),
+        ok_callback = self:safeCallback(_("QR login"), function()
+            self.qr_login:start()
+        end),
+    })
 end
 
 function M:confirmClearAccount()

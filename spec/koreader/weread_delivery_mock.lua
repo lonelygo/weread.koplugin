@@ -14,6 +14,7 @@ local Screen = require("device").screen
 local ReaderUI = require("apps/reader/readerui")
 local FileManager = require("apps/filemanager/filemanager")
 local Registry = require("document/documentregistry")
+local Event = require("ui/event")
 local socket = require("socket")
 local json = require("json")
 local root = assert(home:match("^(.*)/profile$"))
@@ -89,7 +90,8 @@ wait_for("first chapter open", function()
 end)
 
 local NetworkMgr = require("ui/network/manager")
-NetworkMgr.isConnected = function() return true end
+local connected = true
+NetworkMgr.isConnected = function() return connected end
 local http = require("socket.http")
 local ltn12 = require("ltn12")
 local endpoint = reader().weread.settings.mock_endpoint
@@ -119,19 +121,80 @@ local function annotate(phrase, note, stamp)
     reader().highlight:saveHighlight(false)
     reader().highlight.selected_text = nil
 end
+local function unlocated_count()
+    local total = 0
+    for _, issue in ipairs(plugin.library_db:listUnlocatedAnnotations()) do
+        total = total + issue.count
+    end
+    return total
+end
 
--- Genuine online edits use the normal ReaderUI annotation hook and writer.
+-- Simulate a v1.8.5 incremental book whose chapter identity and source index
+-- were not retained. Opening this exact book may rebuild those records, but it
+-- must never guess coordinates or upload before the source is fetched again.
+local stable = reader().document.file
+local store = plugin:_annotationStore()
+store:put("900001", "original", "1", nil, "1")
+store:put("900001", "original_version", "1", nil, "1")
+local old_books = plugin.settings:get("books", {})
+old_books["900001"].annotation_documents[stable] = nil
+plugin.settings:set("books", old_books)
+plugin.settings:flush()
+assert(not store:get("900001", "original", "1")
+    and not plugin.settings:get("books", {})["900001"].annotation_documents[stable],
+    "legacy annotation fixture retained its source metadata")
+connected = false
 annotate("这是第1章的第1段", "在线私密笔记一", "2026-11-25 09:00:01")
-wait_for("first live annotation receipt", function()
-    return #api("/__state").annotation_writes == 1
-end)
 annotate("这是第1章的第2段", "在线私密笔记二", "2026-11-25 09:00:02")
+local old_issues = plugin.library_db:listUnlocatedAnnotations()
+local unlocated_before_reopen = unlocated_count()
+assert(#api("/__state").annotation_writes == 0
+    and #old_issues >= 1 and unlocated_before_reopen == 2,
+    "legacy offline marks were not retained as two unlocated rows")
+reader():onClose()
+FileManager:showFiles(root .. "/books")
+wait_for("file manager before legacy reopen", function()
+    return FileManager.instance and FileManager.instance.weread
+end)
+FileManager.instance.weread:openFile(stable)
+wait_for("legacy aggregate reopened", function()
+    return ReaderUI.instance and reader().weread
+        and reader().document.file == stable
+end)
+plugin = reader().weread
+store = plugin:_annotationStore()
+wait_for("legacy marks loaded without user editing", function()
+    return unlocated_count() == 2
+end)
+local requests_before_repair = #api("/__state").requests
+
+-- A normal reconnect event retries both saved sidecar annotations. There are
+-- no new highlight or note actions after reopening the book.
+connected = true
+reader():handleEvent(Event:new("NetworkConnected"))
 wait_for("second live annotation receipt", function()
     return #api("/__state").annotation_writes == 2
         and plugin.library_db:localAnnotationStatus().synced == 2
 end)
 assert(plugin.library_db:localAnnotationStatus().synced == 2,
     "both actionable marks retain receipts")
+assert(store:get("900001", "original", "1")
+    and plugin.settings:get("books", {})["900001"].annotation_documents[stable],
+    "opening the old incremental book did not restore its source metadata")
+assert(#plugin.library_db:listUnlocatedAnnotations() == 0,
+    "source-repaired marks remained listed as unlocated")
+local repair_requests = api("/__state").requests
+local repair_chapter_requests = 0
+for index = requests_before_repair + 1, #repair_requests do
+    local event = repair_requests[index]
+    if event.path and event.path:match("^/web/book/chapter/") then
+        repair_chapter_requests = repair_chapter_requests + 1
+        assert(event.encoded_chapter == require("weread.lib.protocol").e(1),
+            "annotation repair downloaded a chapter unrelated to either mark")
+    end
+end
+assert(repair_chapter_requests == 3,
+    "annotation repair did not fetch exactly one EPUB chapter source")
 
 reader().rolling:onGotoPage(2)
 wait_for("nonzero live position", function()
@@ -343,6 +406,8 @@ out:write(json.encode({
     queue = queue, review = review, status = status,
     server_seconds = server_seconds, server_report_count = #reports,
     annotation_writes = api("/__state").annotation_writes,
+    unlocated_annotations_before_reopen = unlocated_before_reopen,
+    annotation_repair_chapter_requests = repair_chapter_requests,
     blank_count = blank_count, replayed_after_empty = #positive_reports() - before_repeat,
 }))
 out:close()

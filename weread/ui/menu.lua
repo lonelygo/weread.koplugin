@@ -109,7 +109,7 @@ function M:getMainMenuItems()
                 if account.login_method == "qr" and tonumber(account.login_time or 0) > 0 then
                     local name = type(account.name) == "string" and account.name or ""
                     if name == "" then name = _("Unknown account") end
-                    return T(_("Logged in · %1"), name)
+                    return T(_("Saved account · %1"), name)
                 end
                 return _("QR code login")
             end,
@@ -126,6 +126,10 @@ function M:getMainMenuItems()
             end),
         },
         {
+            text = _("Offline sync"),
+            sub_item_table_func = function() return self:getOfflineSyncMenuItems() end,
+        },
+        {
             text = _("WeRead favorites"),
             callback = self:safeCallback(_("WeRead favorites"), function()
                 self:showWereadCollection()
@@ -137,10 +141,6 @@ function M:getMainMenuItems()
             callback = self:safeCallback(_("Search"), function()
                 self:showSearch()
             end),
-        },
-        {
-            text = _("Offline sync"),
-            sub_item_table_func = function() return self:getOfflineSyncMenuItems() end,
         },
         {
             text = _("Reading time report"),
@@ -166,59 +166,64 @@ function M:getMainMenuItems()
         },
     }
 
-    if self.ui.document then
-        local book_id = self:detectWeReadBook()
-        local reader_items = {}
-        if book_id ~= nil then
-            if not WeRead.is_mp_book(book_id) then
-                reader_items[#reader_items + 1] = {
-                    text = _("Sync progress now"),
-                    keep_menu_open = true,
-                    callback = self:safeCallback(_("Sync progress now"), function()
-                        self:onWeReadSyncProgress()
-                    end),
-                }
-            end
-            reader_items[#reader_items + 1] = {
-                text = _("Book details"),
-                keep_menu_open = true,
-                callback = self:safeCallback(_("Book details"), function()
-                    self:showCurrentBookDetails()
-                end),
-            }
-        end
-        reader_items[#reader_items + 1] = {
-            text = _("Show underlines and thoughts"),
-            checked_func = function()
-                -- The checkbox reflects the user's display preference.  Annotation
-                -- data may still be downloading (or may be unavailable for this
-                -- document), but that must not make a checked preference render
-                -- as unchecked.
-                return self.settings:get("cache", {}).show_annotations ~= false
+    local book_id = self.ui.document and self:detectWeReadBook() or nil
+    if book_id ~= nil then
+        items[#items + 1] = {
+            text = _("Current book"),
+            sub_item_table_func = function()
+                return self:getCurrentBookMenuItems(book_id)
             end,
-            keep_menu_open = true,
-            check_callback_updates_menu = true,
-            callback = self:safeCallback(_("Show underlines and thoughts"), function(touchmenu_instance)
-                self:toggleAnnotationVisibility()
-                if touchmenu_instance then touchmenu_instance:updateItems() end
-            end),
         }
-        if self:_xpointerOverlayPrototypeAvailable() then
-            reader_items[#reader_items + 1] = {
-                text = _("Underlines and thoughts management"),
-                enabled_func = function()
-                    return self:_xpointerOverlayPrototypeAvailable()
-                end,
-                sub_item_table_func = function()
-                    return self:getXPointerOverlayPrototypeMenuItems()
-                end,
-            }
-        end
-        for index = #reader_items, 1, -1 do
-            table.insert(items, 3, reader_items[index])
-        end
     end
 
+    return items
+end
+
+function M:getCurrentBookMenuItems(book_id)
+    local items = {}
+    if not WeRead.is_mp_book(book_id) then
+        items[#items + 1] = {
+            text = _("Sync progress now"),
+            keep_menu_open = true,
+            callback = self:safeCallback(_("Sync progress now"), function()
+                self:onWeReadSyncProgress()
+            end),
+        }
+    end
+    items[#items + 1] = {
+        text = _("Book details"),
+        keep_menu_open = true,
+        callback = self:safeCallback(_("Book details"), function()
+            self:showCurrentBookDetails()
+        end),
+    }
+    items[#items + 1] = {
+        text = _("Show underlines and thoughts"),
+        checked_func = function()
+            -- The checkbox reflects the user's display preference. Annotation
+            -- data may still be downloading (or may be unavailable for this
+            -- document), but that must not make a checked preference render
+            -- as unchecked.
+            return self.settings:get("cache", {}).show_annotations ~= false
+        end,
+        keep_menu_open = true,
+        check_callback_updates_menu = true,
+        callback = self:safeCallback(_("Show underlines and thoughts"), function(touchmenu_instance)
+            self:toggleAnnotationVisibility()
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end),
+    }
+    if self:_xpointerOverlayPrototypeAvailable() then
+        items[#items + 1] = {
+            text = _("Underlines and thoughts management"),
+            enabled_func = function()
+                return self:_xpointerOverlayPrototypeAvailable()
+            end,
+            sub_item_table_func = function()
+                return self:getXPointerOverlayPrototypeMenuItems()
+            end,
+        }
+    end
     return items
 end
 

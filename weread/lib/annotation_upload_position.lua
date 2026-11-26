@@ -81,27 +81,59 @@ local function locate(document, mark, quote, spans)
     if normalized(original) == needle then return range, original end
 end
 
-function Position.resolve(document, book, mark, store)
-    if not document or not mark or not book or not store then return nil, "missing_source" end
+local function selected_chapter(document, book, mark)
+    if type(document) ~= "table" or type(book) ~= "table"
+        or type(mark) ~= "table" then return nil, "missing_selection" end
+    if type(mark.pos0) ~= "string" or type(mark.pos1) ~= "string" then
+        return nil, "missing_selection"
+    end
     local part = fragment(mark.pos0)
-    if not part or fragment(mark.pos1) ~= part then return nil, "cross_chapter_selection" end
-    local descriptor = Chapters.descriptor(book, document.file)
-    if not descriptor then return nil, "unmapped_document" end
+    if not part or fragment(mark.pos1) ~= part then
+        return nil, "cross_chapter_selection"
+    end
+    local path = type(document.file) == "string" and document.file or nil
+    if not path then return nil, "unmapped_document" end
+    local descriptor = Chapters.recoverDescriptor(book, path)
+    if not descriptor or type(descriptor.chapters) ~= "table" then
+        return nil, "unmapped_document"
+    end
+    if type(document.getToc) ~= "function" then
+        return nil, "unmapped_document"
+    end
+    local ok, toc = pcall(document.getToc, document)
+    if not ok or type(toc) ~= "table" then return nil, "unmapped_document" end
     local selected
-    for i, row in ipairs(document:getToc() or {}) do
-        if fragment(row.xpointer) == part then
+    for index, row in ipairs(toc) do
+        if type(row) == "table" and fragment(row.xpointer) == part then
+            local chapter = descriptor.chapters[index]
+            if type(chapter) ~= "table" then return nil, "unmapped_chapter" end
             if selected then return nil, "ambiguous_chapter" end
-            selected = descriptor.chapters[i]
+            selected = chapter
         end
     end
     if not selected then return nil, "unmapped_chapter" end
+    return selected
+end
+
+function Position.resolve(document, book, mark, store)
+    if not document or not mark or not book or not store then return nil, "missing_source" end
+    local selected, select_error = selected_chapter(document, book, mark)
+    if not selected then return nil, select_error end
     local id, uid = book.book_id or book.bookId, Chapters.uid(selected)
+    if id == nil or uid == "" or type(store.get) ~= "function" then
+        return nil, "missing_source"
+    end
     local spans = store:get(id, "original", uid)
-    if not spans then return nil, "missing_source" end
+    if type(spans) ~= "table" then return nil, "missing_source" end
     local version = store:get(id, "original_version", uid)
     if not version and spans[1] and spans[1][4] then version = 0 end
     if not version then return nil, "missing_source_version" end
-    local quote = document:getTextFromXPointers(mark.pos0, mark.pos1)
+    if type(document.getTextFromXPointers) ~= "function" then
+        return nil, "missing_selection"
+    end
+    local ok, quote = pcall(document.getTextFromXPointers,
+        document, mark.pos0, mark.pos1)
+    if not ok then return nil, "missing_selection" end
     if type(quote) ~= "string" then return nil, "missing_selection" end
     local range, original = locate(document, mark, quote, spans)
     if not range then return nil, "ambiguous_selection" end
@@ -110,6 +142,13 @@ function Position.resolve(document, book, mark, store)
         chapterIdx = tonumber(selected.chapterIdx), bookVersion = version,
         range = range, markText = original, chapterName = selected.title,
     }
+end
+
+-- Identify the exact source chapter needed to resolve a native annotation.
+-- This is safe to use for source-cache repair because it relies on the same
+-- document descriptor and fragment identity as resolve().
+function Position.chapter(document, book, mark)
+    return selected_chapter(document, book, mark)
 end
 
 return Position

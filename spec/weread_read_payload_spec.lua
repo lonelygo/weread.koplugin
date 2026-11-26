@@ -66,6 +66,12 @@ local common = {
     ts = 100001,
     rn = 7,
 }
+eq(WeRead.classify_response_error({ errCode = -2012 }),
+    "authentication", "expired cookie classification")
+eq(WeRead.classify_response_error({ errCode = -2010 }),
+    "authentication", "missing user classification")
+eq(WeRead.classify_response_error({ errCode = 4001 }),
+    "rejected", "business refusal classification")
 
 local enter = WeRead.make_enter_read_payload(common)
 eq(enter.pr, 74, "enter progress is integer")

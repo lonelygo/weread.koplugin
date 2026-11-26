@@ -1,4 +1,42 @@
 package.path = "./?.lua;" .. package.path
+
+local archives, archive_opens = {}, 0
+package.preload["libs/libkoreader-lfs"] = function()
+    return {
+        attributes = function(path)
+            local archive = archives[path]
+            return archive and {
+                size = archive.size,
+                modification = archive.modification,
+            } or nil
+        end,
+    }
+end
+package.preload["ffi/archiver"] = function()
+    local Reader = {}
+    Reader.__index = Reader
+    function Reader:new() return setmetatable({}, self) end
+    function Reader:open(path)
+        self.archive = archives[path]
+        archive_opens = archive_opens + 1
+        return self.archive ~= nil
+    end
+    function Reader:iterate()
+        local keys = {}
+        for path in pairs(self.archive.files) do keys[#keys + 1] = path end
+        table.sort(keys)
+        local index = 0
+        return function()
+            index = index + 1
+            local path = keys[index]
+            if path then return { path = path, size = #self.archive.files[path] } end
+        end
+    end
+    function Reader:extractToMemory(path) return self.archive.files[path] end
+    function Reader:close() self.archive = nil end
+    return { Reader = Reader }
+end
+
 local Chapters = require("weread.lib.annotation_chapters")
 local toc = {
     { title = "第一章 开始", xpointer = "0", depth = 1 },
@@ -33,6 +71,123 @@ local book = { chapters = catalog, annotation_documents = { ["selection.epub"] =
 assert(Chapters.descriptor(book, "selection.epub") == descriptor)
 assert(#Chapters.descriptor(book, "chapter.epub").chapters == 1)
 assert(not Chapters.descriptor(book, "legacy-full.epub"), "legacy partial file was assumed to be complete")
+book.cached_chapters["9"] = "unordered.epub"
+book.cached_chapters["12"] = "unordered.epub"
+assert(not Chapters.descriptor(book, "unordered.epub")
+    and not Chapters.recoverDescriptor(book, "unordered.epub"),
+    "an old multi-chapter cache manufactured spine order from chapter UIDs")
+
+local function synthetic_full_epub(path, book_id, chapters, options)
+    options = options or {}
+    local manifest = {
+        '<item id="cover" href="text/cover.xhtml" media-type="application/xhtml+xml"/>',
+        '<item id="toc" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
+    }
+    local spine = { '<itemref idref="cover"/>' }
+    local files = {
+        ["META-INF/container.xml"] = [[<?xml version="1.0"?>
+<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>]],
+        ["OEBPS/text/cover.xhtml"] = "<html><body>cover</body></html>",
+    }
+    local navigation = {}
+    for index, chapter in ipairs(chapters) do
+        local id = "chapter_" .. tostring(index)
+        local href = string.format("text/chapter-%03d.xhtml", index)
+        manifest[#manifest + 1] = '<item id="' .. id .. '" href="' .. href
+            .. '" media-type="application/xhtml+xml"/>'
+        spine[#spine + 1] = '<itemref idref="' .. id .. '"/>'
+        navigation[#navigation + 1] = '<navPoint><content src="' .. href
+            .. '"/></navPoint>'
+        local uid = tostring(chapter.chapterUid)
+        if options.duplicate_last and index == #chapters then
+            uid = tostring(chapters[1].chapterUid)
+        end
+        local marker = options.missing_marker == index and ""
+            or "<!-- weread-chapter-uid: " .. uid .. " -->"
+        files["OEBPS/" .. href] = marker .. "<html><body>synthetic</body></html>"
+    end
+    files["OEBPS/content.opf"] = table.concat({
+        '<package><metadata><dc:identifier xmlns:dc="urn:dc">weread-',
+        options.wrong_book and "other" or book_id,
+        '-full</dc:identifier></metadata><manifest>',
+        table.concat(manifest), '</manifest><spine>',
+        table.concat(spine), '</spine></package>',
+    })
+    if options.reverse_navigation then
+        navigation[#navigation], navigation[#navigation - 1] =
+            navigation[#navigation - 1], navigation[#navigation]
+    end
+    files["OEBPS/toc.ncx"] = "<ncx><navMap>" .. table.concat(navigation)
+        .. "</navMap></ncx>"
+    local size = 0
+    for _, value in pairs(files) do size = size + #value end
+    archives[path] = { files = files, size = size, modification = 10 }
+end
+
+local full_catalog = {}
+for index = 1, 175 do
+    full_catalog[index] = {
+        chapterUid = tostring(100000 + index * 13),
+        chapterIdx = index * 2,
+        title = "Synthetic " .. tostring(index),
+    }
+end
+local full_path = "/synthetic/legacy-full.epub"
+synthetic_full_epub(full_path, "synthetic-book", full_catalog)
+local full_book = {
+    book_id = "synthetic-book",
+    chapters = full_catalog,
+    cached_file = full_path,
+    cached_full_book = full_path,
+    -- Some migrated records retained only one cached_chapters alias even
+    -- though cached_file still points at the complete multi-chapter EPUB.
+    cached_chapters = { [full_catalog[1].chapterUid] = full_path },
+}
+local recovered, did_recover = Chapters.recoverDescriptor(full_book, full_path)
+assert(did_recover and recovered.source == "archive_uid_markers"
+        and #recovered.chapters == 175
+        and recovered.chapters[44].chapterUid == full_catalog[44].chapterUid,
+    "legacy full-book ordinal filenames were not mapped by trusted UID markers")
+local open_count = archive_opens
+local existing, repeated = Chapters.recoverDescriptor(full_book, full_path)
+assert(existing == recovered and not repeated and archive_opens == open_count,
+    "an existing recovered descriptor rescanned the archive")
+archives[full_path].modification = 11
+assert(not Chapters.descriptor(full_book, full_path),
+    "a replaced EPUB retained its recovered descriptor")
+recovered, did_recover = Chapters.recoverDescriptor(full_book, full_path)
+assert(did_recover and recovered.chapters[44].chapterUid == full_catalog[44].chapterUid,
+    "a replaced legacy EPUB did not rebuild its descriptor")
+
+local duplicate_path = "/synthetic/duplicate.epub"
+synthetic_full_epub(duplicate_path, "synthetic-book", full_catalog,
+    { duplicate_last = true })
+assert(not Chapters.recoverDescriptor({
+    book_id = "synthetic-book", chapters = full_catalog,
+    cached_file = duplicate_path, cached_full_book = duplicate_path,
+}, duplicate_path), "duplicate archive UID marker was accepted")
+local missing_path = "/synthetic/missing.epub"
+synthetic_full_epub(missing_path, "synthetic-book", full_catalog,
+    { missing_marker = 44 })
+assert(not Chapters.recoverDescriptor({
+    book_id = "synthetic-book", chapters = full_catalog,
+    cached_file = missing_path, cached_full_book = missing_path,
+}, missing_path), "unmarked legacy chapter was guessed from its ordinal")
+local wrong_path = "/synthetic/wrong-book.epub"
+synthetic_full_epub(wrong_path, "synthetic-book", full_catalog,
+    { wrong_book = true })
+assert(not Chapters.recoverDescriptor({
+    book_id = "synthetic-book", chapters = full_catalog,
+    cached_file = wrong_path, cached_full_book = wrong_path,
+}, wrong_path), "another book's archive markers were accepted")
+local wrong_toc_path = "/synthetic/wrong-toc.epub"
+synthetic_full_epub(wrong_toc_path, "synthetic-book", full_catalog,
+    { reverse_navigation = true })
+assert(not Chapters.recoverDescriptor({
+    book_id = "synthetic-book", chapters = full_catalog,
+    cached_file = wrong_toc_path, cached_full_book = wrong_toc_path,
+}, wrong_toc_path), "NCX order inconsistent with the spine was accepted")
+
 local _, sparse = Chapters.map(doc, { catalog[1], catalog[3] })
 assert(sparse["9"].end_xpointer == "10", "an unmatched sibling leaked into the previous chapter")
 

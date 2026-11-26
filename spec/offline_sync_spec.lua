@@ -44,6 +44,16 @@ assert(time_status.pending == 5 and time_status.unknown == 30,
 assert(db:ackReadTime(assert(db:claimReadTime("test"))))
 assert(not db:hasPendingOfflineWork(true, false),
     "unknown reading-time write incorrectly triggered a network probe")
+assert(db:enqueueReadTime("blocked-book", 30, {}))
+assert(db:enqueueReadTime("next-book", 30, {}))
+local deferred, deferred_count = db:deferPendingReadTimeForBook(
+    "blocked-book", 60)
+assert(deferred and deferred_count == 1
+    and db:pendingOfflineBook(true, false) == "next-book",
+    "one book's progress failure blocked another book's reading time")
+local next_book = assert(db:claimReadTime("test"))
+assert(next_book.book_id == "next-book" and db:ackReadTime(next_book),
+    "the per-book delay was ignored by the reading-time claim")
 
 local annotations = {
     {
@@ -97,6 +107,21 @@ work = assert(db:nextLocalAnnotationWork())
 assert(work.sync_state == "delete_pending" and work.present
     and work.remote_kind == "highlight" and work.kind == "thought",
     "kind-changing edit did not preserve the old remote id for replacement")
+
+local unlocated = {
+    { id = "missing", page = "p2", text = "needs source", drawer = "lighten",
+        _weread_upload_error = "missing_source" },
+}
+assert(db:putLocalAnnotationSnapshot("book", "/books/legacy.epub", unlocated, {
+    changed = { ["ko:missing"] = true },
+}))
+local issues = db:listUnlocatedAnnotations()
+local repair_ids = db:localAnnotationRepairIds("book", "/books/legacy.epub")
+assert(#issues == 1 and issues[1].book_id == "book"
+    and issues[1].document_path == "/books/legacy.epub"
+    and issues[1].reason == "missing_source" and issues[1].count == 1
+    and repair_ids["ko:missing"] == true,
+    "unlocated annotations were not grouped by book, file and safe reason")
 
 current_account = { user_vid = unique .. "-offline-b" }
 local second_path = db:databasePath()

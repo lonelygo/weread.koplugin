@@ -103,6 +103,8 @@ local thought_popup = {
 local available_version
 local annotations_visible = false
 local annotation_menu_updates = 0
+local progress_syncs = 0
+local book_details = 0
 local prefetch_cancellations = 0
 local host = {
     ui = {},
@@ -134,6 +136,8 @@ local host = {
     toggleAnnotationVisibility = function()
         cache.show_annotations = not (cache.show_annotations ~= false)
     end,
+    onWeReadSyncProgress = function() progress_syncs = progress_syncs + 1 end,
+    showCurrentBookDetails = function() book_details = book_details + 1 end,
     safeCallback = function(_self, _label, callback) return callback end,
 }
 for key, value in pairs(Menu) do host[key] = value end
@@ -325,6 +329,20 @@ local function menu_has(items, text)
     return false
 end
 
+local function menu_texts(items)
+    local texts = {}
+    for _, item in ipairs(items or {}) do
+        texts[#texts + 1] = item.text or (item.text_func and item.text_func()) or ""
+    end
+    return table.concat(texts, "|")
+end
+
+local common_menu = menu_texts(main_items)
+expect(common_menu == table.concat({
+    "Bookshelf", "QR code login", "Offline sync", "WeRead favorites",
+    "Search", "Reading time report", "Reading statistics", "Settings",
+}, "|"), "common actions do not have the stable home/reader order")
+
 expect(menu_has(main_items, "WeRead favorites"),
     "main menu did not rename the local collection entry")
 
@@ -339,17 +357,26 @@ for _, item in ipairs(local_reader_items) do
 end
 expect(not menu_has(local_reader_items, "Sync progress now")
         and not menu_has(local_reader_items, "Book details")
-        and menu_has(local_reader_items, "Underlines and thoughts management"),
-    "local document menu retained WeRead-only book actions")
+        and not menu_has(local_reader_items, "Current book")
+        and menu_texts(local_reader_items) == common_menu,
+    "an unrelated local document changed the WeRead menu")
 
 host.detectWeReadBook = function() return "book-1" end
 local weread_reader_items = host:getMainMenuItems()
-expect(menu_has(weread_reader_items, "Sync progress now")
-        and menu_has(weread_reader_items, "Book details")
-        and menu_has(weread_reader_items, "Underlines and thoughts management"),
-    "WeRead book menu retained the local-book annotation submenu")
+local current_book = weread_reader_items[#weread_reader_items]
+local current_book_items = current_book and current_book.sub_item_table_func()
+expect(current_book and current_book.text == "Current book"
+        and menu_texts(weread_reader_items):sub(1, #common_menu) == common_menu
+        and menu_has(current_book_items, "Sync progress now")
+        and menu_has(current_book_items, "Book details")
+        and menu_has(current_book_items, "Underlines and thoughts management"),
+    "current WeRead book actions were not grouped after the stable common menu")
+current_book_items[1].callback()
+current_book_items[2].callback()
+expect(progress_syncs == 1 and book_details == 1,
+    "current-book submenu actions did not invoke their reader operations")
 local visibility_item
-for _, item in ipairs(weread_reader_items) do
+for _, item in ipairs(current_book_items or {}) do
     if item.text == "Show underlines and thoughts" then visibility_item = item end
 end
 expect(visibility_item and not visibility_item.checked_func(),
@@ -366,10 +393,12 @@ expect(cache.show_annotations == false and annotation_menu_updates == 1
 
 host.detectWeReadBook = function() return "mp-book" end
 local mp_reader_items = host:getMainMenuItems()
-expect(not menu_has(mp_reader_items, "Sync progress now")
-        and menu_has(mp_reader_items, "Book details")
-        and menu_has(mp_reader_items, "Underlines and thoughts management"),
-    "public-account menu exposed unsupported progress or local-book actions")
+local mp_book_items = mp_reader_items[#mp_reader_items].sub_item_table_func()
+expect(mp_reader_items[#mp_reader_items].text == "Current book"
+        and not menu_has(mp_book_items, "Sync progress now")
+        and menu_has(mp_book_items, "Book details")
+        and menu_has(mp_book_items, "Underlines and thoughts management"),
+    "public-account book submenu exposed unsupported progress or lost book actions")
 local download_settings
 local cache_management
 for _, item in ipairs(settings_items) do

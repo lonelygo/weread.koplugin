@@ -5,7 +5,17 @@ package.preload["weread.lib.logger"] = function()
     return { scoped = function() return {} end }
 end
 package.preload["weread.lib.protocol"] = function()
-    return { is_success_response = function(value) return value and value.succ == 1 end }
+    return {
+        is_success_response = function(value) return value and value.succ == 1 end,
+        classify_response_error = function(value)
+            local code = type(value) == "table"
+                and tonumber(value.errCode or value.errcode or value.code) or nil
+            if code == -2010 or code == -2012 then return "authentication" end
+            if code and code ~= 0 then return "rejected" end
+            if type(value) == "table" and value.succ ~= nil
+                and tonumber(value.succ) ~= 1 then return "rejected" end
+        end,
+    }
 end
 
 local ReadReport = require("weread.lib.read_report")

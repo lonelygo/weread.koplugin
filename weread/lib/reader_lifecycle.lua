@@ -1,5 +1,6 @@
 -- KOReader event lifecycle and reader-state orchestration.
 local Content = require("weread.lib.content")
+local AnnotationChapters = require("weread.lib.annotation_chapters")
 local logger = require("weread.lib.logger").scoped("Prefetch")
 local UIManager = require("ui/uimanager")
 local PluginUtil = require("weread.lib.plugin_util")
@@ -229,7 +230,20 @@ function M:onReaderReady()
     -- the whole book table on every screen tap.
     self._current_weread_book_id = weread_book_id
     if weread_book_id then
-        local current = self.settings:get("books", {})[tostring(weread_book_id)]
+        local books = self.settings:get("books", {})
+        local current = books[tostring(weread_book_id)]
+        if current and self.ui and self.ui.document then
+            if type(current.chapters) ~= "table" or #current.chapters == 0 then
+                Content.load_catalog_cache(self.client, self.settings, current)
+            end
+            local descriptor, recovered = AnnotationChapters.recoverDescriptor(
+                current, self.ui.document.file)
+            if descriptor and recovered then
+                books[tostring(weread_book_id)] = current
+                self.settings:set("books", books)
+                self.settings:flush()
+            end
+        end
         if current and Content.install_legacy_custom_cover then
             local installed, cover_err = Content.install_legacy_custom_cover(
                 self.settings, current, self.ui.document.file)
@@ -339,6 +353,13 @@ function M:_offlineAnnotationCoordinator()
         end,
         get_store = function()
             return self._annotationStore and self:_annotationStore() or nil
+        end,
+        get_annotations = function()
+            return self.ui and self.ui.annotation
+                and self.ui.annotation.annotations or nil
+        end,
+        get_session = function()
+            return self._reader_session_gen
         end,
     }
     return self.offline_annotations

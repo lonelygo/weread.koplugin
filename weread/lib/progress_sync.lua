@@ -1,4 +1,5 @@
 local PositionMapper = require("weread.lib.position_mapper")
+local RemoteProgress = require("weread.lib.remote_progress")
 
 local logger = require("weread.lib.logger").scoped("ProgressSync")
 
@@ -384,38 +385,8 @@ function ProgressSync:_clear_verified(reason)
 end
 
 function ProgressSync:_fetch_remote(book_id, chapters)
-    local gateway
-    local web
-    local gateway_error
-    local web_error
-    if self.settings:is_api_configured() then
-        local ok, result = pcall(self.client.get_progress, self.client, book_id)
-        if ok then
-            gateway, gateway_error = PositionMapper.normalize_remote(
-                result, book_id, "gateway", chapters)
-        else
-            gateway_error = tostring(result)
-        end
-    end
-    if self.settings:is_cookie_configured() then
-        local ok, result = pcall(
-            self.client.get_web_progress, self.client, book_id)
-        if ok then
-            web, web_error = PositionMapper.normalize_remote(
-                result, book_id, "web", chapters)
-        else
-            web_error = tostring(result)
-        end
-    end
-    local selected = PositionMapper.choose_remote(
-        web,
-        gateway,
-        SOURCE_CONFLICT_THRESHOLD_PERCENT
-    )
-    if not selected then
-        return nil, gateway_error or web_error or "remote_unavailable"
-    end
-    return selected
+    return RemoteProgress.fetch(
+        self.client, self.settings, book_id, chapters)
 end
 
 function ProgressSync:_apply_remote(remote, context, options)

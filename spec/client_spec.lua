@@ -65,10 +65,24 @@ package.preload["weread.lib.protocol"] = function()
     return {
         USER_AGENT = "WeRead client spec",
         SKILL_VERSION = "test-skill",
+        is_success_response = function(value)
+            return type(value) == "table"
+                and (value.succ == true or tonumber(value.succ) == 1)
+        end,
         urlencode = function(value)
             return tostring(value):gsub("([^%w%-_%.~])", function(ch)
                 return string.format("%%%02X", ch:byte())
             end)
+        end,
+        classify_response_error = function(value)
+            local code = type(value) == "table"
+                and tonumber(value.errCode or value.errcode) or nil
+            if code == -2012 or code == -2010 then
+                return "authentication", code
+            end
+            if code and code ~= 0 then return "rejected", code end
+            if type(value) == "table" and value.succ ~= nil
+                and tonumber(value.succ) ~= 1 then return "rejected" end
         end,
     }
 end
@@ -207,6 +221,45 @@ expect(raw_response_log:find(
     1,
     true
 ), "HTTP failure log omitted the raw response body")
+
+local renewed_auth = {
+    cookies = { wr_skey = "old-cookie" },
+    wr_ticket = "old-ticket", wr_wrpa = "",
+}
+local renew_settings = {
+    get = function(_, key, default)
+        local value = renewed_auth[key]
+        return value == nil and default or value
+    end,
+    update_auth = function(_, value)
+        for key, item in pairs(value or {}) do renewed_auth[key] = item end
+    end,
+    merge_set_cookie = function() end,
+}
+local renewal_client = Client:new(renew_settings)
+renewal_client.json_encode = function() return "{}" end
+renewal_client.json_decode = function(_, text)
+    return text:find('"succ":1', 1, true)
+        and { succ = 1 } or { succ = 0, errCode = -2012 }
+end
+responses[#responses + 1] = {
+    body = '{"succ":1}', code = 200,
+    headers = {
+        ["set-cookie"] = "wr_skey=XXX-renewed; Path=/",
+        ["x-wr-ticket"] = "renewed-ticket",
+    },
+}
+renewal_client:renew_cookie()
+expect(renewed_auth.cookies.wr_skey == "XXX-renewed"
+    and renewed_auth.wr_ticket == "renewed-ticket",
+    "a confirmed renewal did not stage its returned credentials")
+responses[#responses + 1] = {
+    body = '{"succ":0,"errCode":-2012}', code = 200,
+    headers = { ["set-cookie"] = "wr_skey=XXX-rejected; Path=/" },
+}
+ok = pcall(renewal_client.renew_cookie, renewal_client)
+expect(not ok and renewed_auth.cookies.wr_skey == "XXX-renewed",
+    "a rejected renewal persisted unconfirmed credentials")
 
 logs = {}
 local gateway_settings = {
@@ -389,7 +442,57 @@ local probe_client = setmetatable({
     end,
 }, { __index = Client })
 probe_response = { data = { book = { bookId = "book", progress = 0 } } }
-expect(probe_client:probe_sync("book"), "a confirmed zero progress is a healthy service response")
+local probe_ok, probe_reason = probe_client:probe_sync("book")
+expect(probe_ok and probe_reason == "verified",
+    "a confirmed zero progress is a healthy service response")
+probe_response = { data = { reader = { reading = {
+    bookId = "book", bookProgress = 25, chapterId = "8",
+} } } }
+probe_ok, probe_reason = probe_client:probe_sync("book")
+expect(probe_ok and probe_reason == "verified",
+    "a nested production-style progress object was rejected")
+probe_response = {
+    data = { reader = { bookId = "book", progress = 25 } },
+    status = { succ = 0, errCode = -1 },
+}
+probe_ok, probe_reason = probe_client:probe_sync("book")
+expect(not probe_ok and probe_reason == "response_rejected",
+    "a nested explicit rejection authorized a write")
+probe_response = { data = { errCode = -2012, errMsg = "login expired" } }
+local probe_code
+probe_ok, probe_reason, probe_code = probe_client:probe_sync("book")
+expect(not probe_ok and probe_reason == "authentication_required"
+    and probe_code == -2012,
+    "an HTTP 200 login-timeout response was reported as reachable")
+local renewals = 0
+probe_client.renew_cookie = function()
+    renewals = renewals + 1
+    probe_response = { bookId = "book", progress = 26, chapterUid = 8 }
+    return { succ = 1 }
+end
+probe_ok, probe_reason, probe_code = probe_client:renew_probe_sync("book")
+expect(probe_ok and probe_reason == "verified" and probe_code.renew_attempted
+    and probe_code.auth_renewed and renewals == 1,
+    "a confirmed renewal was not followed by a fresh read-only probe")
+probe_response = { errCode = -2012, errMsg = "login expired" }
+probe_client.renew_cookie = function()
+    renewals = renewals + 1
+    error("renewal rejected")
+end
+probe_ok, probe_reason, probe_code = probe_client:renew_probe_sync("book")
+expect(not probe_ok and probe_reason == "authentication_required"
+    and probe_code.renew_attempted and not probe_code.auth_renewed
+    and renewals == 2,
+    "a rejected renewal authorized the outbox")
+probe_client.renew_cookie = function() error("HTTP nil, content_type=unknown, body_bytes=0") end
+probe_ok, probe_reason = probe_client:renew_probe_sync("book")
+expect(not probe_ok and probe_reason == "service_unreachable",
+    "a lost connection during renewal was reported as login refused")
+probe_response = { errCode = -2010, errMsg = "user missing" }
+probe_ok, probe_reason, probe_code = probe_client:probe_sync("book")
+expect(not probe_ok and probe_reason == "authentication_required"
+    and probe_code == -2010,
+    "the user-missing response lost its distinct business code")
 for _, invalid in ipairs({
     {}, { succ = 0, progress = 2 }, { book = { errCode = -1, progress = 2 } },
     { book = { bookId = "other", progress = 10 } }, { chapterUid = false }, "login page",
@@ -397,8 +500,14 @@ for _, invalid in ipairs({
     probe_response = invalid
     expect(not probe_client:probe_sync("book"), "an unrecognized response authorized a write")
 end
-probe_client.get_web_progress = function() error("503") end
-expect(not probe_client:probe_sync("book"), "a failed service probe authorized a write")
+probe_client.get_web_progress = function() error("HTTP 401, login expired") end
+probe_ok, probe_reason = probe_client:probe_sync("book")
+expect(not probe_ok and probe_reason == "authentication_required",
+    "an expired login was reported as a generic network failure")
+probe_client.get_web_progress = function() error("HTTP 503") end
+probe_ok, probe_reason = probe_client:probe_sync("book")
+expect(not probe_ok and probe_reason == "service_busy",
+    "a 5xx service response was mislabeled as a lost network")
 
 -- Preserve the actual status for read-report delivery decisions. A decoded
 -- refusal and an unreadable error page must never resemble a success receipt.

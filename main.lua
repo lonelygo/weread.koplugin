@@ -26,7 +26,7 @@ local _ = PluginUtil.tr
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
-    version = "1.8.6",
+    version = "1.8.7",
 }
 
 -- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
@@ -97,6 +97,10 @@ function WeReadPlugin:init()
     self.qr_login = QRLogin:new(self, self.client, self.settings)
     self.offline_sync = OfflineSync:new(self, UIManager, BackgroundWorker:new{
         temp_dir = self.settings.data_dir .. "/sync-probes",
+        -- A sync probe performs one bounded read-only request. Keep enough
+        -- headroom for a 512 MB Kindle without applying the larger EPUB
+        -- download/prefetch fork gate to this small task.
+        min_available_kb = 32 * 1024,
     })
     local function request_sync(reason, context)
         return self.offline_sync:request(reason, context)
@@ -178,8 +182,10 @@ function WeReadPlugin:init()
             return self:getChapterInfoFromFile(book, path)
         end,
         run_online = function(_kind, callback, run_options)
-            return self:runOnlineTask(
-                _("Sync progress"), callback, nil, run_options)
+            return self:runOnlineTask(_("Sync progress"), callback, nil, {
+                check_link_only = true,
+                silent_offline = run_options and run_options.silent_offline,
+            })
         end,
         upload_position = function(book_id, position, elapsed_seconds)
             return self.read_report:upload_position(

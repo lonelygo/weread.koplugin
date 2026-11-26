@@ -310,7 +310,7 @@ assert(wifi_wake_calls == 0, "offline upload woke Wi-Fi")
 connected = true
 set_service_failure(-1)
 menu_sync()
-local failed = wait_result("service failure from settings", "未能连接微信读书")
+local failed = wait_result("service failure from settings", "微信读书暂时无法处理请求或正在限流")
 assert(failed.text:find("50 秒", 1, true) and failed.text:find("2 条", 1, true))
 screen_shot("08-service-failure")
 dismiss_result()

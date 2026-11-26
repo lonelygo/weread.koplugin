@@ -12,6 +12,7 @@ end
 
 local LibraryDB = {}
 LibraryDB.__index = LibraryDB
+local SCHEMA_VERSION = 1
 
 local function status_changed(self)
     local ok, SyncStatus = pcall(require, "weread.lib.sync_status")
@@ -89,6 +90,21 @@ function LibraryDB:databasePath()
     return self.data_dir .. "/library-" .. account_key .. ".db"
 end
 
+local function addMissingColumns(db, name, definitions)
+    local stmt = db:prepare("PRAGMA table_info(" .. name .. ")")
+    local row, present = stmt:reset():step(), {}
+    while row do
+        present[row[2]] = true
+        row = stmt:step()
+    end
+    close_statement(stmt)
+    for column, definition in pairs(definitions) do
+        if not present[column] then
+            db:exec("ALTER TABLE " .. name .. " ADD COLUMN " .. column .. " " .. definition)
+        end
+    end
+end
+
 function LibraryDB:open()
     local path = self:databasePath()
     if not path then
@@ -106,8 +122,17 @@ function LibraryDB:open()
         return nil
     end
     local schema_ok, schema_err = pcall(function()
-        db:exec("PRAGMA journal_mode=WAL")
+        -- The reader, FileManager and their workers open separate handles.
+        -- A status read must not try to change the journal mode or migrate
+        -- the schema while another handle is committing a receipt.
+        db:exec("PRAGMA busy_timeout=750")
         db:exec("PRAGMA synchronous=NORMAL")
+        local stmt = db:prepare("PRAGMA user_version")
+        local version = tonumber(stmt:reset():step()[1]) or 0
+        close_statement(stmt)
+        if version >= SCHEMA_VERSION then return end
+        db:exec("PRAGMA journal_mode=WAL")
+        db:exec("BEGIN IMMEDIATE")
         db:exec([[
             CREATE TABLE IF NOT EXISTS books (
                 book_id           TEXT PRIMARY KEY,
@@ -187,25 +212,33 @@ function LibraryDB:open()
                 value INTEGER NOT NULL
             ) WITHOUT ROWID
         ]])
-        pcall(function()
-            db:exec("ALTER TABLE local_annotation_outbox ADD COLUMN replacement_id TEXT NOT NULL DEFAULT ''")
-        end)
-        pcall(function() db:exec("ALTER TABLE read_time_outbox ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''") end)
-        pcall(function() db:exec("ALTER TABLE read_time_outbox ADD COLUMN retry_after INTEGER NOT NULL DEFAULT 0") end)
-        pcall(function() db:exec("ALTER TABLE read_time_outbox ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0") end)
-        pcall(function() db:exec("ALTER TABLE local_annotation_outbox ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''") end)
-        pcall(function() db:exec("ALTER TABLE local_annotation_outbox ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0") end)
-        -- Adds the richer detail snapshot for databases created by an early
-        -- development build. Duplicate-column errors are intentionally ignored.
-        pcall(function() db:exec("ALTER TABLE books ADD COLUMN detail_payload TEXT") end)
+        db:exec([[
+            CREATE TABLE IF NOT EXISTS last_manual_sync (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                reason TEXT NOT NULL,
+                attempted_at INTEGER NOT NULL
+            )
+        ]])
+        addMissingColumns(db, "books", { detail_payload = "TEXT" })
+        addMissingColumns(db, "read_time_outbox", {
+            claim_token = "TEXT NOT NULL DEFAULT ''", claimed_at = "INTEGER NOT NULL DEFAULT 0",
+            retry_after = "INTEGER NOT NULL DEFAULT 0",
+        })
+        addMissingColumns(db, "local_annotation_outbox", {
+            claim_token = "TEXT NOT NULL DEFAULT ''", claimed_at = "INTEGER NOT NULL DEFAULT 0",
+            replacement_id = "TEXT NOT NULL DEFAULT ''",
+        })
         db:exec("CREATE INDEX IF NOT EXISTS chapters_position ON chapters(book_id, position)")
         db:exec("CREATE INDEX IF NOT EXISTS read_time_pending ON read_time_outbox(state, id)")
         db:exec([[
             CREATE INDEX IF NOT EXISTS local_annotation_pending
                 ON local_annotation_outbox(sync_state, updated_at)
         ]])
+        db:exec("PRAGMA user_version=" .. SCHEMA_VERSION)
+        db:exec("COMMIT")
     end)
     if not schema_ok then
+        pcall(function() db:exec("ROLLBACK") end)
         logger.warn("library_db schema init failed:", schema_err)
         pcall(function() db:close() end)
         return nil
@@ -587,6 +620,38 @@ function LibraryDB:releaseReadTimeClaim(item, retry_delay)
     return ok and affected == 1
 end
 
+-- A failed progress comparison is scoped to one book. Delay only that book's
+-- historical time so another book's already-safe work can continue. Exact-ID
+-- live claims intentionally ignore this delay.
+function LibraryDB:deferPendingReadTimeForBook(book_id, retry_delay)
+    book_id = tostring(book_id or "")
+    if book_id == "" then return false, 0 end
+    local db = self:open()
+    if not db then return false, 0 end
+    local stmt
+    local affected = 0
+    local ok, err = pcall(function()
+        stmt = db:prepare([[
+            UPDATE read_time_outbox
+               SET retry_after=MAX(retry_after, ?)
+             WHERE book_id=? AND state='pending'
+        ]])
+        local after = os.time() + math.max(1,
+            math.floor(tonumber(retry_delay) or 1))
+        stmt:reset():bind(after, book_id):step()
+        close_statement(stmt)
+        stmt = nil
+        affected = changed_rows(db)
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if not ok then
+        logger.warn("library_db read time defer failed:", err)
+        return false, 0
+    end
+    return true, affected
+end
+
 function LibraryDB:offlineStatus()
     local db = self:open()
     if not db then return { available = false, annotations = {} } end
@@ -647,6 +712,65 @@ function LibraryDB:offlineStatus()
         result.review_records = self:listReadTimeReview()
     end
     return result
+end
+
+function LibraryDB:saveManualSyncResult(reason, timestamp)
+    if type(reason) ~= "string" or not reason:match("^[a-z_]+$") or #reason > 48 then return false end
+    local db = self:open()
+    if not db then return false end
+    local stmt
+    local ok = pcall(function()
+        stmt = db:prepare("INSERT OR REPLACE INTO last_manual_sync (id,reason,attempted_at) VALUES (1,?,?)")
+        stmt:reset():bind(reason, math.floor(tonumber(timestamp) or os.time())):step()
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    return ok
+end
+
+function LibraryDB:lastManualSyncResult()
+    local db = self:open()
+    if not db then return nil end
+    local stmt, result
+    local ok = pcall(function()
+        stmt = db:prepare("SELECT reason, attempted_at FROM last_manual_sync WHERE id=1")
+        local row = stmt:reset():step()
+        if row then result = { reason = row[1], at = tonumber(row[2]) } end
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    return ok and result or nil
+end
+
+-- Only the record-details dialog needs per-book counts. Keep the homepage
+-- heartbeat independent of how many books and segments are queued.
+function LibraryDB:listPendingSyncBooks()
+    local db = self:open()
+    if not db then return {} end
+    local stmt, books = nil, {}
+    local ok = pcall(function()
+        stmt = db:prepare([[
+            SELECT book_id, SUM(seconds), SUM(segments), SUM(marks) FROM (
+                SELECT book_id, SUM(elapsed_seconds) AS seconds, COUNT(*) AS segments, 0 AS marks
+                  FROM read_time_outbox WHERE state IN ('pending','claimed') GROUP BY book_id
+                UNION ALL
+                SELECT book_id, 0, 0, COUNT(*) FROM local_annotation_outbox
+                 WHERE sync_state IN ('local_only','update_pending','delete_pending','replace_delete_pending','inflight')
+                 GROUP BY book_id
+            ) GROUP BY book_id ORDER BY book_id
+        ]])
+        local row = stmt:reset():step()
+        while row do
+            books[#books + 1] = {
+                book_id = tostring(row[1]), seconds = tonumber(row[2]) or 0,
+                segments = tonumber(row[3]) or 0, annotations = tonumber(row[4]) or 0,
+            }
+            row = stmt:step()
+        end
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    return ok and books or {}
 end
 
 function LibraryDB:setSyncLastConfirmedAt(timestamp)
@@ -1304,6 +1428,83 @@ function LibraryDB:localAnnotationStatus()
     close_statement(stmt)
     pcall(function() db:close() end)
     return ok and counts or {}
+end
+
+-- List annotations that are meant to upload but still lack verified WeRead
+-- source coordinates. Paths remain internal so callers can map them to the
+-- corresponding saved book without exposing annotation payloads.
+function LibraryDB:listUnlocatedAnnotations()
+    local db = self:open()
+    if not db then return {} end
+    local stmt
+    local issues = {}
+    local ok, err = pcall(function()
+        stmt = db:prepare([[
+            SELECT book_id, document_path,
+                   CASE
+                     WHEN last_error IN (
+                       'missing_source','missing_source_version',
+                       'unmapped_document','unmapped_chapter',
+                       'ambiguous_chapter','ambiguous_selection',
+                       'cross_chapter_selection','missing_selection'
+                     ) THEN last_error
+                     ELSE 'position_pending'
+                   END AS safe_reason,
+                   COUNT(*), MAX(updated_at)
+              FROM local_annotation_outbox
+             WHERE present=1
+               AND sync_state IN ('local_only','update_pending')
+               AND (upload_payload IS NULL OR upload_payload='')
+             GROUP BY book_id, document_path, safe_reason
+             ORDER BY MAX(updated_at) DESC, book_id, document_path, safe_reason
+        ]])
+        local row = stmt:reset():step()
+        while row do
+            issues[#issues + 1] = {
+                book_id = tostring(row[1]),
+                document_path = tostring(row[2]),
+                reason = tostring(row[3]),
+                count = tonumber(row[4]) or 0,
+                updated_at = tonumber(row[5]) or 0,
+            }
+            row = stmt:step()
+        end
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if not ok then
+        logger.warn("library_db unlocated annotation query failed:", err)
+        return {}
+    end
+    return issues
+end
+
+function LibraryDB:localAnnotationRepairIds(book_id, document_path)
+    local db = self:open()
+    if not db then return {} end
+    local stmt
+    local ids = {}
+    local ok, err = pcall(function()
+        stmt = db:prepare([[
+            SELECT local_id FROM local_annotation_outbox
+             WHERE book_id=? AND document_path=? AND present=1
+               AND sync_state IN ('local_only','update_pending')
+               AND (upload_payload IS NULL OR upload_payload='')
+        ]])
+        local row = stmt:reset():bind(tostring(book_id or ""),
+            tostring(document_path or "")):step()
+        while row do
+            ids[tostring(row[1])] = true
+            row = stmt:step()
+        end
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if not ok then
+        logger.warn("library_db annotation repair query failed:", err)
+        return {}
+    end
+    return ids
 end
 
 function LibraryDB:cacheShelf(books, archives)

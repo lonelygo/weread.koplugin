@@ -301,6 +301,7 @@ function QRLogin:_complete_protocol(login_result, generation)
     if self.host.onWeReadAccountChanged then
         self.host:onWeReadAccountChanged()
     end
+    if self.host.offline_sync then self.host.offline_sync:request("login_completed") end
     self.login_cookies = nil
     return account
 end
@@ -324,7 +325,7 @@ function QRLogin:cancel()
 end
 
 function QRLogin:start()
-    if not self.host:isNetworkOnline() then
+    if not self.host:isNetworkConnected() then
         self.host:showOffline(_("QR login"))
         return
     end

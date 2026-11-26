@@ -10,9 +10,11 @@ package.loaded["weread.lib.plugin_util"] = {
     end,
 }
 local status
+local review_books = {}
 package.loaded["weread.lib.sync_status"] = {
     get = function() return status end,
     invalidateOffline = function() end,
+    reviewBooks = function() return review_books end,
 }
 local opened
 local windows = {}
@@ -53,6 +55,7 @@ local shown_message
 view.settings = { get = function(_self, _key, default) return default end }
 local retry_ids, handled_ids = {}, {}
 view.library_db = {
+    readTimeReceipts = function() return { count = 0 } end,
     retryReadTimeReview = function(_self, record)
         local id = record.id
         retry_ids[#retry_ids + 1] = id
@@ -92,14 +95,31 @@ assert(view:getOfflineSyncStatusText() == "微信读书　待传 8 分钟 · 2 �
 view:showOfflineSyncStatus()
 assert(opened.title == "微信读书同步状态" and opened.body.text:find("480 秒", 1, true))
 assert(opened.body.text:find("待传划线和笔记：2 条", 1, true))
-assert(opened.buttons[1][1].text == "关闭"
-    and opened.buttons[1][2].text == "立即上传" and #opened.buttons == 1)
-opened.buttons[1][1].callback()
+assert(opened.buttons[1][1].text == "核对记录" and opened.buttons[2][1].text == "关闭"
+    and opened.buttons[2][2].text == "立即上传" and #opened.buttons == 2)
+opened.buttons[2][1].callback()
 assert(not opened and uploads == 0)
 view:showOfflineSyncStatus()
-assert(opened.buttons[1][2].enabled)
-opened.buttons[1][2].callback()
+assert(opened.buttons[2][2].enabled)
+opened.buttons[2][2].callback()
 assert(not opened and uploads == 1)
+
+status.pending_seconds, status.pending_progress, status.unlocated_annotations = 1930, 1, 2
+review_books = {{ title = "山谷来信", seconds = 1930, segments = 65, annotations = 2, progress = true,
+    issues = {{ count = 2, reason = "missing_source", document_path = "/books/one/offline.epub" }} }}
+view.library_db.lastManualSyncResult = function()
+    return { at = os.time(), reason = "authentication_required" }
+end
+view.library_db.readTimeReceipts = function() return { count = 2, last_time = os.time() } end
+view:showOfflineSyncStatus()
+assert(opened.body.text:find("最近一次时长回执", 1, true))
+assert(opened.body.text:find("上次手动同步", 1, true) and opened.body.text:find("登录凭据未获接受", 1, true))
+opened.buttons[1][1].callback()
+assert(opened.title == "待传记录明细" and opened.body.text:find("1930 秒，共 65 段", 1, true))
+assert(opened.body.text:find("山谷来信", 1, true) and opened.body.text:find("原文索引", 1, true)
+    and opened.body.text:find("offline.epub", 1, true) and not opened.body.text:find("/books", 1, true))
+assert(#opened.buttons[1] == 1, "pending or unlocated items must not offer discard or blind resend")
+opened.buttons[1][1].callback()
 
 status.pending_seconds, status.pending_annotations, status.pending_progress = 0, 0, 1
 assert(view:getOfflineSyncStatusText() == "微信读书　待传 1 本书的进度")
@@ -126,6 +146,8 @@ assert(view:getOfflineSyncStatusText() == "微信读书　有记录待核对")
 view:showOfflineSyncStatus()
 assert(opened.buttons[1][1].text == "核对记录" and #opened.buttons == 2)
 opened.buttons[1][1].callback()
+assert(opened.title == "待传记录明细")
+opened.buttons[1][2].callback()
 assert(opened.title == "阅读时长记录核对"
     and opened.body.text:find("书籍：山谷来信", 1, true)
     and opened.body.text:find("30 秒", 1, true))
@@ -138,6 +160,7 @@ assert(retry_ids[1] == 1 and uploads == 2,
     "explicit ambiguous retry did not schedule the selected record")
 view:showOfflineSyncStatus()
 opened.buttons[1][1].callback()
+opened.buttons[1][2].callback()
 opened.buttons[2][2].callback()
 assert(opened.text:find("不会上传", 1, true))
 opened.ok_callback()
@@ -147,6 +170,9 @@ view:showManualSyncResult("uploaded_with_review", status)
 assert(shown_message:find("新记录已上传", 1, true)
     and shown_message:find("待核对记录：3 条", 1, true),
     "mixed manual result hid confirmed or held work")
+status.newly_confirmed_seconds = 30
+view:showManualSyncResult("partial", status)
+assert(shown_message:find("已确认部分记录", 1, true) and shown_message:find("新确认时长　30 秒", 1, true))
 status.state, status.pending_seconds, status.pending_annotations = "review", 0, 0
 status.pending_progress, status.unknown_seconds, status.unknown_annotations = 0, 0, 0
 assert(view:getOfflineSyncStatusText() == "微信读书　有记录需处理")

@@ -7,6 +7,9 @@ end
 package.preload["weread.lib.protocol"] = function()
     return { is_mp_book = function() return false end }
 end
+package.preload["weread.lib.annotation_chapters"] = function()
+    return { recoverDescriptor = function() return nil, false end }
+end
 package.preload["ui/uimanager"] = function() return {} end
 package.preload["weread.lib.plugin_util"] = function()
     return {

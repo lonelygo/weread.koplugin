@@ -171,8 +171,11 @@ function Worker:_launch(request)
         return false, "low_memory"
     end
     collectgarbage("collect")
+    local minimum_kb = tonumber(request.options.min_available_kb)
+        or self.min_available_kb
+    minimum_kb = math.max(0, minimum_kb)
     local free_kb = self:availableMemoryKB()
-    if free_kb and free_kb < self.min_available_kb then
+    if free_kb and free_kb < minimum_kb then
         self:_complete(request, {
             ok = false, error = "low_memory", available_kb = free_kb,
         })

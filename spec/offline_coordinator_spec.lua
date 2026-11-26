@@ -1,20 +1,38 @@
 package.path = "./?.lua;" .. package.path
 
 local Sync = require("weread.lib.offline_sync")
+local WorkerSettings = require("weread.lib.worker_settings")
 local function fixture()
     local state = { account = "alice", online = true, queued = nil, time = 1, probes = 0,
         positions = 0, times = 0, annotations = 0, captures = 0, pending_positions = 0, notices = {} }
-    local prefs = { sync = { upload_annotations = true }, read_report = { enabled = true } }
+    local prefs = { sync = { upload_annotations = true }, read_report = { enabled = true },
+        cookies = { wr_skey = "old-cookie" }, wr_ticket = "old-ticket", wr_wrpa = "" }
     local tasks = {}
     local scheduler = {
         scheduleIn = function(_, delay, task) tasks[task] = delay end,
         unschedule = function(_, task) tasks[task] = nil end,
     }
-    local plugin = {
-        settings = { get = function(_, key, default)
+    local settings = {
+        get = function(_, key, default)
             if key == "account" then return { user_vid = state.account } end
             return prefs[key] or default
-        end },
+        end,
+        update_auth = function(_, credentials)
+            if type(credentials.cookies) == "table" then
+                prefs.cookies = credentials.cookies
+            end
+            if type(credentials.wr_ticket) == "string" then
+                prefs.wr_ticket = credentials.wr_ticket
+            end
+            if type(credentials.wr_wrpa) == "string" then
+                prefs.wr_wrpa = credentials.wr_wrpa
+            end
+            return true
+        end,
+        flush = function() end,
+    }
+    local plugin = {
+        settings = settings,
         library_db = {
             data_dir = "coordinator-spec",
             accountKey = function() return state.account end,
@@ -24,6 +42,10 @@ local function fixture()
             end,
             pendingOfflineBook = function(_, with_time, with_annotations)
                 if with_time or with_annotations then return state.queued end
+            end,
+            deferPendingReadTimeForBook = function(_, book, delay)
+                state.deferred_book, state.deferred_delay = book, delay
+                return true, 1
             end,
         },
         isNetworkConnected = function() return state.online end,
@@ -38,7 +60,8 @@ local function fixture()
             reconcile_pending = function(_, done, options)
                 state.positions = state.positions + 1
                 state.options = options
-                if state.hold then state.finish = done else done({ status = "idle" }) end
+                if state.hold then state.finish = done
+                else done(state.progress_result or { status = "idle" }) end
             end,
         },
         read_report = { drain = function() state.times = state.times + 1; return state.scheduled end,
@@ -46,9 +69,24 @@ local function fixture()
         _offlineAnnotationCoordinator = function()
             return { drain = function() state.annotations = state.annotations + 1 end }
         end,
-        client = { probe_sync = function(_, book)
+        client = { settings = settings, probe_sync = function(_, book)
             assert(book == state.probe_book)
-            return true
+            state.probe_calls = (state.probe_calls or 0) + 1
+            return state.probe_ok ~= false, state.probe_reason or "verified",
+                state.probe_code
+        end, renew_probe_sync = function()
+            state.renew_calls = (state.renew_calls or 0) + 1
+            if state.renew_ok == false then
+                return false, "authentication_required", {
+                    renew_attempted = true, auth_renewed = false,
+                }
+            end
+            state.probe_calls = (state.probe_calls or 0) + 1
+            return state.renew_verify_ok ~= false,
+                state.renew_verify_reason or "verified", {
+                    renew_attempted = true, auth_renewed = true,
+                    auth_code = state.renew_verify_code,
+                }
         end },
     }
     local worker = {
@@ -56,6 +94,9 @@ local function fixture()
         start = function(_, job)
             state.probes = state.probes + 1
             state.job = job
+            if state.worker_failure then
+                return false, state.worker_failure
+            end
             return true
         end,
     }
@@ -85,9 +126,12 @@ state.online = true
 sync.heartbeat()
 sync:request("network_connected")
 run()
-assert(state.probes == 1 and state.job.task({ checkCancelled = function() end }))
+local first_probe = state.job.task({ checkCancelled = function() end })
+assert(state.probes == 1 and first_probe.ok)
 assert(not sync:gate("weread_read_write", { operation = "progress" }))
-state.job.on_done({ ok = true, value = false })
+state.job.on_done({ ok = true, value = {
+    ok = false, reason = "response_unrecognized",
+} })
 sync:request("read_time_captured")
 run()
 assert(state.probes == 1 and state.times == 0, "failed probe must not claim an item or spin")
@@ -255,6 +299,204 @@ reader_state.account = "separate-login"
 assert(not feedback:startManual(), "a Home tap cannot start work on behalf of a different login")
 reader:deactivate()
 feedback:deactivate()
+
+local reasoned, reason_state, _, reason_step = fixture()
+reasoned:activate()
+reason_step()
+reason_state.queued, reason_state.probe_book = "book", "book"
+reason_state.probe_ok = false
+reason_state.probe_reason = "authentication_required"
+reason_state.probe_code = -2010
+reasoned:startManual()
+reason_step()
+local reason_result = reason_state.job.task({ checkCancelled = function() end })
+reason_state.job.on_done({ ok = true, value = reason_result })
+assert(table.concat(reason_state.notices, ",") == "started,authentication_required",
+    "the manual result hid a definite login failure")
+assert(not reason_state.renew_calls,
+    "the user-missing response attempted an unsafe cookie renewal")
+reasoned:deactivate()
+
+local renewable, renewable_state, _, renewable_step = fixture()
+renewable:activate()
+renewable_step()
+renewable_state.queued, renewable_state.probe_book = "book", "book"
+renewable_state.probe_ok = false
+renewable_state.probe_reason = "authentication_required"
+renewable_state.probe_code = -2012
+renewable:request("network_connected")
+renewable_step()
+assert(renewable_state.job.timeout == 24,
+    "the probe timeout cannot fit GET, renewal and verification GET")
+local renewed_result = renewable_state.job.task({ checkCancelled = function() end })
+assert(renewed_result.ok and renewed_result.renew_attempted
+    and renewed_result.auth_renewed and renewable_state.renew_calls == 1
+    and renewable_state.probe_calls == 2,
+    "a confirmed -2012 renewal skipped the fresh read-only probe")
+renewable_state.job.on_done({ ok = true, value = renewed_result })
+renewable_step()
+assert(renewable:_verified(renewable_state.account)
+    and renewable_state.times == 1,
+    "the freshly verified renewal did not release the queue")
+renewable:deactivate()
+
+local merged, merged_state, _, merged_step, merged_prefs = fixture()
+merged:activate()
+merged_step()
+merged_state.queued, merged_state.probe_book = "book", "book"
+merged:request("network_connected")
+merged_step()
+merged_state.job.on_done({ ok = true, value = {
+    ok = true, reason = "verified", renew_attempted = true,
+    auth_renewed = true, auth = {
+        cookies = { wr_skey = "renewed-cookie" },
+        wr_ticket = "renewed-ticket", wr_wrpa = "",
+    },
+} })
+assert(merged:_verified(merged_state.account)
+    and merged_prefs.cookies.wr_skey == "renewed-cookie"
+    and merged_prefs.wr_ticket == "renewed-ticket",
+    "the parent did not merge renewed credentials after verification")
+merged:deactivate()
+
+local guarded, guarded_state, _, guarded_step, guarded_prefs = fixture()
+guarded:activate()
+guarded_step()
+guarded_state.queued, guarded_state.probe_book = "book", "book"
+guarded:request("network_connected")
+guarded_step()
+guarded_prefs.cookies = { wr_skey = "manual-cookie" }
+guarded_state.job.on_done({ ok = true, value = {
+    ok = true, reason = "verified", renew_attempted = true,
+    auth_renewed = true, auth = {
+        cookies = { wr_skey = "stale-worker-cookie" },
+        wr_ticket = "stale-worker-ticket", wr_wrpa = "",
+    },
+} })
+assert(not guarded:_verified(guarded_state.account)
+    and guarded_prefs.cookies.wr_skey == "manual-cookie"
+    and guarded:_probeRenewalAllowed(guarded_state.account,
+        WorkerSettings.fingerprint(guarded.plugin.settings)),
+    "a stale worker overwrote newer parent credentials")
+guarded:deactivate()
+
+local renewal_rejected, rejected_state, _, rejected_step = fixture()
+rejected_state.account = "expired-login"
+renewal_rejected:activate()
+rejected_step()
+rejected_state.queued, rejected_state.probe_book = "book", "book"
+rejected_state.probe_ok = false
+rejected_state.probe_reason = "authentication_required"
+rejected_state.probe_code = -2012
+rejected_state.renew_ok = false
+renewal_rejected:startManual()
+rejected_step()
+local rejected_result = rejected_state.job.task({ checkCancelled = function() end })
+rejected_state.job.on_done({ ok = true, value = rejected_result })
+assert(table.concat(rejected_state.notices, ",") == "started,authentication_required"
+    and rejected_state.renew_calls == 1,
+    "a rejected renewal did not request a fresh login")
+renewal_rejected:heartbeat()
+rejected_step()
+local cooled_result = rejected_state.job.task({ checkCancelled = function() end })
+assert(not cooled_result.ok and rejected_state.renew_calls == 1,
+    "the next heartbeat repeated a rate-limited renewal")
+renewal_rejected:deactivate()
+local other_surface, other_state = fixture()
+other_state.account = rejected_state.account
+assert(not other_surface:_probeRenewalAllowed(other_state.account,
+    WorkerSettings.fingerprint(other_surface.plugin.settings)),
+    "moving from Home to the reader bypassed the renewal cooldown")
+
+local busy_probe, busy_state, _, busy_step = fixture()
+busy_probe:activate()
+busy_step()
+busy_state.queued, busy_state.probe_book = "book", "book"
+busy_state.probe_ok = false
+busy_state.probe_reason = "service_busy"
+busy_probe:request("network_connected")
+busy_step()
+local busy_result = busy_state.job.task({ checkCancelled = function() end })
+assert(not busy_result.ok and not busy_state.renew_calls,
+    "a non-authentication probe failure attempted cookie renewal")
+busy_probe:deactivate()
+
+local timed_out, timeout_state, _, timeout_step = fixture()
+timed_out:activate()
+timeout_step()
+timeout_state.queued, timeout_state.probe_book = "book", "book"
+timeout_state.probe_ok = false
+timeout_state.probe_reason = "authentication_required"
+timeout_state.probe_code = -2012
+timed_out:startManual()
+timeout_step()
+timeout_state.job.on_done({ ok = false, error = "worker_timeout" })
+assert(timeout_state.probe_calls == 1 and not timeout_state.renew_calls
+    and table.concat(timeout_state.notices, ",")
+        == "started,authentication_required",
+    "a timeout fallback repeated a possibly in-flight renewal")
+timed_out:deactivate()
+
+local stale_probe, stale_state, _, stale_step = fixture()
+stale_probe:activate()
+stale_step()
+stale_state.queued, stale_state.probe_book = "old-book", "old-book"
+stale_probe:startManual()
+stale_step()
+stale_state.account = "new-account"
+stale_state.job.on_done({ ok = false, error = "low_memory" })
+assert(not stale_state.probe_calls and not stale_state.renew_calls,
+    "a stale worker callback probed or renewed the replacement account")
+stale_probe:deactivate()
+
+local low_memory, low_state, _, low_step = fixture()
+low_memory:activate()
+low_step()
+low_state.queued, low_state.probe_book = "book", "book"
+low_state.worker_failure = "low_memory"
+low_state.probe_ok = false
+low_state.probe_reason = "authentication_required"
+low_state.probe_code = -2012
+low_memory:startManual()
+low_step()
+assert(low_memory:_verified(low_state.account),
+    "an explicit tap did not use its one bounded low-memory fallback")
+low_step()
+assert(low_state.times == 1,
+    "the verified fallback did not reach the historical writer")
+assert(low_state.probe_calls == 2 and low_state.renew_calls == 1,
+    "the never-started low-memory worker did not safely renew then re-probe")
+low_memory:deactivate()
+
+local isolated, isolated_state, isolated_tasks, isolated_step = fixture()
+isolated:activate()
+isolated_step()
+isolated_state.queued, isolated_state.probe_book = "bad-book", "bad-book"
+isolated_state.progress_result = {
+    status = "error", book_id = "bad-book", error = "catalog_unavailable",
+}
+isolated:request("network_connected")
+isolated_step()
+isolated_state.job.on_done({
+    ok = true, value = { ok = true, reason = "verified" },
+})
+isolated_step()
+assert(isolated:_verified(isolated_state.account)
+    and isolated_state.deferred_book == "bad-book"
+    and isolated_state.deferred_delay == 15
+    and isolated_tasks[isolated.book_retry] == 15,
+    "a book-specific progress error revoked the account-wide service probe")
+assert(isolated_state.annotations == 1,
+    "safe annotation work was blocked by an unrelated progress failure")
+isolated_state.queued = "next-book"
+isolated_state.progress_result = { status = "idle" }
+isolated_step()
+assert(isolated_state.times == 1 and isolated_state.probes == 1,
+    "one book's progress failure blocked a later book's reading time")
+assert(isolated_tasks[isolated.book_retry] == 15,
+    "the immediate pass consumed the failed book's delayed retry")
+isolated:deactivate()
+
 -- A connected reader uses the normal reporting interval even when an old
 -- ambiguous write is awaiting review and progress polling cannot run.
 local live, l, _, live_run = fixture()
