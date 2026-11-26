@@ -3,14 +3,17 @@
 import base64
 from http.client import RemoteDisconnected
 import json
+from pathlib import Path
+import tempfile
 import threading
 import time
 import unittest
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
+import zipfile
 
 from fetch_weread_epub import decode_content_shards, decode_style_shard, weread_e
-from mock_weread import BOOK_ID, CHAPTERS, MockServer, annotation, chapter_html, shards
+from mock_weread import BOOK_ID, CHAPTERS, MockServer, annotation, chapter_html, prepare, shards
 
 
 class MockTests(unittest.TestCase):
@@ -45,10 +48,32 @@ class MockTests(unittest.TestCase):
         return self.request("/api/agent/gateway", dict(api_name=api, **params))
 
     def setUp(self):
-        self.request("/__control", dict(delay=0, match="", status=503, times=0,
+        self.request("/__control", dict(delay=0, match="", status=503, times=0, drop=False,
                                         empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1,
                                         progress_reply="ok", renew_reply="ok", retry_after=0,
                                         read_replies=[]))
+
+    def test_prepare_can_install_an_exact_candidate_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            (runtime / "luajit").write_text("runtime")
+            (runtime / "reader.lua").write_text("runtime")
+            archive = root / "official.zip"
+            with zipfile.ZipFile(archive, "w") as package:
+                package.writestr("weread.koplugin/_meta.lua", 'return { version = "baseline" }\n')
+            expected = archive.read_bytes()
+            run_dir = root / "run"
+
+            launcher = prepare(run_dir, runtime, 12345, archive)
+
+            self.assertEqual((run_dir / "candidate.zip").read_bytes(), expected)
+            self.assertEqual(
+                (run_dir / "profile/plugins/weread.koplugin/_meta.lua").read_text(),
+                'return { version = "baseline" }\n')
+            self.assertEqual(launcher, run_dir / "launch.command")
+            self.assertIn("port = 12345", (run_dir / "profile/settings/weread-environment.lua").read_text())
 
     def test_contract_and_real_reference_decoder(self):
         status, shelf = self.gateway("/shelf/sync")
@@ -121,6 +146,19 @@ class MockTests(unittest.TestCase):
         self.request("/__control", dict(match="/web/book/getProgress", times=1, status=503))
         self.assertEqual(self.request("/web/book/getProgress?bookId=" + BOOK_ID)[0], 503)
         after = self.request("/__state")[1]
+        for key in ("progress", "read_reports", "annotation_writes", "bookmarks", "private_reviews"):
+            self.assertEqual(after[key], before[key])
+
+    def test_readonly_progress_probe_can_drop_transport_without_mutation(self):
+        before = self.request("/__state")[1]
+        self.request("/__control", dict(
+            match="/web/book/getProgress", times=-1, drop=True))
+        with self.assertRaises(RemoteDisconnected):
+            self.request("/web/book/getProgress?bookId=" + BOOK_ID)
+        after = self.request("/__state")[1]
+        event = next(event for event in reversed(after["requests"])
+                     if event["path"] == "/web/book/getProgress")
+        self.assertEqual(event["status"], 599)
         for key in ("progress", "read_reports", "annotation_writes", "bookmarks", "private_reviews"):
             self.assertEqual(after[key], before[key])
 
@@ -257,6 +295,7 @@ class MockTests(unittest.TestCase):
         self.assertEqual(self.request("/__control", dict(times="forever"))[0], 400)
         self.assertEqual(self.request("/__control", dict(progress_reply="unknown"))[0], 400)
         self.assertEqual(self.request("/__control", dict(renew_reply="unknown"))[0], 400)
+        self.assertEqual(self.request("/__control", dict(drop="yes"))[0], 400)
         self.assertEqual(self.request("/__control", dict(unknown=True))[0], 400)
         self.assertEqual(self.request("/web/book/chapter/e_0", dict(b="unknown", c="bad"))[0], 400)
         self.assertEqual(self.request("/__control", [1, 2])[0], 400)

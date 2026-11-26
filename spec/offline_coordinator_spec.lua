@@ -59,6 +59,11 @@ local function fixture()
             end,
         },
         isNetworkConnected = function() return state.online end,
+        -- KOReader may briefly keep reporting no interface address after the
+        -- radio has associated. The coordinator treats this as an advisory
+        -- hint and may perform one bounded WeRead probe on an explicit tap or
+        -- scheduled reconnect check. `nil` models ports without this signal.
+        isWifiEnabledForSync = function() return state.wifi_enabled end,
         showManualSyncResult = function(_, code) table.insert(state.notices, code) end,
         progress_sync = {
             capture_for_reconnect = function() state.captures = state.captures + 1 end,
@@ -621,6 +626,252 @@ assert(isolated_tasks[isolated.book_retry] == 15,
     "the immediate pass consumed the failed book's delayed retry")
 isolated:deactivate()
 
+-- KOReader's local link flag is advisory for WeRead sync. An explicit tap
+-- must ask WeRead directly, and a confirmed WeRead response authorizes only
+-- this active account/profile for a short bounded interval.
+local stale_link, stale_link_state, _, stale_link_step = fixture()
+stale_link_state.online = false
+stale_link_state.wifi_enabled = true
+stale_link_state.queued, stale_link_state.probe_book = "book", "book"
+stale_link:activate()
+stale_link_step()
+assert(stale_link_state.probes == 0,
+    "startup trusted a stale local link flag and polled WeRead")
+assert(stale_link:startManual(),
+    "an explicit upload was rejected by the stale local link flag")
+stale_link_step()
+assert(stale_link_state.probes == 1,
+    "an explicit upload did not perform one bounded WeRead probe")
+stale_link_state.job.on_done({ ok = true, value = {
+    ok = true, reason = "verified",
+} })
+assert(stale_link:_verified(stale_link_state.account)
+    and stale_link:isConnected(),
+    "a verified WeRead response did not override the stale local hint")
+stale_link_step()
+assert(stale_link_state.positions == 1 and stale_link_state.times == 1
+    and stale_link_state.annotations == 1,
+    "verified WeRead access did not release progress, time and annotations")
+
+local verified_until = stale_link.verified_until
+stale_link_state.time = verified_until
+assert(not stale_link:isConnected(),
+    "verified WeRead reachability survived its bounded TTL")
+stale_link_state.time = verified_until - 1
+assert(stale_link:isConnected(), "the WeRead reachability TTL expired early")
+stale_link:disconnected()
+assert(not stale_link:isConnected(),
+    "an explicit disconnect retained verified WeRead reachability")
+stale_link:deactivate()
+
+-- A FileManager/Home tap is forwarded to the active reader under the same
+-- account and storage profile, even while KOReader's local link hint is false.
+local stale_reader, stale_reader_state, _, stale_reader_step = fixture()
+stale_reader_state.online = false
+stale_reader_state.wifi_enabled = true
+stale_reader_state.queued, stale_reader_state.probe_book = "reader-book", "reader-book"
+stale_reader.plugin.ui = { document = { file = "reader.epub" } }
+stale_reader:activate()
+stale_reader_step()
+local stale_home, stale_home_state = fixture()
+stale_home_state.online = false
+stale_home_state.account = stale_reader_state.account
+assert(stale_home:startManual(),
+    "the Home upload tap did not reach the active reader under a stale link hint")
+stale_reader_step()
+assert(stale_reader_state.probes == 1,
+    "the forwarded Home tap did not perform one WeRead probe")
+stale_reader_state.job.on_done({ ok = true, value = true })
+assert(stale_reader:isConnected(),
+    "the reader did not retain its confirmed WeRead reachability")
+stale_reader_step()
+stale_reader:pause()
+assert(not stale_reader:isConnected(),
+    "suspend retained confirmed WeRead reachability")
+stale_reader:deactivate()
+
+-- A real service response must win over KOReader's stale local flag when
+-- reporting the reason. Failed probes never authorize a queued mutation.
+local stale_service, stale_service_state, _, stale_service_step = fixture()
+stale_service_state.online = false
+stale_service_state.wifi_enabled = true
+stale_service_state.queued, stale_service_state.probe_book = "book", "book"
+stale_service:activate()
+stale_service_step()
+stale_service:startManual()
+stale_service_step()
+stale_service_state.job.on_done({ ok = true, value = {
+    ok = false, reason = "service_busy",
+} })
+assert(table.concat(stale_service_state.notices, ",")
+        == "started,service_busy"
+    and stale_service_state.positions == 0
+    and stale_service_state.times == 0
+    and stale_service_state.annotations == 0,
+    "the stale link hint hid a definite WeRead service response")
+stale_service:deactivate()
+
+local stale_transport, stale_transport_state, _, stale_transport_step = fixture()
+stale_transport_state.online = false
+stale_transport_state.wifi_enabled = true
+stale_transport_state.queued, stale_transport_state.probe_book = "book", "book"
+stale_transport:activate()
+stale_transport_step()
+stale_transport:startManual()
+stale_transport_step()
+stale_transport_state.job.on_done({ ok = true, value = {
+    ok = false, reason = "service_unreachable",
+} })
+assert(table.concat(stale_transport_state.notices, ",")
+        == "started,service_unreachable",
+    "a failed WeRead transport was mislabeled as a definite local disconnect")
+stale_transport:deactivate()
+
+-- Passive record capture never polls. A scheduled heartbeat or explicit
+-- NetworkConnected event may perform one read-only check when the Wi-Fi radio
+-- is known to be enabled, while a disabled radio remains completely quiet.
+local passive, passive_state, _, passive_step = fixture()
+passive_state.online = false
+passive_state.wifi_enabled = false
+passive_state.queued, passive_state.probe_book = "book", "book"
+passive:activate()
+passive_step()
+passive:request("read_time_captured")
+passive_step()
+assert(passive_state.probes == 0,
+    "capturing an offline record polled the network")
+passive.heartbeat()
+passive_step()
+assert(passive_state.probes == 0,
+    "a heartbeat polled WeRead while Wi-Fi was explicitly disabled")
+passive_state.wifi_enabled = true
+passive.heartbeat()
+passive_step()
+assert(passive_state.probes == 1,
+    "a scheduled check did not probe once while Wi-Fi was enabled")
+passive_state.job.on_done({ ok = true, value = {
+    ok = false, reason = "service_unreachable",
+} })
+passive:request("read_time_captured")
+passive_step()
+assert(passive_state.probes == 1,
+    "ordinary queue activity retried a failed passive probe")
+passive:request("network_connected")
+passive_step()
+assert(passive_state.probes == 2,
+    "an explicit reconnect event did not permit one fresh probe")
+passive_state.job.on_done({ ok = true, value = {
+    ok = false, reason = "service_unreachable",
+} })
+passive:deactivate()
+
+-- Unlocated rows are absent from the uploadable queue. An open book with
+-- missing source text still supplies a target for the heartbeat's probe.
+local repair_sync, repair_state, _, repair_step = fixture()
+repair_state.online, repair_state.wifi_enabled = false, true
+repair_state.probe_book = "open-book"
+repair_sync.plugin.offline_annotations = { pendingSourceBook = function() return "open-book" end }
+repair_sync:activate()
+repair_step()
+repair_sync.heartbeat()
+repair_step()
+local repair_probe = repair_state.job.task({ checkCancelled = function() end })
+repair_state.job.on_done({ ok = true, value = repair_probe })
+repair_step()
+assert(repair_state.probe_calls == 1 and repair_state.annotations == 1 and repair_state.times == 0,
+    "a reachable service did not wake source repair for the open book")
+repair_sync:deactivate()
+
+-- A newer eligible connectivity signal is not lost behind an in-flight
+-- failed probe. It permits one fresh read-only check; later queue captures do
+-- not keep retrying that failure.
+local signaled, signaled_state, _, signaled_step = fixture()
+signaled_state.online = false
+signaled_state.wifi_enabled = true
+signaled_state.queued, signaled_state.probe_book = "book", "book"
+signaled:activate()
+signaled_step()
+signaled.heartbeat()
+signaled_step()
+assert(signaled_state.probes == 1)
+local first_signaled_job = signaled_state.job
+signaled:request("network_connected")
+signaled:request("read_time_captured")
+first_signaled_job.on_done({ ok = true, value = {
+    ok = false, reason = "service_unreachable",
+} })
+signaled_step()
+assert(signaled_state.probes == 2,
+    "a newer reconnect signal was lost behind the failed probe")
+signaled_state.job.on_done({ ok = true, value = {
+    ok = false, reason = "service_unreachable",
+} })
+signaled:request("read_time_captured")
+signaled_step()
+assert(signaled_state.probes == 2,
+    "ordinary queue capture repeatedly retried a failed probe")
+signaled:deactivate()
+
+-- A receipt owned by the old UI may tell the replacement UI to recheck the
+-- service, but it cannot directly grant that replacement permission to write.
+local old_surface, _, _, old_surface_step = fixture()
+old_surface:activate()
+old_surface_step()
+local old_allowed, old_ack = old_surface:gate(
+    "weread_read_write", { operation = "live_reading_time", book_id = "book" })
+assert(old_allowed)
+local new_surface, new_surface_state, _, new_surface_step = fixture()
+new_surface_state.online = false
+new_surface_state.wifi_enabled = true
+new_surface_state.queued, new_surface_state.probe_book = "book", "book"
+new_surface:activate()
+new_surface_step()
+old_ack({ accepted = true })
+assert(not new_surface:isConnected(),
+    "an old surface receipt directly authorized its replacement")
+new_surface_step()
+assert(new_surface_state.probes == 1
+    and not new_surface:gate("annotation_write", { operation = "annotation" }),
+    "the replacement surface did not start exactly one fresh read-only probe")
+new_surface_state.job.on_done({ ok = true, value = true })
+assert(new_surface:isConnected(),
+    "the replacement surface ignored its own verified WeRead response")
+new_surface:deactivate()
+
+-- Reachability is scoped to the active account, profile and generation. A
+-- late successful write may settle its own row but must not reopen a session
+-- after disconnect, suspend or a profile switch.
+local scoped, scoped_state, _, scoped_step = fixture()
+scoped_state.online = false
+scoped_state.wifi_enabled = true
+scoped_state.queued, scoped_state.probe_book = "book", "book"
+scoped:activate()
+scoped_step()
+scoped:startManual()
+scoped_step()
+scoped_state.job.on_done({ ok = true, value = true })
+scoped_step()
+local scoped_allowed, scoped_release = scoped:gate(
+    "weread_read_write", { operation = "reading_time", book_id = "book" })
+assert(scoped_allowed)
+scoped:disconnected()
+scoped_release({ accepted = true })
+assert(not scoped:isConnected(),
+    "a late write receipt reauthorized a disconnected generation")
+
+scoped:request("network_connected")
+scoped_step()
+scoped_state.job.on_done({ ok = true, value = true })
+assert(scoped:isConnected())
+scoped_state.account = "other-account"
+assert(not scoped:isConnected(),
+    "verified reachability leaked to another account")
+scoped_state.account = "alice"
+scoped.plugin.library_db.data_dir = "other-profile"
+assert(not scoped:isConnected(),
+    "verified reachability leaked to another storage profile")
+scoped:deactivate()
+
 -- A connected reader uses the normal reporting interval even when an old
 -- ambiguous write is awaiting review and progress polling cannot run.
 local live, l, _, live_run = fixture()
@@ -651,6 +902,7 @@ l.job.on_done({ ok = true, value = true })
 l.conflict = "here"
 assert(not live:gate("weread_read_write", live_ctx), "respect in-book progress choices")
 l.conflict, l.online = nil, false
+live:disconnected()
 assert(not live:gate("weread_read_write", live_ctx), "a disconnected reader must buffer locally")
 assert(not live:gate("annotation_write", {operation = "live_annotation"}))
 live:deactivate()

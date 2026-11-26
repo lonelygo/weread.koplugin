@@ -229,6 +229,7 @@ annotations[2] = { id = "repair-reconnect", page = "p11", text = "reconnect", dr
 assert(coordinator:capture("book", "/book.epub", annotations, { annotations[2] }))
 assert(not active and coordinator.source_repair_pending,
     "offline source repair unexpectedly launched a network task")
+assert(coordinator:pendingSourceBook() == "book", "the service probe needs the open source book")
 online = true
 local reconnect_started = coordinator:on_network_connected()
 assert(reconnect_started and active,
@@ -255,6 +256,7 @@ assert(coordinator:capture("book", "/book.epub", annotations, { annotations[2] }
 local low_memory_repair = assert(coordinator.source_repair_pending)
 assert(low_memory_calls == 1 and low_memory_repair.next_attempt_at == clock + 120,
     "low-memory source repair did not apply its bounded backoff")
+assert(not coordinator:pendingSourceBook(), "a delayed source repair must not cause a service probe")
 assert(coordinator.source_retry_task and not coordinator.retry_task,
     "source repair reused the upload retry timer instead of its bounded backoff")
 for _ = 1, 10 do coordinator:_start_source_repair() end

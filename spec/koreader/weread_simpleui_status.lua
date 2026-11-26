@@ -61,8 +61,10 @@ require("gettext").changeLang("zh_CN")
 
 local NetworkMgr = require("ui/network/manager")
 local connected = false
+local radio_on = true
 local wifi_wake_calls = 0
 NetworkMgr.isConnected = function() return connected end
+NetworkMgr.isWifiOn = function() return radio_on end
 for _, name in ipairs({ "turnOnWifi", "enableWifi", "restoreWifiAsync",
         "turnOnWifiAndWaitForConnection", "promptWifiOn" }) do
     NetworkMgr[name] = function()
@@ -286,10 +288,13 @@ local function dismiss_result()
     tap(math.floor(screen_width / 2), math.floor(screen_height / 2))
     wait_for("dismiss result to Home", back_on_home)
 end
-local function set_service_failure(times)
+local function set_service_failure(times, drop)
     local http = require("socket.http")
     local ltn12 = require("ltn12")
-    local body = json.encode{ status = 503, times = times }
+    local body = json.encode{
+        status = 503, times = times, drop = drop == true,
+        match = times == 0 and "" or "/web/book/getProgress",
+    }
     local _, code = http.request{
         url = plugin.settings.mock_endpoint .. "/__control", method = "POST",
         headers = { ["Content-Type"] = "application/json", ["Content-Length"] = tostring(#body) },
@@ -300,22 +305,27 @@ end
 local function menu_sync() plugin:getOfflineSyncMenuItems()[1].callback() end
 local confirmed_text = "同步完成，微信读书已确认收到全部待传记录。"
 
+-- A real transport failure is not inferred from KOReader's stale link flag:
+-- the explicit tap performs a bounded WeRead GET, receives no HTTP response,
+-- and keeps every durable row for a later retry.
+set_service_failure(-1, true)
 tap_action(open_details(), "upload")
-wait_result("offline feedback", "当前未联网")
+local unreachable = wait_result("transport failure from Home", "连接微信读书超时或失败")
+assert(unreachable.text:find("50 秒", 1, true) and unreachable.text:find("2 条", 1, true))
 dismiss_result()
 assert(SyncStatus.get(plugin).pending_seconds == 50 and SyncStatus.get(plugin).pending_annotations == 2)
 assert(wifi_wake_calls == 0, "offline upload woke Wi-Fi")
 
--- A saved Wi-Fi link can be up while the service returns HTTP 503.
-connected = true
-set_service_failure(-1)
+-- Wi-Fi remains enabled while KOReader still reports no link. A manual tap
+-- must nevertheless reach the service and preserve its faithful HTTP reason.
+set_service_failure(-1, false)
 menu_sync()
 local failed = wait_result("service failure from settings", "微信读书暂时无法处理请求或正在限流")
 assert(failed.text:find("50 秒", 1, true) and failed.text:find("2 条", 1, true))
 screen_shot("08-service-failure")
 dismiss_result()
 assert(SyncStatus.get(plugin).pending_seconds == 50 and SyncStatus.get(plugin).pending_annotations == 2)
-set_service_failure(0)
+set_service_failure(0, false)
 
 dialog = open_details()
 -- No network event. The tap must retry on its own and wait for both time slices.
@@ -418,6 +428,8 @@ assert(wifi_wake_calls == 0, "Home interactions woke Wi-Fi")
 local evidence = {
     empty = "暂无待传记录",
     pending = "待传 50 秒 · 2 条标注",
+    transport_failure = unreachable.text,
+    stale_link_service_failure = failed.text,
     synced_at = acknowledged.last_confirmed_at,
     progress = "待传 1 本书的进度",
     conflict = "1 本书需选择进度",

@@ -161,6 +161,13 @@ expect(not host:onWeReadSyncProgress(),
 expect(notices[1] and notices[1][2] == 1,
     "standalone sync gesture explains missing WeRead context")
 
+local requested_book
+host.detectWeReadBook = function() return "book" end
+host.isNetworkConnected = function() return false end
+host.syncOfflineNow = function(_, book_id) requested_book = book_id; return true end
+expect(host:onWeReadSyncProgress() and requested_book == "book",
+    "the reader progress gesture forwards the open book to the manual upload entry")
+
 print(string.format(
     "prefetch_lifecycle_spec: %d checks, %d failure(s)", checks, failures))
 os.exit(failures == 0 and 0 or 1)

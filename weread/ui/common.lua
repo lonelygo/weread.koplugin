@@ -117,6 +117,15 @@ function M:isNetworkConnected()
     return connected == true
 end
 
+-- A heartbeat may try WeRead on an enabled radio even when KOReader cannot
+-- see an interface address. Reading this flag never initiates a Wi-Fi action.
+function M:isWifiEnabledForSync()
+    local ok, manager = pcall(require, "ui/network/manager")
+    if not ok or not manager or type(manager.isWifiOn) ~= "function" then return false end
+    local checked, enabled = pcall(manager.isWifiOn, manager)
+    return checked and enabled == true
+end
+
 function M:showOffline(label)
     self:closeBusy()
     logger.warn("network unavailable:", label)
@@ -124,10 +133,7 @@ function M:showOffline(label)
 end
 
 function M:runOnlineTask(label, callback, delay, options)
-    -- Progress reads and writes check WeRead itself. KOReader's independent
-    -- Internet test resolves a Microsoft hostname which may be unavailable
-    -- even while the Kindle has a route to WeRead.
-    local check = options and options.check_link_only and self.isNetworkConnected or self.isNetworkOnline
+    local check = options and options.is_connected or self.isNetworkOnline
     if not check(self) then
         if not (options and options.silent_offline) then
             self:showOffline(label)

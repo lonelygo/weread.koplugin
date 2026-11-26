@@ -227,9 +227,9 @@ function M:getCurrentBookMenuItems(book_id)
     return items
 end
 
-function M:syncOfflineNow()
+function M:syncOfflineNow(book_id)
     if not self:requireLogin(true, false) then return false end
-    local book_id = self:detectWeReadBook()
+    book_id = book_id or self:detectWeReadBook()
     if book_id and WeRead.is_mp_book(book_id) then book_id = nil end
     local started = self.offline_sync:startManual(book_id and tostring(book_id))
     if not started then self:showInfo(_("Sync is unavailable. Reopen sync status and try again.")) end

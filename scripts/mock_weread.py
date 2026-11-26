@@ -116,7 +116,7 @@ class MockServer(ThreadingHTTPServer):
         self.next_request_id = 1
         self.active_read_writes = 0
         self.max_read_write_concurrency = 0
-        self.control = dict(delay=0, match="", status=503, times=0,
+        self.control = dict(delay=0, match="", status=503, times=0, drop=False,
                             empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1,
                             progress_reply="ok", renew_reply="ok", retry_after=0,
                             read_replies=[])
@@ -170,6 +170,8 @@ class MockServer(ThreadingHTTPServer):
         if matches:
             time.sleep(control["delay"])
         if fail:
+            if control["drop"]:
+                return 599, DROP_RESPONSE
             headers = {}
             if control["status"] == 429 and control["retry_after"] > 0:
                 headers["Retry-After"] = str(control["retry_after"])
@@ -434,7 +436,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("retry_after must be 0..60 seconds")
             if not isinstance(candidate["match"], str):
                 raise ValueError("match must be a string")
-            for key in ("empty_shelf", "empty_annotations"):
+            for key in ("drop", "empty_shelf", "empty_annotations"):
                 if type(candidate[key]) is not bool:
                     raise ValueError(key + " must be boolean")
             if not isinstance(candidate["read_replies"], list) or len(candidate["read_replies"]) > 20:
@@ -444,7 +446,7 @@ class Handler(BaseHTTPRequestHandler):
             self.server.control = dict(candidate, read_replies=list(candidate["read_replies"]))
 
 
-def prepare(run_dir, runtime, port):
+def prepare(run_dir, runtime, port, candidate_zip=None):
     """Fresh directory only: never read or overwrite the user's KOReader profile."""
     if not (runtime / "luajit").is_file() or not (runtime / "reader.lua").is_file():
         raise ValueError("--koreader must point to the built runtime containing luajit and reader.lua")
@@ -457,7 +459,13 @@ def prepare(run_dir, runtime, port):
     (run_dir / "books").mkdir()
     (run_dir / "evidence").mkdir()
     archive = run_dir / "candidate.zip"
-    subprocess.run(["bash", str(REPO / "scripts/package_release.sh"), str(archive)], check=True)
+    if candidate_zip:
+        candidate_zip = candidate_zip.resolve()
+        if not candidate_zip.is_file():
+            raise ValueError("--candidate-zip must name an existing ZIP file")
+        shutil.copyfile(candidate_zip, archive)
+    else:
+        subprocess.run(["bash", str(REPO / "scripts/package_release.sh"), str(archive)], check=True)
     with zipfile.ZipFile(archive) as package:
         package.extractall(profile / "plugins")
     (run_dir / "evidence/package.sha256").write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "  candidate.zip\n")
@@ -492,6 +500,8 @@ def main():
     parser.add_argument("--bind", default="127.0.0.1", help="listen address; use 0.0.0.0 for Kindle on the same LAN")
     parser.add_argument("--run-dir", type=Path, help="create a NEW isolated candidate installation")
     parser.add_argument("--koreader", type=Path, help="built KOReader runtime directory (not source root)")
+    parser.add_argument("--candidate-zip", type=Path,
+                        help="optional packaged plugin to test instead of packaging the worktree")
     parser.add_argument("--log", type=Path, help="JSONL request log, without headers or private data")
     parser.add_argument("--smoke", action="store_true", help="run real KOReader offscreen smoke, save evidence, then exit")
     parser.add_argument("--scenario", choices=("basic", "covers", "delivery", "menu", "pending", "preparation", "continuous", "offline", "reading", "replay", "unified", "chunks"), default="basic",
@@ -508,7 +518,8 @@ def main():
     server = MockServer(args.port, args.log, args.bind)
     if args.run_dir:
         args.run_dir = args.run_dir.resolve()
-        launcher = prepare(args.run_dir, args.koreader.resolve(), server.server_port)
+        launcher = prepare(args.run_dir, args.koreader.resolve(), server.server_port,
+                           args.candidate_zip)
         server.log_path = args.run_dir / "evidence/requests.jsonl"
         print(f"Launch: {launcher}", flush=True)
     print(f"Mock server: http://{args.bind}:{server.server_port} (Ctrl-C to stop)", flush=True)

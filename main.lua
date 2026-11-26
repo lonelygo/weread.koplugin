@@ -26,7 +26,7 @@ local _ = PluginUtil.tr
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
-    version = "1.8.8",
+    version = "1.8.9",
 }
 
 -- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
@@ -105,6 +105,9 @@ function WeReadPlugin:init()
     local function request_sync(reason, context)
         return self.offline_sync:request(reason, context)
     end
+    local function sync_connected()
+        return self.offline_sync:isConnected()
+    end
     self.read_report = ReadReport:new{
         gate = function(kind, context) return self.offline_sync:gate(kind, context) end,
         request_sync = request_sync,
@@ -124,11 +127,7 @@ function WeReadPlugin:init()
             end
             return self.progress_sync:position_for_report(book_id)
         end,
-        -- The report tick runs on the UI loop; use the link-state check here
-        -- because NetworkMgr:isOnline() does a blocking DNS lookup.
-        is_online = function()
-            return self:isNetworkConnected()
-        end,
+        is_online = sync_connected,
     }
     self.progress_sync = ProgressSync:new{
         request_sync = request_sync,
@@ -183,7 +182,7 @@ function WeReadPlugin:init()
         end,
         run_online = function(_kind, callback, run_options)
             return self:runOnlineTask(_("Sync progress"), callback, nil, {
-                check_link_only = true,
+                is_connected = sync_connected,
                 silent_offline = run_options and run_options.silent_offline,
             })
         end,
@@ -197,9 +196,7 @@ function WeReadPlugin:init()
         open_chapter = function(book, chapter)
             return self:openProgressTargetChapter(book, chapter)
         end,
-        is_online = function()
-            return self:isNetworkConnected()
-        end,
+        is_online = sync_connected,
         on_choice = function(context)
             ProgressSyncDialog.show_choice(context)
         end,

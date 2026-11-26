@@ -74,6 +74,12 @@ function OfflineAnnotations:_source_repair_context(repair)
     return true, document, annotations
 end
 
+function OfflineAnnotations:pendingSourceBook()
+    local repair = self.source_repair_pending
+    if repair and (repair.next_attempt_at or 0) <= self.now()
+        and self:_source_repair_context(repair) then return repair.book_id end
+end
+
 local function retry_delay(repair, reason)
     repair.attempts = (tonumber(repair.attempts) or 0) + 1
     local base = tostring(reason or ""):find("low_memory", 1, true) and 120 or 60
@@ -199,9 +205,7 @@ function OfflineAnnotations:_start_source_repair()
                     end
                 end
                 self:_start_source_repair()
-                return
-            end
-            if valid and not self.source_repair_pending then
+            elseif valid and not self.source_repair_pending then
                 local reason = result and result.error or "worker_no_result"
                 local delay = retry_delay(repair, reason)
                 repair.next_attempt_at = self.now() + delay
@@ -211,6 +215,7 @@ function OfflineAnnotations:_start_source_repair()
             else
                 self:_start_source_repair()
             end
+            if valid then self:_request_sync("annotation_source_finished", { book_id = repair.book_id }) end
         end,
     }
     request_state.handle = request_or_error

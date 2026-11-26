@@ -64,13 +64,22 @@ local network = require("ui/network/manager")
 local dns_checks, ran = 0, 0
 network.isConnected = function() return true end
 network.isOnline = function() dns_checks = dns_checks + 1; return false end
+local function link_available() return host:isNetworkConnected() end
 eq(host:runOnlineTask("progress", function() ran = ran + 1 end, nil,
-    { check_link_only = true }), true, "WeRead request runs when the third-party DNS test fails")
+    { is_connected = link_available }), true, "WeRead request runs when the third-party DNS test fails")
 eq(dns_checks, 0, "WeRead progress does not depend on external DNS probes")
 network.isConnected = function() return false end
 eq(host:runOnlineTask("progress", function() ran = ran + 1 end, nil,
-    { check_link_only = true, silent_offline = true }), false, "disconnected device defers")
+    { is_connected = link_available, silent_offline = true }), false, "disconnected device defers")
 eq(ran, 1, "only the connected operation ran")
+eq(host:runOnlineTask("progress", function() ran = ran + 1 end, nil,
+    { is_connected = function() return true end }), true, "a verified WeRead connection permits progress")
+eq(ran, 2, "scheduled the verified progress task")
+eq(host:isWifiEnabledForSync(), false, "absent radio state does not prompt background checks")
+network.isWifiOn = function() return true end
+eq(host:isWifiEnabledForSync(), true, "read the radio even when the local link hint is false")
+network.isWifiOn = function() error("unavailable") end
+eq(host:isWifiEnabledForSync(), false, "an unavailable radio does not prompt background checks")
 
 host.settings = {
     get = function() return { login_method = "qr", name = "Example" } end,

@@ -93,6 +93,7 @@ end
 function Sync:_invalidate()
     self.generation = self.generation + 1
     self.verified_account, self.verified_until, self.probe_failed = nil, nil, nil
+    self.verified_dir, self.check_radio = nil, nil
     self.allow_data = false
     self.stage, self.stage_account, self.rerun = nil, nil, nil
 end
@@ -174,7 +175,7 @@ function Sync:startManual(book_id)
         manual.start_seconds = db:readTimeReceipts().seconds
     end
     self.plugin.read_report:capture_for_manual()
-    if self.plugin:isNetworkConnected() then self.plugin:showManualSyncResult("started") end
+    self.plugin:showManualSyncResult("started")
     return self:request("manual_sync", {
         manual = true, pull_current = book_id ~= nil, book_id = book_id,
     })
@@ -307,7 +308,7 @@ function Sync:request(reason, context)
         self:_invalidate()
         self.recheck = true
     end
-    if reason == "annotation_captured" and context.live and self.plugin:isNetworkConnected() then
+    if reason == "annotation_captured" and context.live and self:isConnected() then
         -- A newly edited note uses its own endpoint and is independent of
         -- read-time receipts and cloud-position choices. Keep its durable row
         -- until the normal writer returns the remote mark or review ID.
@@ -323,6 +324,7 @@ function Sync:request(reason, context)
     if connection_checks[reason] then
         self.recheck = true
         self.probe_failed = nil
+        self.check_radio = true
         if not self.stage then self.verified_until = nil end
         self.capture_current = true
     end
@@ -338,8 +340,23 @@ function Sync:request(reason, context)
 end
 
 function Sync:_verified(account)
-    return account and account == self.verified_account and self.verified_until
+    return active == self and not self.paused and account and account == self.verified_account
+        and self.verified_dir == self.plugin.library_db.data_dir and self.verified_until
         and self.now() < self.verified_until
+end
+
+function Sync:_confirmConnection(account)
+    self.verified_account = account
+    self.verified_dir = self.plugin.library_db.data_dir
+    self.verified_until = self.now() + math.min(60, self:interval_seconds())
+    self.probe_failed = nil
+end
+
+-- Only consult local state here. This is also called on the UI thread by the
+-- progress, time and annotation writers after the coordinator's service probe.
+function Sync:isConnected()
+    if active ~= self or self.paused then return false end
+    return self:_verified(self.plugin.library_db:accountKey()) or self.plugin:isNetworkConnected()
 end
 
 function Sync:_probeRenewalAllowed(account, fingerprint)
@@ -376,16 +393,18 @@ function Sync:_run()
         self.capture_current = nil
         if progress.capture_for_reconnect then progress:capture_for_reconnect() end
     end
-    if not plugin:isNetworkConnected() then
-        self:_invalidate()
-        self.explicit = nil
-        self:_finishManual("offline")
-        return
-    end
     if attempt and attempt.failure then
         self:_finishManual()
-        if self:_manualAttempt() or self.probe_failed == account then return end
+        attempt = self:_manualAttempt()
+        if attempt or self.probe_failed == account then return end
     end
+    -- A user tap may always try the bounded WeRead GET. Only scheduled
+    -- connectivity checks may do so in the background on a radio with no
+    -- reported link. Capturing a page turn never turns Wi-Fi on or polls it.
+    local check_radio = self.check_radio
+    self.check_radio = nil
+    if not attempt and not self:isConnected()
+        and not (check_radio and plugin:isWifiEnabledForSync()) then return end
     local settings = plugin.settings
     local with_time = settings:get("read_report", {}).enabled == true
     local with_annotations = settings:get("sync", {}).upload_annotations ~= false
@@ -422,7 +441,9 @@ function Sync:_run()
             return
         end
     end
-    local book_id = explicit.book_id or position_book or queued_book
+    local repairs = with_annotations and plugin.offline_annotations
+    local repair_book = repairs and repairs:pendingSourceBook()
+    local book_id = explicit.book_id or position_book or queued_book or repair_book
     if not book_id or book_id == "" then
         self.explicit, self.recheck = nil, nil
         self:_finishManual()
@@ -485,7 +506,7 @@ function Sync:_run()
         if with_time and queued_book then
             scheduled = plugin.read_report:drain(current ~= nil)
         end
-        if with_annotations and queued_book then
+        if with_annotations and (queued_book or repair_book) then
             local annotations = plugin:_offlineAnnotationCoordinator()
             if annotations then scheduled = annotations:drain() or scheduled end
         end
@@ -497,6 +518,7 @@ function Sync:_probe(account, book_id)
     self.allow_data = false
     self.stage, self.stage_account = "probe", account
     local generation = self.generation
+    local data_dir = self.plugin.library_db.data_dir
     local complete = false
     local inline_fallback_attempted = false
     local client = self.plugin.client
@@ -516,7 +538,7 @@ function Sync:_probe(account, book_id)
         end
         return "probe_worker_failed"
     end
-    local function finish(result)
+    local function finish(result, inline)
         if complete then return end
         -- A late callback belongs to the account and generation captured when
         -- the worker started. Never run its inline fallback (especially
@@ -524,7 +546,9 @@ function Sync:_probe(account, book_id)
         if active ~= self or self.paused or self.generation ~= generation then
             return
         end
-        if self.plugin.library_db:accountKey() ~= account then
+        if self.plugin.library_db:accountKey() ~= account
+            or self.plugin.library_db.data_dir ~= data_dir
+            or (not inline and WorkerSettings.fingerprint(self.plugin.settings) ~= auth_fingerprint) then
             complete = true
             self:_invalidate()
             self:_schedule()
@@ -532,7 +556,6 @@ function Sync:_probe(account, book_id)
         end
         if not (result and result.ok)
             and self:_manualAttempt()
-            and self.plugin:isNetworkConnected()
             and not inline_fallback_attempted then
             -- A timed-out/no-result child may already have sent renewal or be
             -- waiting on its verification GET. The bounded fallback remains
@@ -576,19 +599,24 @@ function Sync:_probe(account, book_id)
                 auth_merge_failed and auth_fingerprint
                     or WorkerSettings.fingerprint(self.plugin.settings))
         end
-        if verified and self.plugin:isNetworkConnected() then
-            self.verified_account = account
-            self.verified_until = self.now() + math.min(60, self:interval_seconds())
+        if verified then
+            self:_confirmConnection(account)
             self.rerun = nil
             self:_schedule(0)
         else
             self.verified_account = nil
+            -- A reconnect can arrive while the worker is still returning an
+            -- older failure. Consume that newer check once, including for a
+            -- waiting tap. A capture alone cannot trigger another probe.
+            if self.rerun and self.check_radio then
+                self.rerun = nil
+                self:_schedule(0)
+                return
+            end
             self.probe_failed = account
             local attempt = self:_manualAttempt()
             if attempt then
-                if not self.plugin:isNetworkConnected() then
-                    attempt.failure = "offline"
-                elseif failure_reason then
+                if failure_reason then
                     attempt.failure = failure_reason
                 elseif result and result.ok then
                     attempt.failure = "response_unrecognized"
@@ -605,7 +633,7 @@ function Sync:_probe(account, book_id)
         local ok, value = pcall(inline_probe, allow_renewal)
         finish({ ok = ok, value = ok and value or {
             ok = false, reason = "service_unreachable",
-        } })
+        } }, true)
         return
     end
     local started, reason = self.worker:start{
@@ -622,6 +650,7 @@ function Sync:_probe(account, book_id)
     if not started and not complete then
         if reason == "worker_busy" then
             self.stage = nil
+            self.check_radio = true
             self:_schedule(1)
         else
             finish({ ok = false, error = reason, not_started = true })
@@ -632,11 +661,8 @@ end
 function Sync:gate(kind, context)
     if active ~= self or self.paused then return false, "inactive" end
     local account = self.plugin.library_db:accountKey()
-    if not self.plugin:isNetworkConnected() then
-        self:disconnected()
-        return false, "offline"
-    end
     if not account then return false, "authentication_required" end
+    if not self:isConnected() then return false, "offline" end
     local is_read = kind == "weread_read_write"
     local live = (is_read and context.operation == "live_reading_time")
         or (not is_read and context.operation == "live_annotation")
@@ -665,13 +691,14 @@ function Sync:gate(kind, context)
         end
     end
     local token = {}
+    local generation, data_dir = self.generation, self.plugin.library_db.data_dir
     if is_read then read_writer = token else annotation_writer = token end
     return true, function(outcome)
         if is_read and read_writer == token then read_writer = nil
         elseif not is_read and annotation_writer == token then annotation_writer = nil
         else return end
         local same_account = active and active.plugin.library_db:accountKey() == account
-            and active.plugin.library_db.data_dir == self.plugin.library_db.data_dir
+            and active.plugin.library_db.data_dir == data_dir
         if not same_account or not outcome then
             if active then active:_schedule() end
             return
@@ -708,9 +735,13 @@ function Sync:gate(kind, context)
             end
         end
         if outcome.accepted == true then
-            active.verified_account = account
-            active.verified_until = active.now() + math.min(60, active:interval_seconds())
-            active.probe_failed = nil
+            if active == self and not self.paused and generation == self.generation then
+                self:_confirmConnection(account)
+            elseif active ~= self and not active.paused and not active:_verified(account) then
+                -- The visible surface needs its own probe to continue a
+                -- transfer whose previous write finished during handoff.
+                active.check_radio, active.probe_failed = true, nil
+            end
         elseif error_kind == "transport" or error_kind == "authentication"
             or (not time_row and error_kind == "context") then
             active:_invalidate()

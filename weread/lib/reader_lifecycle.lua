@@ -91,11 +91,7 @@ function M:onWeReadSyncProgress()
             _("This action requires an open WeRead book."), 1)
         return false
     end
-    if not self:requireLogin(true, false) then
-        return false
-    end
-    self.progress_sync:sync_now()
-    return true
+    return self:syncOfflineNow(book_id)
 end
 
 function M:handleEndOfBook(status_self)
@@ -344,7 +340,7 @@ function M:_offlineAnnotationCoordinator()
         resolver = UploadPosition,
         gate = function(kind, context) return self.offline_sync:gate(kind, context) end,
         request_sync = function(reason, context) return self.offline_sync:request(reason, context) end,
-        is_online = function() return self:isNetworkConnected() end,
+        is_online = function() return self.offline_sync:isConnected() end,
         get_document = function()
             return self.ui and self.ui.document
         end,

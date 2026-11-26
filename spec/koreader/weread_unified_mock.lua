@@ -86,8 +86,12 @@ end)
 local stable = reader().document.file
 local NetworkMgr = require("ui/network/manager")
 local connected = true
+local radio_on = true
+local false_link = os.getenv("WEREAD_FORCE_LINK_FALSE") == "1"
+local expect_link_guard = os.getenv("WEREAD_EXPECT_LINK_GUARD") == "1"
 -- Only the OS link boundary is simulated; real Client performs every HTTP call.
-NetworkMgr.isConnected = function() return connected end
+NetworkMgr.isConnected = function() return connected and not false_link end
+NetworkMgr.isWifiOn = function() return radio_on end
 local http = require("socket.http")
 local ltn12 = require("ltn12")
 local endpoint = reader().weread.settings.mock_endpoint
@@ -104,6 +108,7 @@ local function api(path, payload)
 end
 local function offline()
     connected = false
+    radio_on = false
     api("/__control", { times = -1, status = 503 })
 end
 local Event = require("ui/event")
@@ -139,6 +144,24 @@ local function mutations(state)
             or request.path == "/web/book/removeBookmark" or request.path == "/web/review/delete") then
             count = count + 1
         end
+    end
+    return count
+end
+local function probes_between(before_state, after_state)
+    local count = 0
+    for index = #before_state.requests + 1, #after_state.requests do
+        local event = after_state.requests[index]
+        if event.method == "GET" and event.path == "/web/book/getProgress" then
+            count = count + 1
+        end
+    end
+    return count
+end
+local function client_requests_between(before_state, after_state)
+    local count = 0
+    for index = #before_state.requests + 1, #after_state.requests do
+        local path = after_state.requests[index].path or ""
+        if path:sub(1, 2) ~= "/_" then count = count + 1 end
     end
     return count
 end
@@ -221,17 +244,79 @@ reader():handleEvent(Event:new("Resume"))
 if surface == "filemanager" then close_to_manager() end
 local expected_seconds = current_plugin().library_db:readTimeStatus().pending
 assert(expected_seconds > 0, "offline reading time queued")
-local before = mutations(api("/__state"))
+local radio_off_state = api("/__state")
+local before = mutations(radio_off_state)
 heartbeat()
 active():handleEvent(Event:new("NetworkConnected"))
 spin(0.3)
-assert(mutations(api("/__state")) == before, "disconnected triggers attempt no mutation")
+local after_radio_off = api("/__state")
+assert(mutations(after_radio_off) == before, "disconnected triggers attempt no mutation")
+local radio_off_background_request_count = client_requests_between(radio_off_state, after_radio_off)
+assert(radio_off_background_request_count == 0,
+    "radio-off background events must not probe WeRead")
 assert(wake_calls == 0, "no Wi-Fi wake")
 -- Interface link is now up, but the authenticated read-only probe still fails.
 connected = true
+radio_on = true
+local before_radio_on = api("/__state")
 heartbeat()
-spin(0.5)
-assert(mutations(api("/__state")) == before, "failed connectivity probe attempts no mutation")
+if false_link and not expect_link_guard then
+    wait_for("radio-on stale-link probe settles", function()
+        local state = api("/__state")
+        return probes_between(before_radio_on, state) >= 1
+            and current_plugin().offline_sync.stage == nil
+    end)
+else
+    spin(0.5)
+end
+local after_radio_on = api("/__state")
+local false_link_background_probe_count = probes_between(before_radio_on, after_radio_on)
+local false_link_background_mutations = mutations(after_radio_on) - before
+assert(false_link_background_mutations == 0, "failed connectivity probe attempts no mutation")
+if false_link and not expect_link_guard then
+    assert(false_link_background_probe_count == 1,
+        "radio-on heartbeat did not verify WeRead behind the stale OS link flag")
+elseif false_link then
+    assert(false_link_background_probe_count == 0,
+        "v1.8.8 baseline unexpectedly bypassed the stale OS link flag")
+end
+local false_link_probe_count = 0
+local false_link_result
+local false_link_failed_mutations = 0
+if false_link then
+    local before_false_link = api("/__state")
+    assert(current_plugin():syncOfflineNow(),
+        "explicit upload was not accepted while the OS link flag was stale")
+    wait_for("explicit stale-link diagnostic", function()
+        false_link_result = current_plugin().library_db:lastManualSyncResult()
+        return false_link_result and current_plugin().offline_sync.stage == nil
+    end)
+    local after_false_link = api("/__state")
+    false_link_probe_count = probes_between(before_false_link, after_false_link)
+    false_link_failed_mutations = mutations(after_false_link) - mutations(before_false_link)
+    if expect_link_guard then
+        assert(false_link_result.reason == "offline" and false_link_probe_count == 0,
+            "v1.8.8 baseline no longer demonstrates the stale link-state block")
+        local proof = assert(io.open(
+            root .. "/evidence/stale-link-v188-result.json", "wb"))
+        proof:write(json.encode({
+            version = current_plugin().version,
+            result = false_link_result.reason,
+            probe_count = false_link_probe_count,
+            background_probe_count = false_link_background_probe_count,
+            mutations = false_link_failed_mutations,
+        }))
+        proof:close()
+        UIManager:quit()
+        return
+    end
+    assert(false_link_result.reason ~= "offline" and false_link_probe_count == 1,
+        "explicit upload trusted the stale OS link flag instead of checking WeRead")
+    assert(false_link_result.reason ~= "uploaded",
+        "failed WeRead check was incorrectly recorded as an upload success")
+    assert(false_link_failed_mutations == 0,
+        "a failed explicit WeRead check mutated the durable queue")
+end
 -- Simulate a phone advancing within the cached chapter while the device was offline.
 api("/__control", { times = 0 })
 api("/web/book/read", { b = Protocol.e("900001"), c = Protocol.e(1), ci = 1,
@@ -283,10 +368,33 @@ if os.getenv("WEREAD_COMPARE_FAILURE") == "1" then
     api("/__control", { progress_successes_before_failure = -1 })
 end
 -- No NetworkConnected event. Exercise the normal heartbeat or an explicit tap.
+local function capture_completion()
+    local expected = "Sync complete. WeRead confirmed the upload."
+    local translated = I18n.tr(expected)
+    for _, entry in ipairs(UIManager._window_stack) do
+        if entry.widget.text == expected or entry.widget.text == translated then
+            return entry.widget
+        end
+    end
+end
 local manual = os.getenv("WEREAD_MANUAL_SYNC") == "1"
-if manual then current_plugin():getOfflineSyncMenuItems()[1].callback() else heartbeat() end
+local reader_progress_entry_used = false
+if manual then
+    if false_link and surface == "reader" then
+        reader_progress_entry_used = true
+        assert(current_plugin():onWeReadSyncProgress(),
+            "Reader progress action did not start the unified manual upload")
+    elseif false_link then
+        assert(current_plugin():syncOfflineNow(), "manual upload did not start")
+    else
+        current_plugin():getOfflineSyncMenuItems()[1].callback()
+    end
+else
+    heartbeat()
+end
 local selected = false
 wait_for("unified heartbeat drains queues", function()
+    capture_completion()
     if choice == "auto" then
         select_conflict()
         selected = true
@@ -301,21 +409,17 @@ wait_for("unified heartbeat drains queues", function()
 end)
 local first = api("/__state")
 assert(first.annotation_writes[1].payload.isPrivate == 1, "private note uploaded")
-local function completion()
-    local expected = "Sync complete. WeRead confirmed the upload."
-    local translated = I18n.tr(expected)
-    for _, entry in ipairs(UIManager._window_stack) do
-        if entry.widget.text == expected or entry.widget.text == translated then
-            return entry.widget
-        end
-    end
-end
 if manual then
-    wait_for("full-batch confirmation after progress choice", completion)
+    wait_for("full-batch acknowledgement after progress choice", function()
+        capture_completion()
+        local result = current_plugin().library_db:lastManualSyncResult()
+        return result and result.reason == "uploaded"
+    end)
     assert(require("weread.lib.sync_status").get(current_plugin()).state == "synced")
-    UIManager:close(completion())
+    local visible_completion = capture_completion()
+    if visible_completion then UIManager:close(visible_completion) end
 else
-    assert(not completion(), "a background heartbeat showed a manual upload confirmation")
+    assert(not capture_completion(), "a background heartbeat showed a manual upload confirmation")
 end
 local position_after_choice
 if ReaderUI.instance then
@@ -337,6 +441,7 @@ else
 end
 -- A choice is not a permanent block: a new offline session must sync again.
 connected = false
+radio_on = false
 active():handleEvent(Event:new("NetworkDisconnected"))
 api("/__control", { times = -1, status = 503 })
 if not ReaderUI.instance then
@@ -358,7 +463,12 @@ local second_pending = current_plugin().library_db:readTimeStatus().pending
 assert(second_pending > 0, "second offline session queues seconds")
 api("/__control", { times = 0 })
 connected = true
-active():handleEvent(Event:new("NetworkConnected"))
+radio_on = true
+if false_link then
+    heartbeat()
+else
+    active():handleEvent(Event:new("NetworkConnected"))
+end
 selected = false
 wait_for("second session sync after choice", function()
     if choice == "auto" then
@@ -375,18 +485,36 @@ wait_for("second session sync after choice", function()
 end)
 local final = api("/__state")
 local seconds, writes = positive_seconds(final), #final.annotation_writes
+radio_on = false
+connected = false
+active():handleEvent(Event:new("NetworkDisconnected"))
 heartbeat()
 active():handleEvent(Event:new("NetworkConnected"))
 spin(1.5)
 local repeated = api("/__state")
+local final_radio_off_request_count = client_requests_between(final, repeated)
 assert(positive_seconds(repeated) == seconds and #repeated.annotation_writes == writes,
     "closed reader reconnect/heartbeat does not duplicate acknowledged data")
+if false_link then
+    assert(final_radio_off_request_count == 0,
+        "background synchronization probed despite the stale disconnected link flag")
+end
 assert(wake_calls == 0, "never wake Wi-Fi")
 local out = assert(io.open(root .. "/evidence/unified-result.json", "wb"))
 out:write(json.encode({ choice = choice, surface = surface, expected_first_seconds = expected_seconds,
     second_seconds = second_pending, total_seconds = seconds, annotation_writes = repeated.annotation_writes,
     position_after_choice = position_after_choice, final_progress = repeated.progress["900001"],
-    wifi_wake_calls = wake_calls, heartbeat_without_event = true, comparison_failure_checked = comparison_failure_checked, heartbeat_schedule = heartbeat_schedule }))
+    wifi_wake_calls = wake_calls, heartbeat_without_event = true,
+    radio_off_background_request_count = radio_off_background_request_count,
+    false_link = false_link, false_link_probe_count = false_link_probe_count,
+    false_link_background_probe_count = false_link_background_probe_count,
+    false_link_background_mutations = false_link_background_mutations,
+    false_link_failed_mutations = false_link_failed_mutations,
+    false_link_result = false_link_result and false_link_result.reason,
+    final_radio_off_request_count = final_radio_off_request_count,
+    reader_progress_entry_used = reader_progress_entry_used,
+    comparison_failure_checked = comparison_failure_checked,
+    heartbeat_schedule = heartbeat_schedule }))
 out:close()
 active():onClose()
 UIManager:quit()
