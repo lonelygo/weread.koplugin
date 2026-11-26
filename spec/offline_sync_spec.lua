@@ -19,6 +19,12 @@ local settings = {
 local db = LibraryDB:new(settings)
 local first_path = db:databasePath()
 
+assert(db:setReadWriteRetryAfter(123)
+    and db:setReadWriteRetryAfter(100)
+    and db:readWriteRetryAfter() == 123
+    and db:setReadWriteRetryAfter(456)
+    and db:readWriteRetryAfter() == 456,
+    "account rate-limit deadline was not persisted monotonically")
 assert(db:enqueueReadTime("book", 65, { chapter_uid = 7, percent = 12 }))
 assert(db:hasPendingOfflineWork(true, false)
     and db:pendingOfflineBook(true, false) == "book"

@@ -103,16 +103,23 @@ class MockServer(ThreadingHTTPServer):
         super().__init__((bind, port), Handler)
         self.lock = threading.Lock()
         self.log_path = log_path
-        self.events = deque(maxlen=500)
+        # Full-scale replay acceptance emits several context requests per row.
+        # Retain the complete 190-row trace so timing and conservation checks
+        # do not silently inspect only the tail of the run.
+        self.events = deque(maxlen=5000)
         self.progress = {}
         self.read_reports = []
         self.bookmarks = {}
         self.private_reviews = {}
         self.annotation_writes = []
         self.next_annotation_id = 1
+        self.next_request_id = 1
+        self.active_read_writes = 0
+        self.max_read_write_concurrency = 0
         self.control = dict(delay=0, match="", status=503, times=0,
                             empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1,
-                            progress_reply="ok", renew_reply="ok", read_replies=[])
+                            progress_reply="ok", renew_reply="ok", retry_after=0,
+                            read_replies=[])
 
     def record(self, event):
         with self.lock:
@@ -120,6 +127,25 @@ class MockServer(ThreadingHTTPServer):
             if self.log_path:
                 with self.log_path.open("a") as out:
                     out.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def begin_request(self, method, target):
+        path = urlsplit(target).path
+        is_read_write = method == "POST" and path == "/web/book/read"
+        with self.lock:
+            request_id = self.next_request_id
+            self.next_request_id += 1
+            if is_read_write:
+                self.active_read_writes += 1
+                self.max_read_write_concurrency = max(
+                    self.max_read_write_concurrency, self.active_read_writes)
+            concurrency = self.active_read_writes
+        return request_id, is_read_write, concurrency
+
+    def finish_measured_request(self, is_read_write):
+        if not is_read_write:
+            return
+        with self.lock:
+            self.active_read_writes -= 1
 
     def route(self, method, target, data):
         url = urlsplit(target)
@@ -144,7 +170,11 @@ class MockServer(ThreadingHTTPServer):
         if matches:
             time.sleep(control["delay"])
         if fail:
-            return control["status"], dict(errcode=-1, errmsg="Injected mock failure")
+            headers = {}
+            if control["status"] == 429 and control["retry_after"] > 0:
+                headers["Retry-After"] = str(control["retry_after"])
+            return control["status"], dict(
+                errcode=-1, errmsg="Injected mock failure"), headers
 
         book_id = str(data.get("bookId") or query.get("bookId", [BOOK_ID])[0])
         if progress_read and control["progress_reply"] in {"authentication", "expired"}:
@@ -268,6 +298,11 @@ class MockServer(ThreadingHTTPServer):
                     reply = self.control["read_replies"].pop(0)
                 if reply == "reject":
                     return 200, dict(succ=0, errCode=4001, errMsg="Injected reading-time rejection")
+                if reply == "rate_limited":
+                    headers = {}
+                    if control["retry_after"] > 0:
+                        headers["Retry-After"] = str(control["retry_after"])
+                    return 429, dict(errcode=-1, errmsg="Injected rate limit"), headers
                 self.read_reports.append(dict(bookId=book_id, chapterUid=uid, rt=data.get("rt", 0),
                                               chapterOffset=data["co"], progress=data["pr"], reply=reply))
                 self.progress[book_id] = dict(chapterUid=uid, chapterIdx=data["ci"],
@@ -303,6 +338,10 @@ class Handler(BaseHTTPRequestHandler):
         target = self.path
         data = {}
         response_headers = {}
+        request_id = None
+        read_write = False
+        concurrency = 0
+        started_at = time.monotonic()
         try:
             size = int(self.headers.get("Content-Length", 0))
             if not 0 <= size <= 1024 * 1024:
@@ -318,7 +357,9 @@ class Handler(BaseHTTPRequestHandler):
                 with self.server.lock:
                     status, result = 200, dict(control=self.server.control.copy(), requests=list(self.server.events), progress=self.server.progress.copy(),
                                               bookmarks=self.server.bookmarks.copy(), private_reviews=self.server.private_reviews.copy(),
-                                              annotation_writes=list(self.server.annotation_writes), read_reports=list(self.server.read_reports))
+                                              annotation_writes=list(self.server.annotation_writes), read_reports=list(self.server.read_reports),
+                                              active_read_writes=self.server.active_read_writes,
+                                              max_read_write_concurrency=self.server.max_read_write_concurrency)
             elif path.path == "/__control" and self.command == "POST":
                 self.set_control(data)
                 status, result = 200, dict(ok=True)
@@ -327,7 +368,12 @@ class Handler(BaseHTTPRequestHandler):
                     target = parse_qs(path.query)["url"][0]
                 else:
                     target = "https://weread.qq.com" + self.path
-                routed = self.server.route(self.command, target, data)
+                request_id, read_write, concurrency = self.server.begin_request(
+                    self.command, target)
+                try:
+                    routed = self.server.route(self.command, target, data)
+                finally:
+                    self.server.finish_measured_request(read_write)
                 status, result = routed[:2]
                 if len(routed) > 2:
                     response_headers = routed[2]
@@ -339,9 +385,14 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlsplit(target)
         except ValueError:
             parsed = urlsplit("")
+        completed_at = time.monotonic()
         self.server.record(dict(method=self.command, host=parsed.hostname, path=parsed.path,
                                 api=data.get("api_name"), book=data.get("bookId"), chapter=data.get("chapterUid"),
-                                encoded_chapter=data.get("c"), status=status))
+                                encoded_chapter=data.get("c"), rt=data.get("rt"), status=status,
+                                request_id=request_id, started_at=started_at,
+                                completed_at=completed_at,
+                                duration_ms=round((completed_at - started_at) * 1000, 3),
+                                read_write_concurrency=concurrency))
         if result is DROP_RESPONSE:
             self.close_connection = True
             return
@@ -379,6 +430,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("renew_reply must be ok or reject")
             if type(candidate["status"]) is not int or not 400 <= candidate["status"] <= 599:
                 raise ValueError("status must be 400..599")
+            if type(candidate["retry_after"]) not in (float, int) or not 0 <= candidate["retry_after"] <= 60:
+                raise ValueError("retry_after must be 0..60 seconds")
             if not isinstance(candidate["match"], str):
                 raise ValueError("match must be a string")
             for key in ("empty_shelf", "empty_annotations"):
@@ -386,7 +439,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(key + " must be boolean")
             if not isinstance(candidate["read_replies"], list) or len(candidate["read_replies"]) > 20:
                 raise ValueError("read_replies must be a list of at most 20 reply modes")
-            if any(reply not in {"ok", "blank", "reject", "timeout", "drop"} for reply in candidate["read_replies"]):
+            if any(reply not in {"ok", "blank", "reject", "rate_limited", "timeout", "drop"} for reply in candidate["read_replies"]):
                 raise ValueError("read_replies contains an unknown reply mode")
             self.server.control = dict(candidate, read_replies=list(candidate["read_replies"]))
 
@@ -441,7 +494,7 @@ def main():
     parser.add_argument("--koreader", type=Path, help="built KOReader runtime directory (not source root)")
     parser.add_argument("--log", type=Path, help="JSONL request log, without headers or private data")
     parser.add_argument("--smoke", action="store_true", help="run real KOReader offscreen smoke, save evidence, then exit")
-    parser.add_argument("--scenario", choices=("basic", "covers", "delivery", "menu", "pending", "preparation", "continuous", "offline", "reading", "unified", "chunks"), default="basic",
+    parser.add_argument("--scenario", choices=("basic", "covers", "delivery", "menu", "pending", "preparation", "continuous", "offline", "reading", "replay", "unified", "chunks"), default="basic",
                         help="offscreen integration scenario (requires --smoke)")
     args = parser.parse_args()
     if bool(args.run_dir) != bool(args.koreader):
@@ -466,9 +519,12 @@ def main():
                                 EMULATE_READER="1", EMULATE_READER_W="600", EMULATE_READER_H="800", EMULATE_READER_DPI="167", KO_DYLD_PREFIX=str(args.koreader.resolve()))
         log = args.run_dir / "evidence/smoke.log"
         try:
+            smoke_timeout = 360 if (args.scenario == "replay"
+                                    and os.environ.get("WEREAD_REPLAY_SCALE") == "190") else 180
             with log.open("w") as out:
-                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "covers": "weread_covers_mock.lua", "delivery": "weread_delivery_mock.lua", "menu": "weread_menu_consistency.lua", "pending": "weread_pending_diagnostics.lua", "preparation": "weread_preparation_mock.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
-                                        cwd=args.koreader, env=env, stdout=out, stderr=subprocess.STDOUT, timeout=180)
+                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "covers": "weread_covers_mock.lua", "delivery": "weread_delivery_mock.lua", "menu": "weread_menu_consistency.lua", "pending": "weread_pending_diagnostics.lua", "preparation": "weread_preparation_mock.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "replay": "weread_replay_pacing.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
+                                        cwd=args.koreader, env=env, stdout=out, stderr=subprocess.STDOUT,
+                                        timeout=smoke_timeout)
             if result.returncode == 0 and args.scenario == "basic":
                 full_books = list((args.run_dir / "profile/weread-mock/cache").rglob("* - full.epub"))
                 assert len(full_books) == 1, "expected one completed full EPUB"
@@ -516,7 +572,9 @@ def main():
             with server.lock:
                 (args.run_dir / "evidence/server-state.json").write_text(json.dumps(dict(
                     bookmarks=server.bookmarks, private_reviews=server.private_reviews,
-                    annotation_writes=server.annotation_writes, progress=server.progress, read_reports=server.read_reports), ensure_ascii=False, indent=2))
+                    annotation_writes=server.annotation_writes, progress=server.progress,
+                    read_reports=server.read_reports,
+                    max_read_write_concurrency=server.max_read_write_concurrency), ensure_ascii=False, indent=2))
             server.shutdown()
             server.server_close()
             thread.join()

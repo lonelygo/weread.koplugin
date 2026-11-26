@@ -217,7 +217,9 @@ local ok, ambiguous_id = plugin.library_db:enqueueReadTime("900001", 14, positio
 assert(ok and ambiguous_id, "seed ambiguous row")
 local ambiguous = assert(plugin.library_db:claimReadTime("delivery-seed", ambiguous_id))
 assert(plugin.library_db:quarantineReadTime(ambiguous, "seed_lost_reply"))
-assert(plugin.library_db:enqueueReadTime("900001", 5223, position))
+local historical_seconds = 243
+local historical_rows = 9
+assert(plugin.library_db:enqueueReadTime("900001", historical_seconds, position))
 
 -- A fresh 30-second ReaderUI tick must bypass the historical queue and carry
 -- the actual live progress instead of being swallowed by offline replay.
@@ -232,7 +234,7 @@ assert(live and live.rt == 30
         and tostring(live.chapterUid) == tostring(position.chapter_uid),
     "live report sends genuine time and progress")
 local after_live = plugin.library_db:readTimeStatus()
-assert(after_live.pending == 5223 and after_live.unknown == 14,
+assert(after_live.pending == historical_seconds and after_live.unknown == 14,
     "live exact-id claim leaves historical queue intact")
 
 -- A second foreground interval must still send the newly captured position,
@@ -243,7 +245,7 @@ assert(report:report_once(), "second fresh foreground interval accepted")
 local live_receipts = plugin.library_db:readTimeReceipts()
 local live_reports = positive_reports()
 assert(live_receipts.count == 2 and live_receipts.seconds == 60
-        and plugin.library_db:readTimeStatus().pending == 5223,
+        and plugin.library_db:readTimeStatus().pending == historical_seconds,
     "two live intervals bypass historical backlog")
 assert(#live_reports == 2 and live_reports[2].rt == 30
         and tostring(live_reports[2].chapterUid) == tostring(position.chapter_uid),
@@ -257,7 +259,7 @@ local historical_direct = report:report_once()
 wait_for("foreground progress gate drains distinct historical work", function()
     local receipts = plugin.library_db:readTimeReceipts()
     return receipts.count == 3 and receipts.seconds == 90
-        and plugin.library_db:readTimeStatus().pending == 5193
+        and plugin.library_db:readTimeStatus().pending == historical_seconds - 30
 end)
 assert(historical_direct == true or report.last_gate_denial ~= "inactive",
     "foreground historical report uses the real active host gate")
@@ -275,12 +277,6 @@ report.subprocess = nil
 report.now = function() return virtual_now end
 plugin.offline_sync.now = function() return virtual_now end
 
-local function replay_once()
-    virtual_now = virtual_now + 31
-    report.manual_replay_tick = true
-    return report:report_once()
-end
-
 -- A 200 response without a receipt may already have committed. It must be
 -- quarantined after exactly one POST; refreshing context must not resend it.
 api("/__control", { read_replies = { "blank" } })
@@ -289,23 +285,29 @@ virtual_now = virtual_now + 31
 assert(plugin:syncOfflineNow(), "homepage sync starts on visible FileManager")
 wait_for("homepage blank response is quarantined", function()
     local state = plugin.library_db:readTimeStatus()
-    return state.pending == 5163 and state.unknown == 44
+    return state.pending == historical_seconds - 60 and state.unknown == 44
 end)
 local after_blank_reports = positive_reports()
 assert(#after_blank_reports == before_blank + 1
         and after_blank_reports[#after_blank_reports].reply == "blank",
     "blank 200 is held without a duplicate POST")
 local after_blank = plugin.library_db:readTimeStatus()
-assert(after_blank.pending == 5163 and after_blank.unknown == 44,
+assert(after_blank.pending == historical_seconds - 60 and after_blank.unknown == 44,
     "only the blank row moves to uncertain review")
 
 -- One explicit business denial establishes a definitive rejection. That row
 -- leaves the runnable lane but newer rows continue.
 report.last_renew_attempt = virtual_now
 api("/__control", { read_replies = { "reject" } })
-assert(not replay_once(), "explicit denial is not accepted")
+assert(plugin.offline_sync:request("network_connected"),
+    "explicit denial starts through the real coordinator")
+wait_for("explicit denial is isolated", function()
+    local state = plugin.library_db:readTimeStatus()
+    return state.pending == historical_seconds - 90
+        and state.rejected == 30
+end)
 local after_reject = plugin.library_db:readTimeStatus()
-assert(after_reject.pending == 5133 and after_reject.unknown == 44
+assert(after_reject.pending == historical_seconds - 90 and after_reject.unknown == 44
         and after_reject.rejected == 30,
     "one rejected row does not block the remaining backlog")
 
@@ -318,7 +320,7 @@ assert(plugin.offline_sync:request("network_connected"),
     "expired historical gate starts a real reconnect probe")
 wait_for("timeout row is held after the real reconnect gate", function()
     local state = plugin.library_db:readTimeStatus()
-    return state.pending == 5103 and state.unknown == 74
+    return state.pending == historical_seconds - 120 and state.unknown == 74
 end)
 local after_drop_reports = positive_reports()
 assert(#after_drop_reports == before_drop + 1
@@ -327,7 +329,7 @@ assert(#after_drop_reports == before_drop + 1
         .. tostring(report.last_gate_denial) .. " state=" .. tostring(report.state)
         .. " stage=" .. tostring(plugin.offline_sync.stage))
 local after_drop = plugin.library_db:readTimeStatus()
-assert(after_drop.pending == 5103 and after_drop.unknown == 74
+assert(after_drop.pending == historical_seconds - 120 and after_drop.unknown == 74
         and after_drop.rejected == 30,
     "one timed-out row does not block newer records")
 virtual_now = virtual_now + 31
@@ -335,30 +337,13 @@ assert(plugin.offline_sync:request("network_connected"),
     "actual reconnect requests a fresh probe")
 wait_for("reconnect resumes a newer row after timeout", function()
     local state = plugin.library_db:readTimeStatus()
-    return state.pending <= 5073 and state.unknown == 74
+    return state.pending <= historical_seconds - 150 and state.unknown == 74
         and plugin.library_db:readTimeReceipts().count >= 4
 end)
 
-local replay_attempts = 0
-while plugin.library_db:readTimeStatus().pending > 0 do
-    replay_attempts = replay_attempts + 1
-    assert(replay_attempts < 220, "bounded replay")
-    local before = plugin.library_db:readTimeStatus().pending
-    local replayed = replay_once()
-    if not replayed then
-        local denial = tostring(report.last_gate_denial or "")
-        assert(not denial:match(":inactive$"),
-            "visible FileManager must remain the active sync host")
-        -- `writer_busy`, `probe_needed`, `progress_pending`, and pacing are
-        -- asynchronous deferrals. Drive the real scheduler rather than
-        -- manufacturing gate authority.
-        for _ = 1, 50 do
-            UIManager:handleInput()
-            if plugin.library_db:readTimeStatus().pending < before then break end
-            socket.sleep(0.01)
-        end
-    end
-end
+wait_for("remaining delivery queue drains", function()
+    return plugin.library_db:readTimeStatus().pending == 0
+end)
 
 local queue = plugin.library_db:readTimeStatus()
 local receipts = plugin.library_db:readTimeReceipts()
@@ -372,7 +357,10 @@ for _, item in ipairs(reports) do
 end
 assert(queue.pending == 0 and queue.unknown == 74 and queue.rejected == 30,
     "remaining queue totals distinguish uncertain and rejected rows")
-assert(receipts.count == 174 and receipts.seconds == 5193 and receipts.last_time,
+local expected_receipt_count = historical_rows - 3 + 2
+local expected_receipt_seconds = historical_seconds - 90 + 60
+assert(receipts.count == expected_receipt_count
+        and receipts.seconds == expected_receipt_seconds and receipts.last_time,
     "ACK status counts only genuine receipts")
 assert(#review == 4 and review[1].elapsed_seconds == 14
         and review[1].state == "unknown" and review[2].state == "unknown"
@@ -380,9 +368,11 @@ assert(#review == 4 and review[1].elapsed_seconds == 14
     "review rows remain individually identified")
 -- The three uncertain records (14s seed, 30s blank, 30s timeout) plus one
 -- rejected record are conserved; nothing is invented or dropped.
-assert(receipts.seconds + queue.unknown + queue.rejected == 14 + 5223 + 60,
+assert(receipts.seconds + queue.unknown + queue.rejected
+        == 14 + historical_seconds + 60,
     "read-time conservation")
-assert(server_seconds == 5253 and blank_count == 1 and #reports == 176,
+assert(server_seconds == historical_seconds - 30 + 60
+        and blank_count == 1 and #reports == historical_rows - 1 + 2,
     "server sees one blank commit and no fabricated or duplicate reports")
 assert(status.state == "unknown" and status.pending_seconds == 0
         and status.unknown_seconds == 74 and status.rejected_seconds == 30
@@ -393,15 +383,19 @@ assert(status.pending_annotations == 0 and status.unknown_annotations == 0,
 
 local before_repeat = #reports
 for _ = 1, 3 do
-    replay_once()
+    plugin.offline_sync:request("network_connected")
+    for _poll = 1, 5 do
+        UIManager:handleInput()
+        socket.sleep(0.02)
+    end
 end
 assert(#positive_reports() == before_repeat
-        and plugin.library_db:readTimeReceipts().count == 174,
+        and plugin.library_db:readTimeReceipts().count == expected_receipt_count,
     "empty queue and repeated reconnect work never replay receipts")
 
 local out = assert(io.open(root .. "/evidence/delivery-result.json", "wb"))
 out:write(json.encode({
-    input_seconds = 14 + 5223 + 60,
+    input_seconds = 14 + historical_seconds + 60,
     receipt_count = receipts.count, receipt_seconds = receipts.seconds,
     queue = queue, review = review, status = status,
     server_seconds = server_seconds, server_report_count = #reports,

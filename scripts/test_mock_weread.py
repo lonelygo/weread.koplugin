@@ -47,7 +47,8 @@ class MockTests(unittest.TestCase):
     def setUp(self):
         self.request("/__control", dict(delay=0, match="", status=503, times=0,
                                         empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1,
-                                        progress_reply="ok", renew_reply="ok", read_replies=[]))
+                                        progress_reply="ok", renew_reply="ok", retry_after=0,
+                                        read_replies=[]))
 
     def test_contract_and_real_reference_decoder(self):
         status, shelf = self.gateway("/shelf/sync")
@@ -203,6 +204,42 @@ class MockTests(unittest.TestCase):
         payload = dict(b=weread_e(BOOK_ID), c=weread_e(1), ci=1, co=120, pr=25, rt=0)
         self.assertEqual(self.request("/web/book/read", payload)[1]["succ"], 1)
         self.assertEqual(self.request("/__state")[1]["control"]["read_replies"], ["reject"])
+
+    def test_read_events_measure_ack_timing_and_concurrency(self):
+        before = self.request("/__state")[1]
+        previous_id = max((event.get("request_id") or 0 for event in before["requests"]), default=0)
+        self.request("/__control", dict(
+            delay=0.02, match="/web/book/read", read_replies=["ok", "ok"]))
+        payload = dict(b=weread_e(BOOK_ID), c=weread_e(1), ci=1,
+                       co=120, pr=25, rt=13)
+        self.assertEqual(self.request("/web/book/read", payload)[1]["succ"], 1)
+        self.assertEqual(self.request("/web/book/read", payload)[1]["succ"], 1)
+        state = self.request("/__state")[1]
+        events = [event for event in state["requests"]
+                  if (event.get("request_id") or 0) > previous_id
+                  and event["path"] == "/web/book/read"]
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(event["rt"] == 13 for event in events))
+        self.assertTrue(all(event["duration_ms"] >= 15 for event in events))
+        self.assertTrue(all(event["read_write_concurrency"] == 1 for event in events))
+        self.assertLessEqual(events[0]["completed_at"], events[1]["started_at"])
+        self.assertEqual(state["active_read_writes"], 0)
+        self.assertGreaterEqual(state["max_read_write_concurrency"], 1)
+
+    def test_rate_limit_can_supply_retry_after(self):
+        self.request("/__control", dict(
+            match="/web/book/read", retry_after=2,
+            read_replies=["rate_limited", "ok"]))
+        payload = dict(b=weread_e(BOOK_ID), c=weread_e(1), ci=1,
+                       co=120, pr=25, rt=11)
+        request = Request(self.base + "/web/book/read",
+                          data=json.dumps(payload).encode(),
+                          headers={"Content-Type": "application/json"})
+        with self.assertRaises(HTTPError) as limited:
+            self.opener.open(request, timeout=3)
+        self.assertEqual(limited.exception.code, 429)
+        self.assertEqual(limited.exception.headers["Retry-After"], "2")
+        self.assertEqual(self.request("/web/book/read", payload)[1]["succ"], 1)
 
     def test_unknown_routes_and_malformed_control_fail(self):
         with self.assertRaises(ValueError):

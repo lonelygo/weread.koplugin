@@ -816,11 +816,46 @@ end
 
 local read_error_statuses = { [400] = true, [401] = true, [403] = true, [422] = true, [429] = true }
 
+local month_starts = {
+    Jan = 0, Feb = 31, Mar = 59, Apr = 90, May = 120, Jun = 151,
+    Jul = 181, Aug = 212, Sep = 243, Oct = 273, Nov = 304, Dec = 334,
+}
+
+local function days_before_year(year)
+    local last = year - 1
+    return 365 * last + math.floor(last / 4) - math.floor(last / 100) + math.floor(last / 400)
+end
+
+local function http_date(value)
+    if type(value) ~= "string" then return nil end
+    local d, month, y, h, m, s = value:match(
+        "^%a%a%a, (%d%d) (%a%a%a) (%d%d%d%d) (%d%d):(%d%d):(%d%d) GMT$")
+    local start = month_starts[month]
+    if not start then return nil end
+    local day, year, hour, minute, second = tonumber(d), tonumber(y), tonumber(h), tonumber(m), tonumber(s)
+    if day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60 then return nil end
+    local days = days_before_year(year) - days_before_year(1970) + start + day - 1
+    if start >= 59 and days_before_year(year + 1) - days_before_year(year) == 366 then days = days + 1 end
+    return ((days * 24 + hour) * 60 + minute) * 60 + second
+end
+
+local function retry_after_seconds(headers)
+    local value = tostring(scalar_header_value(headers, "retry-after") or ""):match("^%s*(.-)%s*$")
+    if value:match("^%d+$") then return tonumber(value) end
+    local deadline = http_date(value)
+    if deadline then
+        -- A Kindle clock can drift. Use the server's Date when it is available.
+        return math.max(0, deadline - (http_date(scalar_header_value(headers, "date")) or os.time()))
+    end
+end
+
 function Client:report_read(payload, referer)
-    return self:post_json("https://weread.qq.com/web/book/read", payload, {
+    local body, status, headers = self:post_json("https://weread.qq.com/web/book/read", payload, {
         json_error_statuses = read_error_statuses,
         referer = referer or "https://weread.qq.com/",
     })
+    local retry_after = tonumber(status) == 429 and retry_after_seconds(headers) or nil
+    return body, status, headers, retry_after
 end
 
 -- All mutations use the existing reader login. A lost reply can follow a

@@ -158,8 +158,8 @@ assert(pipeline_options.position == live_position and not pipeline_options.force
 report.task = function() end
 assert(report:_schedule_replay(report.generation),
     "fresh success did not reserve a separate replay slot")
-assert(#scheduled == 1 and scheduled[1].delay >= 0.2,
-    "historic replay was not independently paced")
+assert(#scheduled == 1 and scheduled[1].delay <= 1 and scheduled[1].callback ~= report.task,
+    "starting historical replay must leave the regular live timer alone")
 scheduled[1].callback()
 assert(acked[2] == 1 and not rows[1], "separate replay did not shrink old backlog")
 assert(claims[2].exact_id == nil and gates[2].operation == "reading_time",
@@ -258,10 +258,30 @@ rows[12] = { id = 12, book_id = "old", elapsed_seconds = 30,
 next_id = 13
 scheduled60 = {}
 assert(report60:_schedule_replay(report60.generation))
-assert(scheduled60[1].delay >= 0.2,
-    "historic replay ignored its bounded replay slot")
+assert(scheduled60[1].delay <= 1 and scheduled60[1].callback ~= report60.task,
+    "history was unexpectedly tied to the 60-second live timer")
 scheduled60[1].callback()
 assert(not rows[12], "old backlog did not shrink across live periods")
+
+-- A slow history writer can still be running when the live deadline fires.
+-- Even if its replay callback fires first, the waiting live tick gets the writer.
+rows[13] = { id = 13, book_id = "old", elapsed_seconds = 5,
+    position = {}, database_path = "/test" }
+next_id = 14
+interval, clock, wall_clock = 30, 350, 2090
+local live_timer
+live_timer = function() report60:_tick(report60.generation, live_timer) end
+report60.task, report60.job = live_timer, {}
+live_timer()
+assert(report60.live_tick_due, "the regular live tick lost its turn behind a history writer")
+report60.job = nil
+assert(report60:_schedule_replay(report60.generation))
+report60.replay_task()
+assert(rows[13] and report60.replay_task, "replay jumped ahead of the due live interval")
+live_timer()
+assert(rows[13] and not rows[14] and gates[#gates].operation == "live_reading_time",
+    "the due 30-second foreground interval was not delivered before the next historical slice")
+
 interval, clock, wall_clock = 30, 350, 2090
 rows, next_id = {}, 14
 report60.position_provider = function() return nil, "position unavailable", true end
@@ -284,7 +304,7 @@ report._send = function(_self, _book_id, _book, _position, _elapsed, on_write)
     on_write()
     send_calls = send_calls + 1
     local reply = table.remove(replies, 1)
-    return reply[1], reply[2]
+    return reply[1], reply[2], nil, reply[3]
 end
 replies = { { { succ = 0, code = 14, synckey = "ignored" }, 200 } }
 local denied = report:_run_pipeline("book", { allow_renewal = true })
@@ -300,8 +320,9 @@ assert(unknown.error_kind == "unknown" and unknown.write_attempted,
     "unrecognized post-write response was treated as retryable")
 assert(send_calls == 1, "blank 200 triggered a context refresh or second POST")
 
-replies = { { nil, 429 } }
-assert(report:_run_pipeline("book", { allow_renewal = true }).error_kind == "rate_limited")
+replies = { { nil, 429, 83 } }
+local limited = report:_run_pipeline("book", { allow_renewal = true })
+assert(limited.error_kind == "rate_limited" and limited.retry_after == 83)
 assert(renewals == 0, "an ambiguous, rejected or rate-limited report renewed the login")
 
 replies = { { { succ = 0 }, 401 } }

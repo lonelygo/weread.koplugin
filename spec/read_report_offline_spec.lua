@@ -29,6 +29,7 @@ local gate_releases = {}
 local gate_contexts = {}
 local sync_requests = {}
 local scheduled_delays = {}
+local scheduled_callback
 local library_db = {
     enqueueReadTime = function(_self, book_id, seconds, position)
         queued = { id = 1, book_id = book_id, elapsed_seconds = seconds,
@@ -65,8 +66,9 @@ local report = ReadReport:new{
     client = {},
     library_db = library_db,
     scheduler = {
-        scheduleIn = function(_self, delay)
+        scheduleIn = function(_self, delay, callback)
             scheduled_delays[#scheduled_delays + 1] = delay
+            scheduled_callback = callback
         end,
         unschedule = function() end,
     },
@@ -125,15 +127,27 @@ assert(proceed and book_id == "queued-book" and position == nil
 assert(gate_contexts[#gate_contexts].book_id == "queued-book",
     "read-time gate used the unrelated foreground book instead of the claimed queue book")
 
-assert(report:_apply_queued_outcome(item, { accepted = true }))
+assert(report:_apply_queued_outcome(item, { accepted = true, write_started_at = clock }))
 assert(acked == 1 and quarantined == nil,
     "accepted replay was not acknowledged exactly once")
 assert(#gate_releases == 1 and gate_releases[1].operation == "reading_time",
     "read-time gate lease was not held through the completed request")
 report.task = function() end
 assert(report:drain())
-assert(scheduled_delays[#scheduled_delays] == 30,
-    "rapid drain bypassed the 30-second reading-time replay interval")
+assert(scheduled_delays[#scheduled_delays] == 1,
+    "a fast ACK must schedule the next historical start in one second")
+local schedules = #scheduled_delays
+assert(report:drain(true) and #scheduled_delays == schedules,
+    "another manual tap duplicated the pending replay callback")
+clock = clock + 0.99
+scheduled_callback()
+local remaining = scheduled_delays[#scheduled_delays]
+assert(#scheduled_delays == schedules + 1 and remaining > 0 and remaining < 0.02,
+    "a slightly early scheduler callback dropped the rest of the queue")
+clock = clock + 0.51
+report.replay_task = nil
+assert(report:drain() and scheduled_delays[#scheduled_delays] == 0,
+    "a slow ACK unnecessarily slept for another full interval")
 report.replay_task = nil
 report.task = nil
 
@@ -145,7 +159,7 @@ assert(acked == nil and quarantined[1] == 1,
     "ambiguous replay was deleted or left eligible for blind retry")
 
 wall_clock = wall_clock + 31
-local proceed_before_context = report:_precheck()
+local proceed_before_context = report:_precheck(true)
 assert(proceed_before_context, "context-failure replay was not admitted")
 assert(not report:_apply_queued_outcome(queued, {
     accepted = false, write_attempted = false,
@@ -196,6 +210,7 @@ report._run_pipeline = function(_self, _book_id, options)
     pipeline_options = options
     return { accepted = true }
 end
+report.manual_replay_tick = true
 assert(report:report_once())
 assert(pipeline_options.force_context == true and pipeline_options.position == nil,
     "reading-time replay reused an offline position that could regress cloud progress")

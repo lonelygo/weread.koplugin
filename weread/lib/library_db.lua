@@ -792,6 +792,47 @@ function LibraryDB:setSyncLastConfirmedAt(timestamp)
     return ok
 end
 
+-- The reading-time and progress writers share WeRead's book/read service.
+-- Persist only an explicit server throttle so a KOReader restart cannot turn
+-- one 429 response into an immediate burst from the remaining outbox.
+function LibraryDB:setReadWriteRetryAfter(timestamp)
+    timestamp = math.max(0, math.floor(tonumber(timestamp) or 0))
+    local db = self:open()
+    if not db then return false end
+    local stmt
+    local ok, err = pcall(function()
+        stmt = db:prepare([[
+            INSERT INTO sync_status_meta (name, value)
+            VALUES ('read_write_retry_after', ?)
+            ON CONFLICT(name) DO UPDATE SET value=MAX(value, excluded.value)
+        ]])
+        stmt:reset():bind(timestamp):step()
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if not ok then
+        logger.warn("library_db read-write retry timestamp failed:", err)
+    end
+    return ok
+end
+
+function LibraryDB:readWriteRetryAfter()
+    local db = self:open()
+    if not db then return 0 end
+    local stmt, timestamp
+    local ok = pcall(function()
+        stmt = db:prepare([[
+            SELECT value FROM sync_status_meta
+             WHERE name='read_write_retry_after'
+        ]])
+        local row = stmt:reset():step()
+        timestamp = row and tonumber(row[1]) or 0
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    return ok and timestamp or 0
+end
+
 function LibraryDB:recoverStaleReadTimeClaims(cutoff)
     local db = self:open()
     if not db then return false end

@@ -521,5 +521,15 @@ end
 report_client.json_decode = function() error("undecodable") end
 local invalid_body, failure_status = report_client:report_read({})
 expect(invalid_body == nil and failure_status == 429, "unreadable HTTP failure lost its status")
+for _, case in ipairs({
+    { { ["Retry-After"] = " 83 " }, 83 },
+    { { date = "Thu, 29 Feb 2024 23:59:50 GMT",
+        ["retry-after"] = { "Fri, 01 Mar 2024 00:00:10 GMT" } }, 20 },
+    { { ["retry-after"] = "invalid" }, nil },
+}) do
+    report_client.request = function() return "fixture", 429, case[1] end
+    local _, status, _, delay = report_client:report_read({})
+    expect(status == 429 and delay == case[2], "reading endpoint lost its Retry-After")
+end
 
 print(("client_spec: %d checks"):format(checks))

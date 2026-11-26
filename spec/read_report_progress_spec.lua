@@ -8,6 +8,7 @@ local cached_catalog
 local saved_catalog
 local catalog_fetch_count = 0
 local reader_book_version
+local reader_page_requests = 0
 package.preload["weread.lib.content"] = function()
     return {
         load_catalog_cache = function(_client, _settings, book)
@@ -19,6 +20,7 @@ package.preload["weread.lib.content"] = function()
             return true
         end,
         ensure_reader_state = function(_client, book)
+            reader_page_requests = reader_page_requests + 1
             book.psvts = "fresh-session"
             book.pclts = "fresh-clock"
             book.book_version = reader_book_version or book.book_version
@@ -246,6 +248,40 @@ test("forced historical context uses fresh cloud location and cached catalog", f
     eq(context.chapter_offset, 150, "fresh cloud offset")
     eq(context.progress, 99, "original cloud percent")
     eq(catalog_fetch_count, 0, "valid catalog was not downloaded again")
+end)
+
+test("consecutive historical ACKs reuse the session and follow the phone each time", function()
+    local report, records = fixture()
+    local book = { book_id = "book" }
+    local offset, now, progress_reads, catalog_writes = 50, 1000, 0, 0
+    local function current_progress()
+        progress_reads = progress_reads + 1
+        return { book = { bookId = "book", progress = 42, chapterUid = 22, chapterIdx = 2,
+            chapterOffset = offset } }
+    end
+    report.client.get_progress = current_progress
+    report.client.get_web_progress = current_progress
+    report.library_db = { putChapters = function() catalog_writes = catalog_writes + 1 end }
+    report.now = function() return now end
+    report.ensure_context = function(_, book_id, force)
+        book.chapters = nil -- a new fork loads the scalar BookStore record
+        return report:_build_context(book_id, force, book)
+    end
+    local before = reader_page_requests
+    local options = { force_context = true, elapsed_seconds = 5 }
+    assert(report:_run_pipeline("book", options).accepted)
+    eq(#records, 2, "first session entry and first time")
+    offset, now = 150, 1002
+    assert(report:_run_pipeline("book", options).accepted)
+    eq(reader_page_requests - before, 1, "two slices loaded one reader page")
+    eq(catalog_writes, 1, "two slices indexed the catalog once")
+    eq(#records, 3, "the second slice did not enter the same session again")
+    eq(records[3].chapter_offset, 150, "second slice followed the updated phone position")
+    eq(progress_reads, 4, "each slice read both current progress sources")
+    now = 1901
+    assert(report:_run_pipeline("book", options).accepted)
+    eq(reader_page_requests - before, 2, "activity did not extend the old reader token's TTL")
+    eq(records[4].kind, "enter", "the expired reader session was re-entered")
 end)
 
 test("verified live position does not depend on auxiliary cloud progress", function()

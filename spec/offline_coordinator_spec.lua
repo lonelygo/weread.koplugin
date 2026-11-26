@@ -41,11 +41,21 @@ local function fixture()
                     unknown_seconds = state.unknown or 0, last_confirmed_at = 1 }
             end,
             pendingOfflineBook = function(_, with_time, with_annotations)
-                if with_time or with_annotations then return state.queued end
+                return with_time and state.queued or with_annotations and state.annotation_book or nil
             end,
             deferPendingReadTimeForBook = function(_, book, delay)
                 state.deferred_book, state.deferred_delay = book, delay
                 return true, 1
+            end,
+            readWriteRetryAfter = function()
+                return state.persisted_read_retry or 0
+            end,
+            setReadWriteRetryAfter = function(_, deadline)
+                state.persisted_read_retry = math.max(
+                    state.persisted_read_retry or 0, deadline)
+                state.persisted_read_retry_writes =
+                    (state.persisted_read_retry_writes or 0) + 1
+                return true
             end,
         },
         isNetworkConnected = function() return state.online end,
@@ -420,6 +430,120 @@ local busy_result = busy_state.job.task({ checkCancelled = function() end })
 assert(not busy_result.ok and not busy_state.renew_calls,
     "a non-authentication probe failure attempted cookie renewal")
 busy_probe:deactivate()
+
+local rate_limited, limited_state, limited_tasks, limited_step = fixture()
+limited_state.account = "rate-limit-account"
+rate_limited:activate()
+limited_step()
+limited_state.queued, limited_state.probe_book = "book", "book"
+limited_state.annotation_book = "book"
+rate_limited:request("network_connected")
+limited_step()
+limited_state.job.on_done({ ok = true, value = true })
+limited_step()
+local allowed, limited_release = rate_limited:gate(
+    "weread_read_write", { operation = "reading_time", book_id = "book" })
+assert(allowed)
+limited_release({
+    accepted = false, write_attempted = false,
+    error_kind = "rate_limited", retry_after = 7,
+})
+assert(limited_state.persisted_read_retry == limited_state.time + 7
+    and limited_state.persisted_read_retry_writes == 1
+    and limited_tasks[rate_limited.read_retry] == 7,
+    "a reading-time rate limit was not persisted and scheduled once")
+local progress_allowed, progress_reason = rate_limited:gate(
+    "weread_read_write", { operation = "progress", book_id = "book" })
+assert(not progress_allowed and progress_reason == "rate_limited",
+    "a book/read rate limit did not pause progress writes")
+local annotation_allowed, annotation_release = rate_limited:gate(
+    "annotation_write", { operation = "annotation", book_id = "book" })
+assert(annotation_allowed, "book/read throttling blocked the annotation endpoint")
+annotation_release({ accepted = true })
+assert(rate_limited:startManual())
+limited_step()
+assert(limited_state.probes == 2, "annotation work should verify its own connection during the throttle")
+limited_state.job.on_done({ ok = true, value = true })
+limited_step()
+assert(limited_state.times == 1 and limited_state.annotations >= 2
+    and limited_state.positions == 1,
+    "a throttled pass retried read work or failed to drain annotations")
+assert(table.concat(limited_state.notices, ",") == "started,service_busy",
+    "a manual upload hid the active server throttle")
+
+local switched, switched_state, switched_tasks, switched_step = fixture()
+switched_state.account = limited_state.account
+switched:activate()
+switched_state.queued, switched_state.probe_book = "book", "book"
+switched_step()
+assert(switched_state.probes == 0
+    and switched_tasks[switched.read_retry] == 7,
+    "moving between Home and reader bypassed the account throttle")
+switched_state.time = switched_state.time + 7
+switched_tasks[switched.read_retry] = nil
+switched.read_retry()
+switched_step()
+assert(switched_state.probes == 1,
+    "the account throttle did not resume automatically at its deadline")
+switched:deactivate()
+
+local long_limit, long_state, long_tasks, long_step = fixture()
+long_state.account = "long-rate-limit"
+long_state.queued, long_state.probe_book = "book", "book"
+long_limit:activate()
+assert(long_limit:_setReadWriteRateLimit(long_state.account, 7200)
+    == long_state.time + 7200
+    and long_state.persisted_read_retry == long_state.time + 7200
+    and long_tasks[long_limit.read_retry] == 3600,
+    "a Retry-After over one hour was shortened")
+long_step()
+assert(long_state.probes == 0)
+long_state.time = long_state.time + 3600
+long_tasks[long_limit.read_retry] = nil
+long_limit.read_retry()
+long_step()
+assert(long_state.probes == 0
+    and long_tasks[long_limit.read_retry] == 3600,
+    "the hourly timer resumed writes before the full Retry-After")
+long_state.time = long_state.time + 3600
+long_tasks[long_limit.read_retry] = nil
+long_limit.read_retry()
+long_step()
+assert(long_state.probes == 1,
+    "a long Retry-After did not resume at its true deadline")
+long_limit:deactivate()
+
+local restarted, restarted_state, restarted_tasks, restarted_step = fixture()
+restarted_state.account = "persisted-rate-limit"
+restarted_state.persisted_read_retry = restarted_state.time + 9
+-- The single rate-limited row is still hidden by SQLite's retry_after.
+restarted_state.probe_book = "book"
+restarted:activate()
+restarted_step()
+assert(restarted_state.probes == 0
+    and restarted_tasks[restarted.read_retry] == 9,
+    "a restart ignored the persisted book/read throttle")
+restarted:deactivate()
+
+local context_retry, context_state, context_tasks, context_step = fixture()
+context_state.account = "context-retry"
+context_retry:activate()
+context_step()
+context_state.queued, context_state.probe_book = "book", "book"
+context_retry:request("network_connected")
+context_step()
+context_state.job.on_done({ ok = true, value = true })
+context_step()
+local context_allowed, context_release = context_retry:gate(
+    "weread_read_write", { operation = "reading_time", book_id = "book" })
+assert(context_allowed)
+context_release({
+    accepted = false, write_attempted = false,
+    error_kind = "context", retry_after = 23,
+})
+assert(context_tasks[context_retry.book_retry] == 23,
+    "a pre-write context delay was left waiting for the heartbeat")
+context_retry:deactivate()
 
 local timed_out, timeout_state, _, timeout_step = fixture()
 timed_out:activate()

@@ -136,7 +136,6 @@ assert(expected >= 65 and expected <= 66, "virtual offline session accounted onc
 reader():onClose()
 FileManager:showFiles(root .. "/books")
 wait_for("file manager", function() return FileManager.instance and FileManager.instance.weread end)
-FileManager.instance.weread.read_report.now = function() return virtual_now end
 api("/__control", { times = 0 })
 connected = true
 heartbeat()
@@ -149,31 +148,43 @@ for _ = 1, 3 do
     spin(0.2)
 end
 assert(#reports() == 1, "repeated triggers cannot accelerate replay")
-virtual_now = virtual_now + 29
-heartbeat()
-spin(0.4)
-assert(#reports() == 1, "29 seconds is still inside replay cooldown")
-virtual_now = virtual_now + 1
-heartbeat()
 wait_for("second 30-second slice", function() return #reports() == 2 and FileManager.instance.weread.read_report.job == nil
     and FileManager.instance.weread.library_db:readTimeStatus().pending == expected - 60 end)
 assert(reports()[2].rt == 30, "second slice bounded to 30 seconds")
-virtual_now = virtual_now + 30
-heartbeat()
 wait_for("final remaining slice", function()
     return #reports() == 3 and FileManager.instance.weread.library_db:readTimeStatus().pending == 0
 end)
 local result = reports()
 assert(result[3].rt == expected - 60, "remaining exact seconds")
-virtual_now = virtual_now + 60
 heartbeat()
 FileManager.instance:handleEvent(Event:new("NetworkConnected"))
 spin(0.5)
 assert(#reports() == 3, "acknowledged slices never replay")
+local receipts = FileManager.instance.weread.library_db:readTimeReceipts()
+assert(receipts.count == 3 and receipts.seconds == expected,
+    "three explicit ACKs conserve the captured session")
+local timed = {}
+for _, item in ipairs(api("/__state").requests) do
+    if item.path == "/web/book/read" and (tonumber(item.rt) or 0) > 0 then
+        timed[#timed + 1] = item
+    end
+end
+assert(#timed == 3, "continuous scheduler produced duplicate elapsed-time requests")
+local start_intervals = {}
+for index = 2, #timed do
+    local interval = timed[index].started_at - timed[index - 1].started_at
+    start_intervals[#start_intervals + 1] = interval
+    assert(interval >= 0.85 and interval < 6,
+        "Home replay did not use the one-second continuous cadence")
+    assert(timed[index].started_at >= timed[index - 1].completed_at,
+        "Home replay overlapped elapsed-time writes")
+end
 local out = assert(io.open(root .. "/evidence/chunks-result.json", "wb"))
 out:write(json.encode({ expected_seconds = expected, positive_reports = result,
-    clock_injected = true, repeated_triggers_blocked = true, cooldown_boundary = { 29, 30 } }))
+    receipt_count = receipts.count, receipt_seconds = receipts.seconds,
+    capture_clock_injected = true, continuous_replay_clock = "wall",
+    repeated_triggers_blocked = true, start_intervals = start_intervals }))
 out:close()
 FileManager.instance:onClose()
 UIManager:quit()
-print("PASS: real queued 65-second session -> FileManager heartbeat 30/30/remainder; clock boundary cooldown and idempotence")
+print("PASS: queued 65-second session -> one Home heartbeat continuously replays 30/30/remainder without overlap")

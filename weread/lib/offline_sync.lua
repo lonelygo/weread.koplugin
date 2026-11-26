@@ -4,6 +4,7 @@
 local Sync = {}
 Sync.__index = Sync
 local WorkerSettings = require("weread.lib.worker_settings")
+local has_socket, socket = pcall(require, "socket")
 
 local active
 local read_writer
@@ -12,8 +13,13 @@ local annotation_writer
 -- returning. Only an explicit tap subscribes the current login to a result.
 local manual
 local last_probe_renewal
+local read_write_limits = {}
 local BOOK_RETRY_SECONDS = 15
+local CONTEXT_RETRY_SECONDS = 60
 local PROBE_RENEWAL_COOLDOWN_SECONDS = 10 * 60
+local DEFAULT_RATE_LIMIT_SECONDS = 60
+local MAX_RATE_LIMIT_SECONDS = 365 * 24 * 60 * 60
+local MAX_RATE_LIMIT_TIMER_SECONDS = 60 * 60
 
 local connection_checks = {
     heartbeat = true, network_connected = true, resume = true, manual_sync = true,
@@ -50,7 +56,7 @@ end
 function Sync.new(class, plugin, scheduler, probe_worker, now)
     local self = setmetatable({
         plugin = plugin, scheduler = scheduler, worker = probe_worker,
-        now = now or os.time, generation = 0,
+        now = now or (has_socket and socket.gettime) or os.time, generation = 0,
     }, class)
     self.heartbeat = function()
         if active ~= self or self.paused then return end
@@ -63,6 +69,10 @@ function Sync.new(class, plugin, scheduler, probe_worker, now)
     end
     self.book_retry = function()
         self.book_retry_due = nil
+        if active == self and not self.paused then self:_schedule() end
+    end
+    self.read_retry = function()
+        self.read_retry_due = nil
         if active == self and not self.paused then self:_schedule() end
     end
     return self
@@ -93,8 +103,10 @@ function Sync:pause()
     self.scheduler:unschedule(self.heartbeat)
     self.scheduler:unschedule(self.run)
     self.scheduler:unschedule(self.book_retry)
+    self.scheduler:unschedule(self.read_retry)
     self.due = nil
     self.book_retry_due = nil
+    self.read_retry_due = nil
 end
 
 function Sync:deactivate()
@@ -238,6 +250,53 @@ function Sync:_schedule_book_retry(delay)
     self.scheduler:scheduleIn(delay, self.book_retry)
 end
 
+local function read_limit_key(data_dir, account)
+    return tostring(data_dir or "") .. "\31" .. tostring(account or "")
+end
+
+function Sync:_readWriteRetryAfter(account)
+    local db = self.plugin.library_db
+    local key = read_limit_key(db.data_dir, account)
+    if self.read_limit_key ~= key then
+        self.read_limit_key = key
+        local persisted = type(db.readWriteRetryAfter) == "function"
+            and tonumber(db:readWriteRetryAfter()) or 0
+        persisted = math.min(persisted or 0,
+            self.now() + MAX_RATE_LIMIT_SECONDS)
+        read_write_limits[key] = math.max(
+            tonumber(read_write_limits[key]) or 0, persisted or 0)
+    end
+    local deadline = tonumber(read_write_limits[key]) or 0
+    return deadline > self.now() and deadline or 0
+end
+
+function Sync:_scheduleReadRetry(deadline)
+    if active ~= self or self.paused then return end
+    local delay = math.max(0.1, math.min(MAX_RATE_LIMIT_TIMER_SECONDS,
+        (tonumber(deadline) or 0) - self.now()))
+    local due = self.now() + delay
+    if self.read_retry_due and self.read_retry_due <= due then return end
+    self.scheduler:unschedule(self.read_retry)
+    self.read_retry_due = due
+    self.scheduler:scheduleIn(delay, self.read_retry)
+end
+
+function Sync:_setReadWriteRateLimit(account, delay)
+    delay = math.max(1, math.min(MAX_RATE_LIMIT_SECONDS,
+        math.floor(tonumber(delay) or DEFAULT_RATE_LIMIT_SECONDS)))
+    local db = self.plugin.library_db
+    local key = read_limit_key(db.data_dir, account)
+    local deadline = math.max(self.now() + delay,
+        tonumber(read_write_limits[key]) or 0)
+    read_write_limits[key] = deadline
+    self.read_limit_key = key
+    if type(db.setReadWriteRetryAfter) == "function" then
+        db:setReadWriteRetryAfter(math.ceil(deadline))
+    end
+    self:_scheduleReadRetry(deadline)
+    return deadline
+end
+
 function Sync:request(reason, context)
     if active ~= self or self.paused then return false end
     context = context or {}
@@ -338,6 +397,31 @@ function Sync:_run()
     if summary.actionable > 0 or explicit.manual or explicit.resume_conflicts then
         position_book = summary.book_id
     end
+    local read_retry_after = self:_readWriteRetryAfter(account)
+    if read_retry_after > 0 then
+        -- A restarted coordinator may have only a single deferred row. Its
+        -- database retry time hides it from the runnable-book query until due.
+        self:_scheduleReadRetry(read_retry_after)
+        local pending_time = with_time and plugin.library_db:pendingOfflineBook(true, false)
+        if not pending_time and attempt and with_time and plugin.library_db.readTimeStatus then
+            pending_time = plugin.library_db:readTimeStatus().pending > 0
+        end
+        if pending_time or summary.actionable > 0 then
+            local note_book = with_annotations and plugin.library_db:pendingOfflineBook(false, true)
+            if note_book and not self:_verified(account) then
+                if self.probe_failed ~= account then self:_probe(account, note_book) end
+                return
+            end
+            local annotations = note_book and plugin:_offlineAnnotationCoordinator()
+            if annotations then self.allow_data = true end
+            local scheduled = annotations and annotations:drain() or false
+            if attempt then
+                attempt.failure = "service_busy"
+                if not scheduled then self:_finishManual() end
+            end
+            return
+        end
+    end
     local book_id = explicit.book_id or position_book or queued_book
     if not book_id or book_id == "" then
         self.explicit, self.recheck = nil, nil
@@ -381,6 +465,7 @@ function Sync:_run()
             -- Located annotations use an independent endpoint and may proceed;
             -- this book's time remains delayed until progress is safe.
             self.allow_data = true
+            self.time_needs_reconcile = nil
             local annotations = plugin:_offlineAnnotationCoordinator()
             local scheduled = with_annotations and annotations
                 and annotations:drain() or false
@@ -395,6 +480,7 @@ function Sync:_run()
         if status == "uploading" or status == "pulling" or status == "stale"
             or (status == "deferred" and result.reason == "busy") then return end
         self.allow_data = true
+        self.time_needs_reconcile = nil
         local scheduled
         if with_time and queued_book then
             scheduled = plugin.read_report:drain(current ~= nil)
@@ -554,6 +640,13 @@ function Sync:gate(kind, context)
     local is_read = kind == "weread_read_write"
     local live = (is_read and context.operation == "live_reading_time")
         or (not is_read and context.operation == "live_annotation")
+    if is_read then
+        local read_retry_after = self:_readWriteRetryAfter(account)
+        if read_retry_after > 0 then
+            self:_scheduleReadRetry(read_retry_after)
+            return false, "rate_limited"
+        end
+    end
     -- A fresh online mutation checks the service itself. Historical time
     -- shares the progress endpoint and still goes through reconnect comparison.
     if not live and not self:_verified(account) then return false, "probe_needed" end
@@ -565,7 +658,8 @@ function Sync:gate(kind, context)
     end
     if is_read and context.operation ~= "progress" then
         local progress = self.plugin.progress_sync
-        if self.stage == "progress" or progress.uploading or progress.reconciling or progress.pulling
+        if (not live and self.time_needs_reconcile) or self.stage == "progress"
+            or progress.uploading or progress.reconciling or progress.pulling
             or (progress.awaiting_choice and progress:awaiting_choice(context.book_id)) then
             return false, "progress_pending"
         end
@@ -584,6 +678,16 @@ function Sync:gate(kind, context)
         end
         local error_kind = outcome.error_kind
         local time_row = is_read and context.operation ~= "progress"
+        -- The reporter can arm the next historical slice directly on receipt.
+        -- Reconcile any local position captured during this write before its
+        -- successor acquires the gate, including when the queue changes books.
+        if time_row then active.time_needs_reconcile = true end
+        if is_read and error_kind == "rate_limited" then
+            active:_setReadWriteRateLimit(account, outcome.retry_after)
+        elseif time_row and error_kind == "context" then
+            active:_schedule_book_retry(
+                tonumber(outcome.retry_after) or CONTEXT_RETRY_SECONDS)
+        end
         local ambiguous = (time_row or not is_read) and outcome.write_attempted == true
             and (error_kind == "transport" or error_kind == "unknown" or error_kind == "job")
         local held_row = ambiguous or (time_row and (error_kind == "rejected" or error_kind == "context"))
