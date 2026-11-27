@@ -58,7 +58,7 @@ expect(requests[2].url ==
     "https://weread.qq.com/api/auth/getLoginInfo?uid=uid%20value&otp=1234",
     "non-empty OTP was serialized incorrectly")
 
-local function run_login(fingerprint)
+local function run_login(fingerprint, old_vid)
     local protocol_requests, saved = {}, nil
     local responses = {
         { "html", { ["set-cookie"] = "wr_preflight=test-preflight; Path=/" } },
@@ -77,23 +77,40 @@ local function run_login(fingerprint)
     }
     protocol_client.request_follow = protocol_client.request
     local settings = {
+        get = function(_self, key)
+            assert(key == "account")
+            return { user_vid = old_vid }
+        end,
         get_device_fingerprint = function() return fingerprint end,
         update_auth = function(_self, credentials, options)
             expect(options.replace_cookies, "login should replace account cookies")
             saved = credentials
         end,
     }
-    local resumed
-    local protocol_login = QRLogin:new({ offline_sync = {
+    local resumed, closed_old, started_new
+    local host = {
+        onWeReadAccountChanging = function(_, previous)
+            expect(not saved and previous == old_vid, "close old session before replacing credentials")
+            closed_old = true
+        end,
+        onWeReadAccountChanged = function(_, switched)
+            expect(saved and saved.account.user_vid == "test-user", "publish credentials before resuming")
+            started_new = switched
+        end,
+    }
+    host.offline_sync = {
         request = function(_sync, reason)
             expect(saved ~= nil, "login must be saved before checking queued records")
             resumed = reason
         end,
-    } }, protocol_client, settings)
+    }
+    local protocol_login = QRLogin:new(host, protocol_client, settings)
     local uid = protocol_login:_begin_protocol()
     local result = protocol_login:_poll_protocol(uid)
     protocol_login:_complete_protocol(result, protocol_login.generation)
     expect(resumed == "login_completed", "fresh login should recheck pending records")
+    expect((closed_old == true) == (old_vid ~= "test-user")
+        and started_new == (old_vid ~= "test-user"), "only an account switch resets the reader session")
     local expected_urls = {
         "https://weread.qq.com/r/weread-skills",
         "https://weread.qq.com/api/auth/getLoginUid",
@@ -119,7 +136,7 @@ local function run_login(fingerprint)
     return protocol_requests[2].headers.Cookie
 end
 
-expect(run_login("1234567890") ~= run_login("2345678901"),
+expect(run_login("1234567890", "previous-user") ~= run_login("2345678901", "test-user"),
     "separate device fingerprints must reach the server independently")
 
 print("qr_login_spec: " .. checks .. " checks passed")

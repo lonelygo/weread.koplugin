@@ -264,11 +264,10 @@ function M:confirmClearAccount()
         ok_text = _("Clear"),
         ok_callback = self:safeCallback(_("Clear"), function()
             self.qr_login:cancel()
-            self.read_report:stop("account_cleared")
+            self:onWeReadAccountChanging(self.settings:get("account", {}).user_vid)
             self.settings:reset_account()
-            if self.onWeReadAccountChanged then
-                self:onWeReadAccountChanged()
-            end
+            self:onWeReadAccountChanged(false)
+            self.offline_sync:request("account_cleared")
             self:refreshLoginMenu()
             self:showInfo(_("WeRead account data cleared."))
         end),

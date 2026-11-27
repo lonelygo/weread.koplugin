@@ -66,7 +66,15 @@ local function fixture()
         isWifiEnabledForSync = function() return state.wifi_enabled end,
         showManualSyncResult = function(_, code) table.insert(state.notices, code) end,
         progress_sync = {
-            capture_for_reconnect = function() state.captures = state.captures + 1 end,
+            has_offline_movement = function() return state.offline_movement == true end,
+            has_pending_for_book = function(_, book) return state.pending_positions > 0 and state.position_book == book end,
+            capture_for_reconnect = function()
+                state.captures = state.captures + 1
+                if state.offline_movement then
+                    state.pending_positions, state.position_book = 1, "book"
+                    state.offline_movement = false
+                end
+            end,
             has_pending = function()
                 return state.pending_positions > 0,
                     { actionable = state.pending_positions, book_id = state.position_book }
@@ -906,4 +914,42 @@ live:disconnected()
 assert(not live:gate("weread_read_write", live_ctx), "a disconnected reader must buffer locally")
 assert(not live:gate("annotation_write", {operation = "live_annotation"}))
 live:deactivate()
+
+do
+    local coordinator, s, _, run_check = fixture()
+    coordinator:activate()
+    run_check()
+    local live_tick = { operation = "live_reading_time", book_id = "book" }
+    local tick_allowed, acknowledge_tick = coordinator:gate("weread_read_write", live_tick)
+    assert(tick_allowed)
+    acknowledge_tick({ accepted = true })
+    run_check()
+    -- A temporarily stale OS link hint must not discard a fresh WeRead ACK
+    -- or make normal page turns look like reconnects on an empty queue.
+    s.online = false
+    for _, event in ipairs({"heartbeat", "network_connected", "resume"}) do
+        coordinator:request(event)
+        run_check()
+        assert(s.captures == 0 and s.probes == 0 and s.positions == 0 and coordinator:isConnected(),
+            "idle connectivity check manufactured work or revoked the service receipt: " .. event)
+    end
+    coordinator:disconnected()
+    assert(s.captures == 1 and not coordinator:isConnected())
+    s.offline_movement, s.online = true, true
+    local resumed, why = coordinator:gate("weread_read_write", live_tick)
+    assert(not resumed and why == "progress_pending" and s.captures == 2 and s.position_book == "book",
+        "a live tick overtook reconciliation of a genuinely offline page turn")
+    s.probe_book = "book"
+    run_check()
+    assert(s.probes == 1, "reconcile was not scheduled after the missed reconnect event")
+    s.job.on_done({ ok = true, value = true })
+    run_check()
+    local still_blocked = coordinator:gate("weread_read_write", live_tick)
+    assert(not still_blocked, "a later tick ignored this book's pending decision")
+    s.pending_positions, s.position_book = 0, nil
+    local settled, finish_book = coordinator:gate("weread_read_write", live_tick)
+    assert(settled, "settling the position must release normal online reporting")
+    finish_book({ accepted = true })
+    coordinator:deactivate()
+end
 print("offline_coordinator_spec: passive checks, replay gates, account and screen transitions passed")

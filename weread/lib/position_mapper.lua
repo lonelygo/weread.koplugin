@@ -249,14 +249,41 @@ function PositionMapper.compare(local_position, remote, threshold)
     return delta > 0 and "remote_ahead" or "local_ahead", delta
 end
 
+function PositionMapper.has_physical_position(position)
+    if type(position) ~= "table" or position.has_chapter_offset == false then
+        return false
+    end
+    local uid = position.chapter_uid
+    return uid ~= nil and tostring(uid) ~= ""
+        and position.chapter_offset ~= nil
+end
+
+function PositionMapper.same_physical_position(left, right, tolerance)
+    if not PositionMapper.has_physical_position(left)
+        or not PositionMapper.has_physical_position(right) then
+        return false
+    end
+    tolerance = math.max(0, tonumber(tolerance) or 1)
+    return tostring(left.chapter_uid) == tostring(right.chapter_uid)
+        and math.abs((tonumber(left.chapter_offset) or 0)
+            - (tonumber(right.chapter_offset) or 0)) <= tolerance
+end
+
 function PositionMapper.same_position(left, right, tolerance)
     if type(left) ~= "table" or type(right) ~= "table" then return false end
+    local left_physical = PositionMapper.has_physical_position(left)
+    local right_physical = PositionMapper.has_physical_position(right)
+    if left_physical and right_physical then
+        return PositionMapper.same_physical_position(left, right, 1)
+    end
     tolerance = math.max(0, tonumber(tolerance) or 0.5)
-    return math.abs((tonumber(left.percent) or 0) - (tonumber(right.percent) or 0))
-            <= tolerance
-        and tostring(left.chapter_uid or "") == tostring(right.chapter_uid or "")
-        and math.abs((tonumber(left.chapter_offset) or 0)
-            - (tonumber(right.chapter_offset) or 0)) <= 1
+    local left_uid = left.chapter_uid
+    local right_uid = right.chapter_uid
+    local chapters_compatible = left_uid == nil or right_uid == nil
+        or tostring(left_uid) == tostring(right_uid)
+    return chapters_compatible
+        and math.abs((tonumber(left.percent) or 0)
+            - (tonumber(right.percent) or 0)) <= tolerance
 end
 
 return PositionMapper

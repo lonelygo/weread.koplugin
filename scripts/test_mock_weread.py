@@ -51,7 +51,7 @@ class MockTests(unittest.TestCase):
         self.request("/__control", dict(delay=0, match="", status=503, times=0, drop=False,
                                         empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1,
                                         progress_reply="ok", renew_reply="ok", retry_after=0,
-                                        read_replies=[]))
+                                        read_replies=[], gateway_progress=None))
 
     def test_prepare_can_install_an_exact_candidate_archive(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -107,6 +107,20 @@ class MockTests(unittest.TestCase):
         self.request("/web/book/read", dict(b=weread_e(BOOK_ID), c=weread_e(2), ci=2, co=120, pr=25))
         _, progress = self.gateway("/book/getprogress", bookId=BOOK_ID)
         self.assertEqual(progress["book"]["chapterOffset"], 120)
+
+    def test_gateway_progress_override_is_read_only_and_validated(self):
+        override = dict(chapterUid=2, chapterIdx=2, chapterOffset=321,
+                        progress=27, updateTime=1)
+        before = self.request("/__state")[1]
+        self.assertEqual(self.request("/__control", dict(gateway_progress=override))[0], 200)
+        _, progress = self.gateway("/book/getprogress", bookId=BOOK_ID)
+        self.assertEqual(progress["book"], override)
+        after = self.request("/__state")[1]
+        self.assertEqual(after["progress"], before["progress"])
+        self.assertEqual(self.request("/__control", dict(gateway_progress={"progress": 3}))[0], 400)
+        self.assertEqual(self.request("/__control", dict(gateway_progress=False))[0], 200)
+        self.assertIsNone(self.request("/__state")[1]["control"]["gateway_progress"])
+        self.assertEqual(self.request("/__control", dict(gateway_progress=None))[0], 200)
 
     def test_private_annotation_write_contract_and_delete(self):
         quote = "这是第2章的第1段"

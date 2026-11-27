@@ -128,7 +128,12 @@ function M:closeWeReadUI()
     end
 end
 
-function M:onWeReadAccountChanged()
+function M:onWeReadAccountChanging(old_vid)
+    self.read_report:on_account_changed(self.library_db:accountKey())
+    self.progress_sync:on_account_changed(old_vid)
+end
+
+function M:onWeReadAccountChanged(start_session)
     self:closeWeReadUI()
     self.shelf_regular = nil
     self.shelf_mp = nil
@@ -137,6 +142,10 @@ function M:onWeReadAccountChanged()
     self.shelf_group_key = nil
     self.shelf_search_keyword = nil
     self.shelf_view_pages = nil
+    if start_session then
+        if self.ui and self.ui.document then self.progress_sync:on_reader_ready() end
+        self.read_report:on_account_ready()
+    end
 end
 
 function M:applyShelfSnapshot(all_books, archives)

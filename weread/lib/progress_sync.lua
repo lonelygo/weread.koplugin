@@ -50,6 +50,52 @@ local function position_identity(account_id, book_id, position)
     }, "|")
 end
 
+local function positions_match(left, right)
+    return PositionMapper.same_position(left, right)
+end
+
+local function has_physical_position(position)
+    if type(PositionMapper.has_physical_position) == "function" then
+        return PositionMapper.has_physical_position(position)
+    end
+    return type(position) == "table"
+        and position.has_chapter_offset ~= false
+        and position.chapter_uid ~= nil
+        and position.chapter_offset ~= nil
+end
+
+local function positions_aligned(left, right, threshold)
+    if positions_match(left, right) then return true end
+    if has_physical_position(left) and has_physical_position(right) then
+        return false
+    end
+    local left_uid = type(left) == "table" and left.chapter_uid or nil
+    local right_uid = type(right) == "table" and right.chapter_uid or nil
+    if left_uid ~= nil and right_uid ~= nil
+        and tostring(left_uid) ~= tostring(right_uid) then
+        return false
+    end
+    return math.abs((tonumber(left and left.percent) or 0)
+        - (tonumber(right and right.percent) or 0))
+        <= math.max(0, tonumber(threshold) or SAME_THRESHOLD_PERCENT)
+end
+
+local function live_report_position(book_id, local_position, remote_position)
+    local position = {
+        book_id = tostring(book_id or remote_position.book_id or ""),
+        percent = tonumber(remote_position.percent or remote_position.progress) or 0,
+        chapter_uid = remote_position.chapter_uid,
+        chapter_idx = tonumber(remote_position.chapter_idx) or 0,
+        chapter_offset = tonumber(remote_position.chapter_offset),
+        summary = tostring(local_position.summary or ""),
+        captured_at = local_position.captured_at,
+        has_chapter_offset = true,
+        safe = true,
+    }
+    position._confirmed_remote_proxy = true
+    return position
+end
+
 function ProgressSync:new(options)
     options = options or {}
     assert(options.settings, "progress sync settings are required")
@@ -105,6 +151,101 @@ function ProgressSync:_account_id()
     return type(account) == "table" and tostring(account.user_vid or "") or ""
 end
 
+function ProgressSync:_account_key()
+    if self.library_db and type(self.library_db.accountKey) == "function" then
+        return self.library_db:accountKey()
+    end
+    return self:_account_id()
+end
+
+function ProgressSync:_confirmed_positions(book)
+    if type(book) ~= "table" then return nil end
+    local account_id = self:_account_id()
+    if account_id == "" then return nil end
+    if type(book.last_confirmed_position) == "table"
+        and tostring(book.last_confirmed_account or "") == account_id then
+        return book.last_confirmed_position,
+            type(book.last_confirmed_remote_position) == "table"
+                and book.last_confirmed_remote_position
+                or book.last_confirmed_position
+    end
+end
+
+function ProgressSync:_remember_confirmed(book_id, local_position, remote_position)
+    if type(local_position) ~= "table" or type(remote_position) ~= "table" then
+        return false
+    end
+    local account_id = self:_account_id()
+    if account_id == "" then return false end
+    return self:_persist(book_id, {
+        last_confirmed_position = local_position,
+        last_confirmed_remote_position = remote_position,
+        last_confirmed_account = account_id,
+    })
+end
+
+-- Determine which side moved since the last position that both KOReader and
+-- WeRead explicitly confirmed. This makes backwards movement on another
+-- device visible while an offline-only local advance can continue silently.
+function ProgressSync:_position_changes(book, local_position, remote)
+    local local_baseline, remote_baseline = self:_confirmed_positions(book)
+    if not local_baseline then return nil end
+    return {
+        local_baseline = local_baseline,
+        remote_baseline = remote_baseline,
+        local_changed = not positions_match(local_position, local_baseline),
+        remote_changed = not positions_match(remote, remote_baseline),
+    }
+end
+
+function ProgressSync:_matches_confirmed_pair(book, local_position, remote)
+    local changes = self:_position_changes(book, local_position, remote)
+    return changes ~= nil
+        and not changes.local_changed
+        and not changes.remote_changed
+end
+
+function ProgressSync:_requires_choice(book, local_position, remote)
+    if positions_match(local_position, remote) then return false end
+    if self:_config().ask_on_conflict == false then return false end
+    local changes = self:_position_changes(book, local_position, remote)
+    if changes then
+        -- The cloud moved either forwards or backwards. Ask unless the local
+        -- side reached exactly the same physical place.
+        return changes.remote_changed
+    end
+    -- Without an account-scoped common point there is no safe direction to
+    -- overwrite: a numerically lower cloud position may be a deliberate
+    -- rewind on another device.
+    return true
+end
+
+function ProgressSync:_note_offline_movement(position)
+    if type(position) ~= "table" or self.is_online() then return end
+    self.offline_movement = {
+        generation = self.generation,
+        account = self:_account_id(),
+        book_id = tostring(position.book_id or self.current_book_id or ""),
+        position = copy(position),
+    }
+end
+
+function ProgressSync:_clear_offline_movement(book_id, position)
+    local movement = self.offline_movement
+    if not movement or tostring(movement.book_id) ~= tostring(book_id or "") then return end
+    if position and not positions_match(movement.position, position) then return end
+    self.offline_movement = nil
+end
+
+function ProgressSync:has_offline_movement()
+    local movement = self.offline_movement
+    return movement ~= nil
+        and movement.generation == self.generation
+        and movement.account == self:_account_id()
+        and movement.book_id ~= ""
+        and movement.book_id == tostring(self.current_book_id or "")
+end
+
 function ProgressSync:_pending_identity(book_id, book)
     if type(book) ~= "table" or type(book.pending_upload_position) ~= "table" then
         return nil
@@ -147,6 +288,62 @@ function ProgressSync:_note_sync_ack()
     }, self.now())
 end
 
+-- A successful live reading-time write normally carries its exact local
+-- position. A confirmed cloud proxy preserves the already-resolved local/cloud
+-- pair instead of collapsing KOReader page quantization back into the cloud.
+function ProgressSync:on_live_position_ack(book_id, sent_position, account_key)
+    book_id = tostring(book_id or "")
+    local expected_account = tostring(self:_account_key() or "")
+    local account_id = self:_account_id()
+    if book_id == "" or type(sent_position) ~= "table"
+        or account_id == ""
+        or expected_account == ""
+        or tostring(account_key or "") ~= expected_account then
+        return false
+    end
+    local books = self.settings:get("books", {})
+    local book = type(books) == "table" and books[book_id] or nil
+    if type(book) ~= "table" then return false end
+    if sent_position._confirmed_remote_proxy == true then
+        local confirmed_local, confirmed_remote = self:_confirmed_positions(book)
+        if confirmed_local and confirmed_remote
+            and positions_match(confirmed_remote, sent_position) then
+            local clean_remote = live_report_position(
+                book_id, sent_position, sent_position)
+            clean_remote._confirmed_remote_proxy = nil
+            self:_persist(book_id, {
+                last_confirmed_position = confirmed_local,
+                last_confirmed_remote_position = clean_remote,
+                last_confirmed_account = account_id,
+                last_remote_position = clean_remote,
+            })
+            if tostring(self.current_book_id or "") == book_id
+                and positions_match(self.local_position, confirmed_local) then
+                self.dirty = false
+            end
+        end
+        return true
+    end
+    local patch = {
+        last_confirmed_position = sent_position,
+        last_confirmed_remote_position = sent_position,
+        last_confirmed_account = account_id,
+        last_remote_position = sent_position,
+    }
+    local pending_identity = self:_pending_identity(book_id, book)
+    if pending_identity and positions_match(book.pending_upload_position, sent_position) then
+        if not self:_clear_pending_if_matches(book_id, pending_identity, patch) then return false end
+    else
+        self:_persist(book_id, patch)
+    end
+    if tostring(self.current_book_id or "") == book_id
+        and positions_match(self.local_position, sent_position) then
+        self.dirty = false
+    end
+    self:_clear_offline_movement(book_id, sent_position)
+    return true
+end
+
 function ProgressSync:_save_pending(position, reason)
     if type(position) ~= "table" then return nil end
     local book_id = tostring(position.book_id or self.current_book_id or "")
@@ -157,6 +354,7 @@ function ProgressSync:_save_pending(position, reason)
     local previous = type(books) == "table" and books[book_id] or nil
     local previous_identity = self:_pending_identity(book_id, previous)
     if previous_identity
+        and tostring(previous.pending_upload_account or "") == account_id
         and PositionMapper.same_position(previous.pending_upload_position, position) then
         return previous_identity, book_id
     end
@@ -179,7 +377,30 @@ function ProgressSync:_save_pending(position, reason)
         patch.last_sync_error = false
     end
     self:_persist(book_id, patch)
+    self:_clear_offline_movement(book_id, position)
     return identity, book_id
+end
+
+function ProgressSync:_snapshot_dedupe(book_id, position)
+    local books = self.settings:get("books", {})
+    local book = type(books) == "table" and books[book_id] or nil
+    if type(book) ~= "table" then return "changed" end
+    local owned_pending = type(book.pending_upload_position) == "table"
+        and tostring(book.pending_upload_account or "") == self:_account_id()
+    if owned_pending and positions_match(book.pending_upload_position, position) then
+        self:_clear_offline_movement(book_id, position)
+        return "pending", self:_pending_identity(book_id, book)
+    end
+    -- A distinct pending snapshot is newer local evidence and must be replaced
+    -- even when the user has since returned to the last confirmed position.
+    if owned_pending then return "changed" end
+    local confirmed_local = self:_confirmed_positions(book)
+    if confirmed_local and positions_match(confirmed_local, position) then
+        self.dirty = false
+        self:_clear_offline_movement(book_id, position)
+        return "confirmed"
+    end
+    return "changed"
 end
 
 function ProgressSync:capture_for_reconnect()
@@ -190,19 +411,9 @@ function ProgressSync:capture_for_reconnect()
     local position, reason = self:capture_local()
     if not position then return false, reason end
     local book_id = tostring(position.book_id or "")
-    local books = self.settings:get("books", {})
-    local book = type(books) == "table" and books[book_id] or nil
-    if type(book) == "table" then
-        if type(book.pending_upload_position) == "table"
-            and PositionMapper.same_position(book.pending_upload_position, position) then
-            return true, "already_pending"
-        end
-        if type(book.last_uploaded_position) == "table"
-            and PositionMapper.same_position(book.last_uploaded_position, position) then
-            self.dirty = false
-            return false, "already_synced"
-        end
-    end
+    local dedupe = self:_snapshot_dedupe(book_id, position)
+    if dedupe == "pending" then return true, "already_pending" end
+    if dedupe == "confirmed" then return false, "already_synced" end
     local identity = self:_save_pending(position, "network_reconnect")
     if not identity then return false, "snapshot_not_saved" end
     return true, "captured"
@@ -365,6 +576,9 @@ function ProgressSync:_mark_verified(book_id, reason, local_position, remote)
         last_remote_position = remote,
         last_sync_error = false,
     })
+    if positions_aligned(local_position, remote, SAME_THRESHOLD_PERCENT) then
+        self:_remember_confirmed(book_id, local_position, remote)
+    end
     log("info", "verified:",
         "book=", tostring(book_id),
         "reason=", tostring(reason),
@@ -438,7 +652,12 @@ function ProgressSync:_apply_remote(remote, context, options)
     if options.manual then
         self.notify("remote_applied", { position = remote })
     end
+    local generation = self.generation
+    local account_id = self:_account_id()
     self.scheduler:scheduleIn(0.15, function()
+        if generation ~= self.generation or account_id ~= self:_account_id() then
+            return
+        end
         local position = self:capture_local()
         if position then
             self.local_position = position
@@ -446,6 +665,7 @@ function ProgressSync:_apply_remote(remote, context, options)
             self:_persist(context.book_id, {
                 last_local_position = position,
             })
+            self:_remember_confirmed(context.book_id, position, remote)
         end
     end)
     return true
@@ -464,7 +684,13 @@ function ProgressSync:_upload_snapshot(position, reason, show_result, options)
     if options.confirmed_local and self:_pending_matches(book_id, identity) then
         self:_persist(book_id, { pending_upload_decision = "local" })
     end
-    local function finish(result)
+    local operation_account = self:_account_id()
+    local function operation_current(token)
+        return operation_account == self:_account_id()
+            and (token == nil or token == self.upload_token)
+    end
+    local function finish(result, token)
+        if not operation_current(token) then return end
         if type(options.done) == "function" then options.done(result) end
     end
     if self.uploading then
@@ -486,13 +712,16 @@ function ProgressSync:_upload_snapshot(position, reason, show_result, options)
             reason = "needs_reconcile" })
         return false
     end
+    self.upload_token = (self.upload_token or 0) + 1
+    local upload_token = self.upload_token
     self.uploading = true
     self.state = "uploading"
     local attempt
     attempt = function()
+        if not operation_current(upload_token) then return end
         if not self:_pending_matches(book_id, identity) then
             self.uploading = false
-            finish({ status = "stale", book_id = book_id })
+            finish({ status = "stale", book_id = book_id }, upload_token)
             self:request_sync("stale_upload")
             return
         end
@@ -502,11 +731,13 @@ function ProgressSync:_upload_snapshot(position, reason, show_result, options)
             copy(position),
             0
         )
+        if not operation_current(upload_token) then return end
         if ok and not accepted and type(outcome) == "table"
             and outcome.error_kind == "busy" then
             self.uploading = false
             self.state = "pending_reconcile"
-            finish({ status = "deferred", book_id = book_id, reason = "busy" })
+            finish({ status = "deferred", book_id = book_id, reason = "busy" },
+                upload_token)
             self:request_sync("progress_endpoint_busy", {
                 delay = RECONCILE_RETRY_SECONDS,
             })
@@ -517,6 +748,10 @@ function ProgressSync:_upload_snapshot(position, reason, show_result, options)
             local cleared = self:_clear_pending_if_matches(book_id, identity, {
                 last_local_position = position,
                 last_uploaded_position = position,
+                last_remote_position = position,
+                last_confirmed_position = position,
+                last_confirmed_remote_position = position,
+                last_confirmed_account = self:_account_id(),
                 last_upload_at = self.now(),
                 last_sync_error = false,
             })
@@ -536,7 +771,7 @@ function ProgressSync:_upload_snapshot(position, reason, show_result, options)
                 self.notify("upload_success", { position = position })
             end
             finish({ status = cleared and "uploaded" or "stale",
-                book_id = book_id })
+                book_id = book_id }, upload_token)
             self:request_sync("upload_finished")
             return
         end
@@ -555,7 +790,7 @@ function ProgressSync:_upload_snapshot(position, reason, show_result, options)
             })
         end
         finish({ status = "error", book_id = book_id,
-            error = tostring(error_message or "upload_failed") })
+            error = tostring(error_message or "upload_failed") }, upload_token)
         if self.is_online() then
             self:request_sync("upload_failed", { delay = 30 })
         end
@@ -567,11 +802,11 @@ function ProgressSync:_upload_snapshot(position, reason, show_result, options)
     else
         started = self.run_online("progress_upload", attempt)
     end
-    if not started then
+    if not started and operation_current(upload_token) then
         self.uploading = false
         self.state = "offline"
         finish({ status = "deferred", book_id = book_id,
-            reason = "online_task_unavailable" })
+            reason = "online_task_unavailable" }, upload_token)
         self:request_sync("upload_start_failed", {
             delay = RECONCILE_RETRY_SECONDS,
         })
@@ -599,6 +834,9 @@ end
 
 function ProgressSync:_resolve(local_position, remote, context, options)
     options = options or {}
+    local books = self.settings:get("books", {})
+    local progress_state = type(books) == "table" and books[context.book_id]
+        or context.book
     self.local_position = copy(local_position)
     self.remote_position = copy(remote)
     local comparison = PositionMapper.compare(
@@ -607,7 +845,10 @@ function ProgressSync:_resolve(local_position, remote, context, options)
         SAME_THRESHOLD_PERCENT
     )
 
-    if comparison == "same" and not remote.conflict then
+    local aligned = positions_match(local_position, remote)
+        or (positions_aligned(local_position, remote, SAME_THRESHOLD_PERCENT)
+            and remote.conflict ~= true)
+    if aligned then
         self.dirty = false
         self:_mark_verified(
             context.book_id,
@@ -621,10 +862,20 @@ function ProgressSync:_resolve(local_position, remote, context, options)
         return
     end
 
-    local conflict = remote.conflict == true
-        or comparison == "remote_ahead"
-        or comparison == "different"
-    if conflict and self:_config().ask_on_conflict ~= false then
+    if self:_matches_confirmed_pair(progress_state, local_position, remote) then
+        self.dirty = false
+        self:_mark_verified(
+            context.book_id,
+            "confirmed_pair_unchanged",
+            local_position,
+            remote
+        )
+        return
+    end
+
+    local conflict = self:_requires_choice(
+        progress_state, local_position, remote)
+    if conflict then
         local identity, book_id = self:_save_pending(
             local_position,
             options.manual and "manual_conflict" or "open_conflict"
@@ -642,7 +893,7 @@ function ProgressSync:_resolve(local_position, remote, context, options)
     self:_keep_local(local_position, remote, {
         manual = options.manual,
         upload_now = true,
-        reason = conflict and "default_local_choice" or "local_ahead",
+        reason = "local_ahead",
     })
 end
 
@@ -709,9 +960,13 @@ function ProgressSync:_pull(options)
     end
 
     local generation = self.generation
+    local account_id = self:_account_id()
     self.pulling = true
     self.state = "pulling"
     local started = self.run_online("progress_pull", function()
+        if generation ~= self.generation or account_id ~= self:_account_id() then
+            return
+        end
         if not local_position then
             local book_id = tostring(self.detect_book() or "")
             local refresh_ok, refreshed, refresh_error = pcall(
@@ -723,6 +978,8 @@ function ProgressSync:_pull(options)
             self.document_context = nil
             local_position, reason, context = self:capture_local()
             if not local_position then
+                if generation ~= self.generation
+                    or account_id ~= self:_account_id() then return end
                 self.pulling = false
                 self.state = "error"
                 self.notify("local_unavailable", {
@@ -738,11 +995,12 @@ function ProgressSync:_pull(options)
             context.book_id,
             context.chapters
         )
-        self.pulling = false
         if generation ~= self.generation
+            or account_id ~= self:_account_id()
             or tostring(self.detect_book() or "") ~= context.book_id then
             return
         end
+        self.pulling = false
         if not remote then
             self.state = "error"
             self:_persist(context.book_id, {
@@ -758,8 +1016,6 @@ function ProgressSync:_pull(options)
             return
         end
         self:_persist(context.book_id, {
-            last_remote_position = remote,
-            last_local_position = local_position,
             last_pull_at = self.now(),
             last_sync_error = false,
         })
@@ -817,11 +1073,17 @@ function ProgressSync:_apply_pending_jump(book_id)
         pending_remote_account = false,
         pending_remote_selected_at = false,
     })
+    local generation = self.generation
+    local account_id = self:_account_id()
     self.scheduler:scheduleIn(0.15, function()
+        if generation ~= self.generation or account_id ~= self:_account_id() then
+            return
+        end
         local position = self:capture_local()
         if position then
             self.local_position = position
             self:_persist(book_id, { last_local_position = position })
+            self:_remember_confirmed(book_id, position, pending.remote)
         end
     end)
     return true
@@ -863,6 +1125,39 @@ function ProgressSync:cancel_pending_jump(reason)
     return true
 end
 
+-- Call before replacing or clearing account settings. Every foreground and
+-- delayed callback created for the old login becomes stale; on_reader_ready
+-- may establish the new account's state after credentials are saved.
+function ProgressSync:on_account_changed(expected_account_id)
+    local current_account = self:_account_id()
+    if expected_account_id ~= nil
+        and tostring(expected_account_id) ~= current_account then
+        return false
+    end
+    self.generation = self.generation + 1
+    self.pull_retry_token = (self.pull_retry_token or 0) + 1
+    self.sync_request_token = (self.sync_request_token or 0) + 1
+    self.upload_token = (self.upload_token or 0) + 1
+    self.reconcile_token = (self.reconcile_token or 0) + 1
+    self.sync_callbacks = {}
+    self.explicit_sync_request = nil
+    self.awaiting_choice_book_id = nil
+    self.pending_jump = nil
+    self.offline_movement = nil
+    self.current_book_id = nil
+    self.local_position = nil
+    self.remote_position = nil
+    self.document_context = nil
+    self.verified = false
+    self.dirty = false
+    self.pulling = false
+    self.uploading = false
+    self.reconciling = false
+    self.reconnect_checking = false
+    self.state = "account_changed"
+    return true
+end
+
 function ProgressSync:on_reader_ready()
     self.generation = self.generation + 1
     local generation = self.generation
@@ -872,6 +1167,7 @@ function ProgressSync:on_reader_ready()
     self.document_context = nil
     self.verified = false
     self.dirty = false
+    self.offline_movement = nil
     self.state = "waiting"
 
     -- Establish a position baseline as soon as ReaderReady fires. Without
@@ -932,6 +1228,7 @@ function ProgressSync:on_page_update()
     if self.local_position
         and not PositionMapper.same_position(position, self.local_position) then
         self.dirty = true
+        self:_note_offline_movement(position)
     end
     self.local_position = position
 end
@@ -947,7 +1244,13 @@ function ProgressSync:on_close_document()
         -- reconciled against the cloud before upload, even if link state still
         -- appears online while the document is closing.
         if self.dirty then
-            self:_upload_snapshot(position, "document_close", false)
+            local book_id = tostring(position.book_id or self.current_book_id or "")
+            local dedupe, identity = self:_snapshot_dedupe(book_id, position)
+            if dedupe ~= "confirmed" then
+                self:_upload_snapshot(position, "document_close", false, {
+                    identity = dedupe == "pending" and identity or nil,
+                })
+            end
         end
     end
     if position and self:_config().upload_on_close ~= true then
@@ -959,6 +1262,7 @@ function ProgressSync:on_close_document()
     self.local_position = nil
     self.remote_position = nil
     self.document_context = nil
+    self.offline_movement = nil
 end
 
 function ProgressSync:on_suspend()
@@ -967,10 +1271,17 @@ function ProgressSync:on_suspend()
     if position and self.local_position
         and not PositionMapper.same_position(position, self.local_position) then
         self.dirty = true
+        self:_note_offline_movement(position)
     end
     if position and self.dirty
         and self:_config().upload_on_close == true then
-        self:_upload_snapshot(position, "suspend", false)
+        local book_id = tostring(position.book_id or self.current_book_id or "")
+        local dedupe, identity = self:_snapshot_dedupe(book_id, position)
+        if dedupe ~= "confirmed" then
+            self:_upload_snapshot(position, "suspend", false, {
+                identity = dedupe == "pending" and identity or nil,
+            })
+        end
     end
 end
 
@@ -1041,6 +1352,16 @@ end
 function ProgressSync:has_pending(options)
     local _, summary = self:_pending_candidates(options)
     return summary.pending > 0, summary
+end
+
+function ProgressSync:has_pending_for_book(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then return false end
+    local books = self.settings:get("books", {})
+    local book = type(books) == "table" and books[book_id] or nil
+    return type(book) == "table"
+        and type(book.pending_upload_position) == "table"
+        and tostring(book.pending_upload_account or "") == self:_account_id()
 end
 
 function ProgressSync:can_write_progress()
@@ -1215,6 +1536,9 @@ function ProgressSync:_present_pending_conflict(candidate, remote, relation)
             end
             local remote_patch = {
                 last_remote_position = remote,
+                last_confirmed_position = remote,
+                last_confirmed_remote_position = remote,
+                last_confirmed_account = self:_account_id(),
                 last_sync_error = false,
             }
             if applied_to_open_book then
@@ -1258,17 +1582,27 @@ end
 
 function ProgressSync:reconcile_pending(done, options)
     options = options or {}
+    if self.uploading or self.reconciling or self.pulling then
+        if type(done) == "function" then
+            done({ status = "deferred", reason = "busy" })
+        end
+        return false
+    end
+    self.reconcile_token = (self.reconcile_token or 0) + 1
+    local reconcile_token = self.reconcile_token
+    local operation_account = self:_account_id()
+    local function operation_current()
+        return reconcile_token == self.reconcile_token
+            and operation_account == self:_account_id()
+    end
     local finished = false
     local function finish(result)
         if finished then return end
         finished = true
+        if not operation_current() then return end
         self.reconciling = false
         self.reconnect_checking = false
         if type(done) == "function" then done(result) end
-    end
-    if self.uploading or self.reconciling or self.pulling then
-        finish({ status = "deferred", reason = "busy" })
-        return false
     end
     if not self.is_online() then
         local pending = self:has_pending({ book_id = options.book_id })
@@ -1318,6 +1652,9 @@ function ProgressSync:reconcile_pending(done, options)
         )
     end
     local book = self.get_book(selected.book_id)
+    local stored_books = self.settings:get("books", {})
+    local progress_state = type(stored_books) == "table"
+        and stored_books[selected.book_id] or nil
     local chapters = type(book) == "table" and self.get_chapters(book) or nil
     if type(chapters) ~= "table" or #chapters == 0 then
         self:_persist(selected.book_id, {
@@ -1335,7 +1672,9 @@ function ProgressSync:reconcile_pending(done, options)
     self.reconciling = true
     self.reconnect_checking = true
     local started = self.run_online("progress_reconcile", function()
+        if not operation_current() then return end
         local remote, fetch_error = self:_fetch_remote(selected.book_id, chapters)
+        if not operation_current() then return end
         if not self:_pending_matches(selected.book_id, selected.identity) then
             finish({ status = "stale", book_id = selected.book_id })
             self:request_sync("stale_reconcile")
@@ -1355,10 +1694,17 @@ function ProgressSync:reconcile_pending(done, options)
         end
         local relation = PositionMapper.compare(selected.position, remote,
             SOURCE_CONFLICT_THRESHOLD_PERCENT)
-        if relation == "same" and remote.conflict ~= true then
+        local aligned = positions_match(selected.position, remote)
+            or (positions_aligned(selected.position, remote,
+                    SOURCE_CONFLICT_THRESHOLD_PERCENT)
+                and remote.conflict ~= true)
+        if aligned then
             local cleared = self:_clear_pending_if_matches(selected.book_id, selected.identity, {
                 last_local_position = selected.position,
                 last_remote_position = remote,
+                last_confirmed_position = selected.position,
+                last_confirmed_remote_position = remote,
+                last_confirmed_account = self:_account_id(),
                 last_sync_error = false,
             })
             if cleared then self:_note_sync_ack() end
@@ -1367,8 +1713,21 @@ function ProgressSync:reconcile_pending(done, options)
             self:request_sync("matching_progress_finished")
             return
         end
-        if (relation == "remote_ahead" or relation == "different" or remote.conflict == true)
-            and self:_config().ask_on_conflict ~= false then
+        if self:_matches_confirmed_pair(
+            progress_state, selected.position, remote) then
+            local cleared = self:_clear_pending_if_matches(
+                selected.book_id, selected.identity, {
+                    last_local_position = selected.position,
+                    last_remote_position = remote,
+                    last_sync_error = false,
+                })
+            if cleared then self:_note_sync_ack() end
+            self.state = "verified"
+            finish({ status = "synced", book_id = selected.book_id })
+            self:request_sync("confirmed_pair_unchanged")
+            return
+        end
+        if self:_requires_choice(progress_state, selected.position, remote) then
             local _, shown = self:_present_pending_conflict(
                 selected, remote, relation)
             finish({ status = "conflict", book_id = selected.book_id,
@@ -1438,6 +1797,19 @@ function ProgressSync:position_for_report(book_id)
         self.dirty = true
     end
     self.local_position = position
+    if not self.dirty then
+        local books = self.settings:get("books", {})
+        local book = type(books) == "table" and books[tostring(book_id)] or nil
+        local confirmed_local, confirmed_remote = self:_confirmed_positions(book)
+        if confirmed_local and confirmed_remote
+            and positions_match(position, confirmed_local)
+            and not positions_match(confirmed_local, confirmed_remote)
+            and has_physical_position(confirmed_remote) then
+            local selected = live_report_position(
+                book_id, position, confirmed_remote)
+            return selected, nil, true
+        end
+    end
     return position, nil, true
 end
 

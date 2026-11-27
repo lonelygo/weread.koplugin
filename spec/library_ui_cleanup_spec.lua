@@ -112,4 +112,22 @@ host:openFile(nil)
 expect(#closed == 0 and host.shelf_view == shelf_view,
     "invalid open request unexpectedly closed the bookshelf")
 
+local calls = {}
+host.library_db = { accountKey = function() return "old-db" end }
+host.read_report = {
+    on_account_changed = function(_, key) calls[#calls + 1] = key end,
+    on_account_ready = function() calls[#calls + 1] = "timer" end,
+}
+host.progress_sync = {
+    on_account_changed = function(_, vid) calls[#calls + 1] = vid end,
+    on_reader_ready = function() calls[#calls + 1] = "compare" end,
+}
+host:onWeReadAccountChanging("old-reader")
+host:onWeReadAccountChanged(false)
+expect(table.concat(calls, ",") == "old-db,old-reader", "sign-out must close both old sessions")
+host.ui.document = {}
+host:onWeReadAccountChanged(true)
+expect(table.concat(calls, ",") == "old-db,old-reader,compare,timer",
+    "new reader must start progress verification before its clock")
+
 print(("library_ui_cleanup_spec: %d checks"):format(checks))

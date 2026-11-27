@@ -93,7 +93,7 @@ end
 function Sync:_invalidate()
     self.generation = self.generation + 1
     self.verified_account, self.verified_until, self.probe_failed = nil, nil, nil
-    self.verified_dir, self.check_radio = nil, nil
+    self.verified_dir, self.check_radio, self.refresh_probe = nil, nil, nil
     self.allow_data = false
     self.stage, self.stage_account, self.rerun = nil, nil, nil
 end
@@ -140,6 +140,9 @@ end
 
 function Sync:disconnected()
     self:_invalidate()
+    if active == self and not self.paused then
+        self.plugin.progress_sync:capture_for_reconnect()
+    end
     if self:_manualAttempt() then
         manual.failure = "offline"
         self:_schedule()
@@ -304,7 +307,7 @@ function Sync:request(reason, context)
     if self.stage and self.stage_account ~= self.plugin.library_db:accountKey() then
         self:_invalidate()
     end
-    if reason == "login_completed" then
+    if reason == "login_completed" or reason == "account_cleared" then
         self:_invalidate()
         self.recheck = true
     end
@@ -321,12 +324,16 @@ function Sync:request(reason, context)
         self.probe_failed = self.plugin.library_db:accountKey()
     end
     if reason == "remote_choice_finished" and self:_manualAttempt() then manual.matched = true end
+    if reason == "manual_sync" then
+        self.plugin.progress_sync:capture_for_reconnect()
+    end
     if connection_checks[reason] then
         self.recheck = true
         self.probe_failed = nil
         self.check_radio = true
-        if not self.stage then self.verified_until = nil end
-        self.capture_current = true
+        -- Preserve recent service receipts on an idle heartbeat. A fresh
+        -- probe is useful only once we have found actual work to send.
+        if not self.stage then self.refresh_probe = true end
     end
     if context.manual or context.pull_current or context.resume_conflicts then
         self.explicit = {
@@ -389,9 +396,8 @@ function Sync:_run()
     if not account then self.explicit = nil; return end
     if self.explicit and self.explicit.account ~= account then self.explicit = nil end
     local progress = plugin.progress_sync
-    if self.capture_current then
-        self.capture_current = nil
-        if progress.capture_for_reconnect then progress:capture_for_reconnect() end
+    if self.check_radio and progress:has_offline_movement() then
+        progress:capture_for_reconnect()
     end
     if attempt and attempt.failure then
         self:_finishManual()
@@ -401,8 +407,8 @@ function Sync:_run()
     -- A user tap may always try the bounded WeRead GET. Only scheduled
     -- connectivity checks may do so in the background on a radio with no
     -- reported link. Capturing a page turn never turns Wi-Fi on or polls it.
-    local check_radio = self.check_radio
-    self.check_radio = nil
+    local check_radio, refresh_probe = self.check_radio, self.refresh_probe
+    self.check_radio, self.refresh_probe = nil, nil
     if not attempt and not self:isConnected()
         and not (check_radio and plugin:isWifiEnabledForSync()) then return end
     local settings = plugin.settings
@@ -427,7 +433,7 @@ function Sync:_run()
         end
         if pending_time or summary.actionable > 0 then
             local note_book = with_annotations and plugin.library_db:pendingOfflineBook(false, true)
-            if note_book and not self:_verified(account) then
+            if note_book and (refresh_probe or not self:_verified(account)) then
                 if self.probe_failed ~= account then self:_probe(account, note_book) end
                 return
             end
@@ -449,7 +455,7 @@ function Sync:_run()
         self:_finishManual()
         return
     end
-    if not self:_verified(account) then
+    if refresh_probe or not self:_verified(account) then
         if self.probe_failed ~= account then self:_probe(account, book_id) end
         return
     end
@@ -515,6 +521,7 @@ function Sync:_run()
 end
 
 function Sync:_probe(account, book_id)
+    self.verified_until = nil
     self.allow_data = false
     self.stage, self.stage_account = "probe", account
     local generation = self.generation
@@ -664,7 +671,8 @@ function Sync:gate(kind, context)
     if not account then return false, "authentication_required" end
     if not self:isConnected() then return false, "offline" end
     local is_read = kind == "weread_read_write"
-    local live = (is_read and context.operation == "live_reading_time")
+    local live_time = is_read and context.operation == "live_reading_time"
+    local live = live_time
         or (not is_read and context.operation == "live_annotation")
     if is_read then
         local read_retry_after = self:_readWriteRetryAfter(account)
@@ -684,6 +692,19 @@ function Sync:gate(kind, context)
     end
     if is_read and context.operation ~= "progress" then
         local progress = self.plugin.progress_sync
+        if live_time then
+            -- The first normal tick can beat KOReader's NetworkConnected
+            -- event. Settle this book's offline position before a live time
+            -- POST is allowed to carry a local position to the server.
+            if progress:has_offline_movement() then
+                progress:capture_for_reconnect()
+                self.probe_failed = nil
+            end
+            if progress:has_pending_for_book(context.book_id) then
+                self:_schedule()
+                return false, "progress_pending"
+            end
+        end
         if (not live and self.time_needs_reconcile) or self.stage == "progress"
             or progress.uploading or progress.reconciling or progress.pulling
             or (progress.awaiting_choice and progress:awaiting_choice(context.book_id)) then
@@ -744,6 +765,12 @@ function Sync:gate(kind, context)
             end
         elseif error_kind == "transport" or error_kind == "authentication"
             or (not time_row and error_kind == "context") then
+            -- A failed live write left this book's position unconfirmed.
+            -- A delayed callback from another reader must not capture here.
+            if live_time and active == self and not self.paused and self.generation == generation
+                and tostring(active.plugin.progress_sync.current_book_id or "") == tostring(context.book_id) then
+                active.plugin.progress_sync:capture_for_reconnect()
+            end
             active:_invalidate()
             -- An uncertain POST is held individually. Probe before replaying
             -- the next item, so a single lost reply doesn't stall the account.

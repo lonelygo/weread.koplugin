@@ -431,11 +431,13 @@ function M:onCloseDocument()
 end
 
 function M:onNetworkConnected()
+    self.read_report:on_network_restored()
     self:_captureLocalAnnotationSnapshot(nil)
     self.offline_sync:request("network_connected")
 end
 
 function M:onNetworkDisconnected()
+    self.read_report:on_network_disconnected()
     self.offline_sync:disconnected()
 end
 
@@ -566,11 +568,13 @@ function M:stopReadReport(reason)
 end
 
 function M:onSuspend()
+    -- Account the final foreground seconds while this reader still owns its
+    -- connection state. Pausing the coordinator makes it appear offline.
+    self.read_report:on_suspend()
     self.offline_sync:pause()
     if self._cancelUnifiedAnnotationSync then self:_cancelUnifiedAnnotationSync() end
     self._annotation_pending_prefetch = nil
     self.progress_sync:on_suspend()
-    self.read_report:on_suspend()
 end
 
 function M:onResume()

@@ -34,8 +34,8 @@ local Dialog = require("weread.ui.progress_sync_dialog")
 local actions = {}
 local dialog = Dialog.show_choice({
     book_title = "Book",
-    local_position = { percent = 20 },
-    remote_position = { percent = 40 },
+    local_position = { percent = 23.04, chapter_idx = 2, chapter_offset = 90 },
+    remote_position = { percent = 23.49, chapter_idx = 3, chapter_offset = 12 },
     keep_local = function() actions[#actions + 1] = "local" end,
     use_remote = function() actions[#actions + 1] = "remote" end,
     later = function() actions[#actions + 1] = "later" end,
@@ -47,6 +47,9 @@ assert(dialog.ok_text == "Keep KOReader progress"
     "local choice is not the primary action")
 assert(dialog.other_buttons[1][1].text == "Later",
     "explicit Later action is missing")
+assert(dialog.text:find("23.0%% · chapter 2 · position 90")
+    and dialog.text:find("23.5%% · chapter 3 · position 12"),
+    "same rounded progress did not expose chapter and location")
 
 dialog:onClose()
 assert(actions[1] == "later" and #actions == 1,

@@ -119,7 +119,7 @@ class MockServer(ThreadingHTTPServer):
         self.control = dict(delay=0, match="", status=503, times=0, drop=False,
                             empty_shelf=False, empty_annotations=False, progress_successes_before_failure=-1,
                             progress_reply="ok", renew_reply="ok", retry_after=0,
-                            read_replies=[])
+                            read_replies=[], gateway_progress=None)
 
     def record(self, event):
         with self.lock:
@@ -208,6 +208,8 @@ class MockServer(ThreadingHTTPServer):
                 return 200, dict(results=[dict(books=[dict(bookInfo=b) for b in BOOKS
                                                       if keyword in b["title"] or keyword in b["author"]])])
             if api == "/book/getprogress":
+                if control["gateway_progress"] is not None:
+                    return 200, dict(book=control["gateway_progress"].copy())
                 return 200, self.get_progress(book_id)
             if api == "/review/list":
                 return 200, dict(reviewsCnt=1, reviewsHasMore=0, reviews=[dict(review=review())])
@@ -417,6 +419,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def set_control(self, data):
         with self.server.lock:
+            if data.get("gateway_progress") is False:
+                data = dict(data, gateway_progress=None)
             candidate = self.server.control | data
             if set(candidate) != set(self.server.control):
                 raise ValueError("unknown control key")
@@ -434,6 +438,13 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("status must be 400..599")
             if type(candidate["retry_after"]) not in (float, int) or not 0 <= candidate["retry_after"] <= 60:
                 raise ValueError("retry_after must be 0..60 seconds")
+            gateway_progress = candidate["gateway_progress"]
+            if gateway_progress is not None:
+                required = {"chapterUid", "chapterIdx", "chapterOffset", "progress"}
+                if not isinstance(gateway_progress, dict) or not required <= set(gateway_progress):
+                    raise ValueError("gateway_progress must be null or a progress object")
+                if not all(type(gateway_progress[key]) is int for key in required):
+                    raise ValueError("gateway_progress fields must be integers")
             if not isinstance(candidate["match"], str):
                 raise ValueError("match must be a string")
             for key in ("drop", "empty_shelf", "empty_annotations"):
@@ -504,7 +515,7 @@ def main():
                         help="optional packaged plugin to test instead of packaging the worktree")
     parser.add_argument("--log", type=Path, help="JSONL request log, without headers or private data")
     parser.add_argument("--smoke", action="store_true", help="run real KOReader offscreen smoke, save evidence, then exit")
-    parser.add_argument("--scenario", choices=("basic", "covers", "delivery", "menu", "pending", "preparation", "continuous", "offline", "reading", "replay", "unified", "chunks"), default="basic",
+    parser.add_argument("--scenario", choices=("basic", "boundaries", "covers", "delivery", "menu", "pending", "preparation", "continuous", "offline", "reading", "replay", "unified", "chunks"), default="basic",
                         help="offscreen integration scenario (requires --smoke)")
     args = parser.parse_args()
     if bool(args.run_dir) != bool(args.koreader):
@@ -515,6 +526,11 @@ def main():
         parser.error("--smoke requires a fresh --run-dir and --koreader")
     if args.run_dir and args.bind not in ("127.0.0.1", "0.0.0.0"):
         parser.error("local launcher requires --bind 127.0.0.1 or 0.0.0.0; use --bind LAN_IP without --run-dir for a device-only server")
+    if args.scenario == "boundaries":
+        # Three generated EPUB pages inside a deliberately large first
+        # chapter make page 2 display as 23%, matching the real-device
+        # duplicate-conflict report while keeping the fixture compact.
+        CHAPTERS[0]["wordCount"] = 20100
     server = MockServer(args.port, args.log, args.bind)
     if args.run_dir:
         args.run_dir = args.run_dir.resolve()
@@ -533,7 +549,7 @@ def main():
             smoke_timeout = 360 if (args.scenario == "replay"
                                     and os.environ.get("WEREAD_REPLAY_SCALE") == "190") else 180
             with log.open("w") as out:
-                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "covers": "weread_covers_mock.lua", "delivery": "weread_delivery_mock.lua", "menu": "weread_menu_consistency.lua", "pending": "weread_pending_diagnostics.lua", "preparation": "weread_preparation_mock.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "replay": "weread_replay_pacing.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
+                result = subprocess.run(["./luajit", str(REPO / "spec/koreader" / {"basic": "weread_mock_smoke.lua", "boundaries": "weread_sync_boundaries.lua", "covers": "weread_covers_mock.lua", "delivery": "weread_delivery_mock.lua", "menu": "weread_menu_consistency.lua", "pending": "weread_pending_diagnostics.lua", "preparation": "weread_preparation_mock.lua", "continuous": "weread_continuous_mock.lua", "offline": "weread_offline_mock.lua", "reading": "weread_reading_mock.lua", "replay": "weread_replay_pacing.lua", "unified": "weread_unified_mock.lua", "chunks": "weread_chunks_mock.lua"}[args.scenario])],
                                         cwd=args.koreader, env=env, stdout=out, stderr=subprocess.STDOUT,
                                         timeout=smoke_timeout)
             if result.returncode == 0 and args.scenario == "basic":

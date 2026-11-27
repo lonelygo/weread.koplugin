@@ -12,7 +12,17 @@ local function _(text)
 end
 
 local function percent(position)
-    return string.format("%.0f", tonumber(position and position.percent) or 0)
+    return string.format("%.1f", tonumber(position and position.percent) or 0)
+end
+
+local function location(position)
+    position = type(position) == "table" and position or {}
+    local chapter = position.chapter_idx or position.chapter_index
+        or position.chapter_uid or position.current_chapter_uid or "?"
+    local offset = position.chapter_offset
+    if offset == nil then offset = "?" end
+    return T(_("%1% · chapter %2 · position %3"),
+        percent(position), tostring(chapter), tostring(offset))
 end
 
 function ProgressSyncDialog.show_choice(context)
@@ -20,17 +30,17 @@ function ProgressSyncDialog.show_choice(context)
     if context.source_conflict then
         message = T(_(
             "WeRead's two progress sources disagree for \"%1\".\n\n"
-            .. "KOReader: %2%\nSelected cloud position: %3%\n\n"
+            .. "KOReader: %2\nSelected cloud position: %3\n\n"
             .. "Choose which position to keep."
-        ), context.book_title, percent(context.local_position),
-            percent(context.remote_position))
+        ), context.book_title, location(context.local_position),
+            location(context.remote_position))
     else
         message = T(_(
             "Reading progress differs for \"%1\".\n\n"
-            .. "KOReader: %2%\nWeRead: %3%\n\n"
+            .. "KOReader: %2\nWeRead: %3\n\n"
             .. "Choose which position to keep."
-        ), context.book_title, percent(context.local_position),
-            percent(context.remote_position))
+        ), context.book_title, location(context.local_position),
+            location(context.remote_position))
     end
 
     local dialog

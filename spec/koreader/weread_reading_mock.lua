@@ -109,6 +109,7 @@ end
 local Event = require("ui/event")
 local FileManager = require("apps/filemanager/filemanager")
 local WeRead = require("weread.lib.protocol")
+local I18n = require("weread.lib.i18n")
 local function spin(seconds)
     local ending = socket.gettime() + seconds
     repeat UIManager:handleInput(); socket.sleep(0.03) until socket.gettime() >= ending
@@ -120,6 +121,23 @@ local function reported()
 end
 local function manager()
     return assert(FileManager.instance, "file manager instance")
+end
+local function select_progress(choice)
+    local wanted = choice == "cloud" and "Use WeRead progress" or "Keep KOReader progress"
+    local translated = I18n.tr(wanted)
+    for _, entry in ipairs(UIManager._window_stack) do
+        local widget = entry.widget
+        if widget.ok_text == wanted or widget.ok_text == translated then
+            UIManager:close(widget)
+            widget.ok_callback()
+            return true
+        elseif widget.cancel_text == wanted or widget.cancel_text == translated then
+            UIManager:close(widget)
+            widget.cancel_callback()
+            return true
+        end
+    end
+    return false
 end
 local function snapshot(label, instance)
     local progress_sync = instance.progress_sync
@@ -166,9 +184,14 @@ assert(reported() == 0, "offline no reported time")
 api("/__control", { times = 0 })
 connected = true
 manager():handleEvent(Event:new("NetworkConnected"))
+local selected_first_progress = false
 wait_for("file manager drains first reading time", function()
+    if not selected_first_progress then
+        selected_first_progress = select_progress("local")
+    end
     return manager().weread.library_db:readTimeStatus().pending == 0 and reported() == expected_first
 end)
+assert(selected_first_progress, "offline reconnect offers the local progress choice")
 local after_first = reported()
 local first_progress = api("/__state").progress["900001"]
 assert(first_progress and first_progress.chapterUid == 1 and first_progress.progress > 0,
@@ -202,7 +225,11 @@ api("/web/book/read", { b = WeRead.e("900001"), c = WeRead.e(6), ci = 6,
 local phone_event_count = #api("/__state").read_reports
 connected = true
 manager():handleEvent(Event:new("NetworkConnected"))
+local selected_second_progress = false
 wait_for("file manager drains second reading time", function()
+    if not selected_second_progress then
+        selected_second_progress = select_progress("cloud")
+    end
     return manager().weread.library_db:readTimeStatus().pending == 0 and reported() == after_first + second
 end)
 local state = api("/__state")
@@ -217,6 +244,7 @@ spin(2.2)
 assert(reported() == after_first + second, "second reconnect idempotence")
 evidence.second_seconds = second
 evidence.second_clock_delta = second_end - second_start
+evidence.second_choice_prompted = selected_second_progress
 evidence.total_reported_seconds = reported()
 evidence.read_reports = api("/__state").read_reports
 evidence.remote_progress = api("/__state").progress["900001"]

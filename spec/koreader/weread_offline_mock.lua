@@ -93,11 +93,21 @@ local function api(path, payload)
     assert(code == 200, "fixture control response " .. tostring(code))
     return json.decode(table.concat(response))
 end
+local offline_start
 local function offline()
+    offline_start = #api("/__state").requests
     connected = false
     api("/__control", { times = -1, status = 503 })
+    reader():handleEvent(require("ui/event"):new("NetworkDisconnected"))
 end
 local function online()
+    local requests = api("/__state").requests
+    for index = offline_start + 1, #requests do
+        local path = requests[index].path
+        assert(path ~= "/web/book/addBookmark" and path ~= "/web/book/removeBookmark"
+            and path ~= "/web/review/add" and path ~= "/web/review/delete",
+            "offline annotation contacted the service: " .. path)
+    end
     api("/__control", { times = 0 })
     connected = true
     reader():handleEvent(require("ui/event"):new("NetworkConnected"))

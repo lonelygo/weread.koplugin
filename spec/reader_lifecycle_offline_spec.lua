@@ -38,6 +38,10 @@ local host = {
         end,
     },
     detectWeReadBook = function() return "book" end,
+    read_report = {
+        on_network_restored = function() requests[#requests + 1] = "time_restored" end,
+        on_network_disconnected = function() requests[#requests + 1] = "time_disconnected" end,
+    },
     offline_sync = {
         request = function(_self, reason) requests[#requests + 1] = reason end,
         disconnected = function() requests[#requests + 1] = "disconnected" end,
@@ -51,8 +55,8 @@ assert(saved and saved[1] == "book" and saved[2] == "/books/book.epub"
     "KOReader annotation event did not persist the full native snapshot")
 host:onNetworkConnected()
 host:onNetworkDisconnected()
-assert(#requests == 2 and requests[1] == "network_connected" and requests[2] == "disconnected",
-    "connection changes must go through the common coordinator")
+assert(table.concat(requests, ",") == "time_restored,network_connected,time_disconnected,disconnected",
+    "reading time must close the previous interval before the coordinator handles the link change")
 
 local page, percent
 host.ui.rolling = {

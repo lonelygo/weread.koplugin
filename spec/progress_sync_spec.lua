@@ -83,14 +83,15 @@ local function fixture(remote, options)
     local notifications = {}
     local client = {
         get_progress = function()
-            return { book = remote }
+            return { book = options.gateway_remote or remote }
         end,
         get_web_progress = function()
-            return remote
+            return options.web_remote or remote
         end,
     }
     local sync = ProgressSync:new{
         settings = settings,
+        library_db = options.library_db,
         client = client,
         scheduler = scheduler,
         get_document = function() return document end,
@@ -244,19 +245,162 @@ test("matching open progress verifies the reporting gate", function()
     eq(position.chapter_offset, 150, "live offset")
 end)
 
+test("stale secondary cloud source does not prompt when selected cloud matches local", function()
+    local current = {
+        bookId = "book", progress = 25, chapterUid = 22,
+        chapterIdx = 2, chapterOffset = 150, updateTime = 20,
+    }
+    local f = fixture(current, {
+        web_remote = current,
+        gateway_remote = {
+            bookId = "book", progress = 0, chapterUid = 11,
+            chapterIdx = 1, chapterOffset = 0, updateTime = 10,
+        },
+    })
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.choices, 0, "stale secondary source is not a user conflict")
+    eq(f.sync:status().verified, true, "matching selected source verifies")
+    eq(f.values.books.book.last_confirmed_position.chapter_offset, 150,
+        "common physical position is remembered")
+end)
+
 test("nearby progress within two percent is treated as aligned", function()
     local f = fixture({
         bookId = "book",
         progress = 26.9,
         chapterUid = 22,
         chapterIdx = 2,
-        chapterOffset = 169,
         updateTime = 10,
     })
     f.sync:on_reader_ready()
     f.drain()
     eq(f.sync:status().verified, true, "nearby position verifies")
     eq(#f.choices, 0, "nearby position does not prompt")
+end)
+
+test("same physical anchor wins even when displayed percent projection differs", function()
+    local f = fixture({
+        bookId = "book", progress = 23.8, chapterUid = 22,
+        chapterIdx = 2, chapterOffset = 150, updateTime = 10,
+    })
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(f.sync:status().verified, true, "physical position verifies")
+    eq(#f.choices, 0, "percent projection does not create a conflict")
+end)
+
+test("material physical movement within two percent is not silently aligned", function()
+    local f = fixture({
+        bookId = "book", progress = 26.9, chapterUid = 22,
+        chapterIdx = 2, chapterOffset = 169, updateTime = 10,
+    })
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.choices, 1, "different chapter offset requires a decision")
+end)
+
+test("local-ahead open without an account-scoped baseline prompts", function()
+    local f = fixture({
+        bookId = "book", progress = 0, chapterUid = 11,
+        chapterIdx = 1, chapterOffset = 0, updateTime = 10,
+    })
+    f.values.books.book.last_uploaded_position = {
+        book_id = "book", percent = 25, chapter_uid = 22,
+        chapter_idx = 2, chapter_offset = 150,
+    }
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.choices, 1, "legacy upload does not authorize overwriting cloud")
+    eq(#f.uploads, 0, "cloud is untouched before the decision")
+end)
+
+test("resolved local and cloud page-quantization pair does not re-prompt", function()
+    local f = fixture({
+        bookId = "book", progress = 25, chapterUid = 22,
+        chapterIdx = 2, chapterOffset = 160, updateTime = 10,
+    }, {
+        library_db = { accountKey = function() return "account-hash" end },
+    })
+    f.values.books.book.last_confirmed_account = "100"
+    f.values.books.book.last_confirmed_position = {
+        book_id = "book", percent = 25, chapter_uid = 22,
+        chapter_idx = 2, chapter_offset = 150,
+    }
+    f.values.books.book.last_confirmed_remote_position = {
+        book_id = "book", percent = 25, chapter_uid = 22,
+        chapter_idx = 2, chapter_offset = 160,
+    }
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.choices, 0, "unchanged resolved pair does not prompt")
+    eq(#f.uploads, 0, "page quantization does not overwrite cloud")
+    eq(f.sync:status().verified, true, "resolved pair verifies")
+
+    local first = assert(f.sync:position_for_report("book"))
+    eq(first.chapter_offset, 160,
+        "idle live report preserves the chosen cloud anchor")
+    eq(first.raw_node, nil, "raw cloud response is not copied to the outbox")
+    eq(first.sources, nil, "cloud source diagnostics are not copied to the outbox")
+    eq(first.conflict, nil, "cloud conflict metadata is not copied to the outbox")
+    eq(f.sync:on_live_position_ack("book", first, "account-hash"), true,
+        "first idle live report is acknowledged")
+    eq(f.values.books.book.last_confirmed_position.chapter_offset, 150,
+        "first idle ACK preserves local page quantization")
+    eq(f.values.books.book.last_confirmed_remote_position.chapter_offset, 160,
+        "first idle ACK preserves the chosen cloud anchor")
+
+    local second = assert(f.sync:position_for_report("book"))
+    eq(second.chapter_offset, 160,
+        "second idle live report still uses the chosen cloud anchor")
+    f.document.page = 50
+    f.sync:on_page_update()
+    eq(f.sync.dirty, true, "newer page turn is dirty before the old ACK")
+    eq(f.sync:on_live_position_ack("book", second, "account-hash"), true,
+        "second idle live report is acknowledged")
+    eq(f.sync.dirty, true, "old idle ACK does not clear the newer page turn")
+    eq(f.values.books.book.last_confirmed_position.chapter_offset, 150,
+        "old idle ACK keeps the local side of the pair")
+    eq(f.values.books.book.last_confirmed_remote_position.chapter_offset, 160,
+        "old idle ACK keeps the cloud side of the pair")
+
+    local moved = assert(f.sync:position_for_report("book"))
+    eq(moved.chapter_offset, 100,
+        "genuine local movement reports its fresh local anchor")
+    eq(moved._confirmed_remote_proxy, nil,
+        "fresh local movement is not marked as a cloud proxy")
+    eq(f.sync:on_live_position_ack("book", moved, "account-hash"), true,
+        "fresh local movement is acknowledged")
+    eq(f.values.books.book.last_confirmed_position.chapter_offset, 100,
+        "fresh local ACK advances the local baseline")
+    eq(f.values.books.book.last_confirmed_remote_position.chapter_offset, 100,
+        "fresh local ACK advances the cloud baseline")
+    eq(f.sync.dirty, false, "fresh local ACK clears its own dirty position")
+end)
+
+test("missing confirmed cloud offset never becomes a real zero", function()
+    local f = fixture({
+        bookId = "book", progress = 25, chapterUid = 22,
+        chapterIdx = 2, chapterOffset = 150, updateTime = 10,
+    })
+    f.values.books.book.last_confirmed_account = "100"
+    f.values.books.book.last_confirmed_position = {
+        book_id = "book", percent = 25, chapter_uid = 22,
+        chapter_idx = 2, chapter_offset = 150,
+    }
+    f.values.books.book.last_confirmed_remote_position = {
+        book_id = "book", percent = 25, chapter_uid = 22,
+        chapter_idx = 2, chapter_offset = 0, has_chapter_offset = false,
+    }
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    f.sync.verified = true
+    local reported = assert(f.sync:position_for_report("book"))
+    eq(reported.chapter_offset, 150,
+        "missing cloud offset falls back to the real local position")
+    eq(reported._confirmed_remote_proxy, nil,
+        "missing cloud offset is never marked as an authoritative anchor")
 end)
 
 test("unresolved conflict blocks reports and local choice uploads", function()
@@ -279,6 +423,60 @@ test("unresolved conflict blocks reports and local choice uploads", function()
     eq(f.sync:status().verified, true, "local choice verifies")
     eq(#f.uploads, 1, "local choice uploads immediately")
     eq(f.uploads[1].chapter_offset, 150, "uploaded immutable position")
+end)
+
+test("other-device backwards movement prompts against confirmed baseline", function()
+    local f = fixture({
+        bookId = "book", progress = 0, chapterUid = 11,
+        chapterIdx = 1, chapterOffset = 0, updateTime = 20,
+    })
+    f.values.books.book.last_confirmed_account = "100"
+    f.values.books.book.last_confirmed_position = {
+        book_id = "book", percent = 25, chapter_uid = 22,
+        chapter_idx = 2, chapter_offset = 150,
+    }
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.choices, 1, "cloud rewind asks which position to keep")
+    f.choices[1].use_remote()
+    f.drain()
+    eq(f.sync:status().verified, true, "cloud rewind is applied")
+    eq(f.values.books.book.last_confirmed_position.chapter_offset, 0,
+        "chosen rewind becomes the common baseline")
+end)
+
+test("offline-only local advance uploads when cloud stayed at baseline", function()
+    local f = fixture({
+        bookId = "book", progress = 25, chapterUid = 22,
+        chapterIdx = 2, chapterOffset = 150, updateTime = 20,
+    })
+    f.values.books.book.last_confirmed_account = "100"
+    f.values.books.book.last_confirmed_position = {
+        book_id = "book", percent = 25, chapter_uid = 22,
+        chapter_idx = 2, chapter_offset = 150,
+    }
+    f.document.page = 50
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.choices, 0, "unchanged cloud does not block local-only advance")
+    eq(#f.uploads, 1, "local-only advance is uploaded")
+    eq(f.uploads[1].percent, 50, "advanced position is immutable")
+end)
+
+test("two-way divergence prompts even when local is numerically ahead", function()
+    local f = fixture({
+        bookId = "book", progress = 0, chapterUid = 11,
+        chapterIdx = 1, chapterOffset = 0, updateTime = 20,
+    })
+    f.values.books.book.last_confirmed_account = "100"
+    f.values.books.book.last_confirmed_position = {
+        book_id = "book", percent = 25, chapter_uid = 22,
+        chapter_idx = 2, chapter_offset = 150,
+    }
+    f.document.page = 50
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.choices, 1, "both changed sides require a choice")
 end)
 
 test("page change uploads once on close", function()
@@ -319,6 +517,244 @@ test("reconnect capture persists an open dirty page exactly once", function()
     eq(reason, "already_pending", "same page is not enqueued again")
     eq(f.values.books.book.pending_upload_id, identity,
         "same pending page keeps its conflict identity")
+end)
+
+test("reconnect dedupe ignores unscoped legacy upload positions", function()
+    local online = false
+    local f = fixture({}, { is_online = function() return online end })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    local position = assert(f.sync:capture_local())
+    local state = f.values.books.book
+    state.last_uploaded_position = position
+    state.last_confirmed_account = "100"
+    state.last_confirmed_position = {
+        book_id = "book", percent = 50, chapter_uid = 33,
+        chapter_idx = 3, chapter_offset = 100,
+    }
+    state.last_confirmed_remote_position = state.last_confirmed_position
+    f.sync.dirty = true
+    f.sync:_note_offline_movement(position)
+    local saved, reason = f.sync:capture_for_reconnect()
+    eq(saved, true, "legacy upload cannot suppress a genuine rewind")
+    eq(reason, "captured", "rewind is staged")
+    eq(state.pending_upload_position.chapter_offset, position.chapter_offset,
+        "current rewind replaces the legacy location")
+    eq(f.sync:has_offline_movement(), false,
+        "staged rewind clears transient movement")
+end)
+
+test("round trip to confirmed local position clears transient movement", function()
+    local online = false
+    local f = fixture({}, { is_online = function() return online end })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    local position = assert(f.sync:capture_local())
+    local state = f.values.books.book
+    state.last_confirmed_account = "100"
+    state.last_confirmed_position = position
+    state.last_confirmed_remote_position = position
+    f.sync.dirty = true
+    f.sync:_note_offline_movement(position)
+    local saved, reason = f.sync:capture_for_reconnect()
+    eq(saved, false, "confirmed round trip needs no queue")
+    eq(reason, "already_synced", "confirmed baseline is the dedupe source")
+    eq(state.pending_upload_position, nil, "round trip creates no pending data")
+    eq(f.sync:has_offline_movement(), false,
+        "confirmed round trip clears transient movement")
+    eq(f.sync.dirty, false, "confirmed round trip clears dirty state")
+end)
+
+test("returning to confirmed position supersedes a distinct newer pending", function()
+    local online = false
+    local f = fixture({}, { is_online = function() return online end })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    local position_a = assert(f.sync:capture_local())
+    local position_b = {
+        book_id = "book", percent = 50, chapter_uid = 33,
+        chapter_idx = 3, chapter_offset = 100, captured_at = 2,
+    }
+    local state = f.values.books.book
+    state.last_confirmed_account = "100"
+    state.last_confirmed_position = position_a
+    state.last_confirmed_remote_position = position_a
+    assert(f.sync:_save_pending(position_b, "offline_forward"))
+    local old_identity = state.pending_upload_id
+    f.sync.dirty = true
+    f.sync:_note_offline_movement(position_a)
+    local saved, reason = f.sync:capture_for_reconnect()
+    eq(saved, true, "return position supersedes the distinct pending snapshot")
+    eq(reason, "captured", "return position is staged, not deduped")
+    eq(state.pending_upload_position.chapter_offset, position_a.chapter_offset,
+        "latest local position replaces the older pending position")
+    eq(state.pending_upload_id == old_identity, false,
+        "superseding position gets a new identity")
+    eq(f.sync:has_offline_movement(), false,
+        "superseding snapshot clears transient movement")
+end)
+
+test("close uses confirmed baseline but never drops a distinct pending", function()
+    local online = false
+    local f = fixture({}, { is_online = function() return online end })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    local position_a = assert(f.sync:capture_local())
+    local state = f.values.books.book
+    state.last_confirmed_account = "100"
+    state.last_confirmed_position = position_a
+    state.last_confirmed_remote_position = position_a
+    f.sync.dirty = true
+    f.sync:on_close_document()
+    eq(state.pending_upload_position, nil,
+        "closing at confirmed position creates no snapshot")
+
+    f.sync:on_reader_ready()
+    f.drain()
+    local position_b = {
+        book_id = "book", percent = 50, chapter_uid = 33,
+        chapter_idx = 3, chapter_offset = 100, captured_at = 2,
+    }
+    assert(f.sync:_save_pending(position_b, "offline_forward"))
+    f.sync.dirty = true
+    f.sync:on_close_document()
+    eq(state.pending_upload_position.chapter_offset, position_a.chapter_offset,
+        "close replaces distinct pending with the latest return position")
+end)
+
+test("deferred close upload survives reader generation change", function()
+    local callbacks = {}
+    local f = fixture({}, {
+        run_online = function(_kind, callback)
+            callbacks[#callbacks + 1] = callback
+            return true
+        end,
+    })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    f.sync.verified = true
+    f.document.page = 40
+    f.sync:on_page_update()
+    f.sync:on_close_document()
+    eq(#callbacks, 1, "close upload is staged")
+    callbacks[1]()
+    eq(#f.uploads, 1, "close upload completes after document generation changes")
+end)
+
+test("offline movement is scoped and clears when its snapshot is staged", function()
+    local online = true
+    local f = fixture({}, { is_online = function() return online end })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 40
+    online = false
+    f.sync:on_page_update()
+    eq(f.sync:has_offline_movement(), true, "offline page turn is observable")
+    local saved = f.sync:capture_for_reconnect()
+    eq(saved, true, "offline movement is durably staged")
+    eq(f.sync:has_offline_movement(), false, "staged movement is no longer transient")
+    eq(f.sync:has_pending_for_book("book"), true, "pending lookup is account scoped")
+    f.values.account = { user_vid = "other" }
+    eq(f.sync:has_pending_for_book("book"), false, "pending lookup rejects another login")
+end)
+
+test("live position ACK commits only its exact account and snapshot", function()
+    local f = fixture({}, {
+        library_db = { accountKey = function() return "account-hash" end },
+    })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    local sent = assert(f.sync:capture_local())
+    f.sync.dirty = true
+    f.sync:_save_pending(sent, "captured_before_ack")
+    eq(f.sync:on_live_position_ack("book", sent, "wrong"), false,
+        "wrong login cannot commit a baseline")
+    f.values.account = {}
+    eq(f.sync:on_live_position_ack("book", sent, "account-hash"), false,
+        "missing login cannot commit a baseline")
+    f.values.account = { user_vid = "100" }
+    eq(f.sync:on_live_position_ack("book", sent, "account-hash"), true,
+        "matching live ACK commits the baseline")
+    eq(f.values.books.book.pending_upload_position, nil,
+        "obsolete matching pending snapshot is cleared")
+    eq(f.values.books.book.last_confirmed_position.chapter_offset, 150,
+        "sent position becomes the common baseline")
+    eq(f.sync.dirty, false, "matching live ACK clears the current dirty flag")
+
+    f.document.page = 50
+    f.sync:on_page_update()
+    eq(f.sync.dirty, true, "later page turn is dirty")
+    eq(f.sync:on_live_position_ack("book", sent, "account-hash"), true,
+        "late ACK is still recorded")
+    eq(f.sync.dirty, true, "late ACK cannot clear a newer local page")
+end)
+
+test("account handoff invalidates old choices and delayed uploads", function()
+    local callbacks = {}
+    local f = fixture({
+        bookId = "book", progress = 50, chapterUid = 33,
+        chapterIdx = 3, chapterOffset = 100, updateTime = 10,
+    }, {
+        run_online = function(_kind, callback)
+            callbacks[#callbacks + 1] = callback
+            return true
+        end,
+    })
+    f.sync:on_reader_ready()
+    f.step()
+    eq(#callbacks, 1, "opening pull was staged")
+    callbacks[1]()
+    f.drain()
+    eq(#f.choices, 1, "old account choice is visible")
+    local choice = f.choices[1]
+    eq(f.sync:on_account_changed("wrong"), false,
+        "mismatched handoff is rejected")
+    eq(f.sync:on_account_changed("100"), true,
+        "old account handoff is accepted")
+    f.values.account = { user_vid = "200" }
+    eq(choice.keep_local(), false, "old choice cannot upload as new account")
+    eq(choice.use_remote(), false, "old choice cannot jump as new account")
+    eq(#f.uploads, 0, "old choice made no request")
+
+    f.values.account = { user_vid = "100" }
+    f.sync:on_reader_ready()
+    f.drain()
+    local position = assert(f.sync:capture_local())
+    f.sync.verified = true
+    eq(f.sync:_upload_snapshot(position, "account_handoff", false), true,
+        "old account upload was staged")
+    local delayed_upload = callbacks[#callbacks]
+    eq(f.sync:on_account_changed("100"), true,
+        "upload owner handoff is accepted")
+    f.values.account = { user_vid = "200" }
+    delayed_upload()
+    eq(#f.uploads, 0, "delayed old upload did not use new credentials")
+end)
+
+test("account handoff invalidates delayed post-jump verification", function()
+    local f = fixture({
+        bookId = "book", progress = 50, chapterUid = 33,
+        chapterIdx = 3, chapterOffset = 100, updateTime = 10,
+    })
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.choices, 1, "cloud choice is available")
+    eq(f.choices[1].use_remote(), true, "cloud choice starts the jump")
+    eq(f.sync:on_account_changed("100"), true,
+        "jump owner handoff is accepted")
+    f.values.account = { user_vid = "200" }
+    f.drain()
+    eq(f.values.books.book.last_confirmed_account, "100",
+        "old post-jump callback did not verify the new account")
+    eq(f.sync:status().verified, false,
+        "new account remains unverified until reader initialization")
 end)
 
 test("reconnect capture respects disabled automatic progress upload", function()

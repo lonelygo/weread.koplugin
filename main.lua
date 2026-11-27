@@ -26,7 +26,7 @@ local _ = PluginUtil.tr
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
-    version = "1.8.9",
+    version = "1.8.10",
 }
 
 -- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
@@ -126,6 +126,9 @@ function WeReadPlugin:init()
                 return nil, "progress_sync_initializing", true
             end
             return self.progress_sync:position_for_report(book_id)
+        end,
+        on_live_position_ack = function(book_id, sent_position, account_key)
+            self.progress_sync:on_live_position_ack(book_id, sent_position, account_key)
         end,
         is_online = sync_connected,
     }

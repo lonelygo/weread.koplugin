@@ -267,6 +267,7 @@ function ReadReport:new(options)
         is_online = options.is_online or function() return true end,
         gate = options.gate,
         request_sync = options.request_sync or function() end,
+        on_live_position_ack = options.on_live_position_ack,
         now = options.now or os.time,
         active_now = options.active_now or options.now or default_active_now,
         session_id = tostring({}) .. ":" .. tostring((options.now or os.time)()),
@@ -292,6 +293,28 @@ end
 function ReadReport:_interval()
     local interval = tonumber(self:_config().interval_seconds) or DEFAULT_INTERVAL_SECONDS
     return math.max(MIN_INTERVAL_SECONDS, interval)
+end
+
+function ReadReport:_account_key()
+    if self.library_db and type(self.library_db.accountKey) == "function" then
+        return self.library_db:accountKey()
+    end
+end
+
+function ReadReport:_next_live_delay(book_id)
+    local interval = self:_interval()
+    if not self.library_db then
+        return interval
+    end
+    if type(self.library_db.nextLiveReadTime) == "function"
+        and self.library_db:nextLiveReadTime(book_id) then
+        return math.min(15, interval)
+    end
+    if type(self.library_db.onlineReadTail) ~= "function" then return interval end
+    local tail = self.library_db:onlineReadTail(book_id)
+    if tail <= 0 then return interval end
+    if tail >= interval then return 0.1 end
+    return math.max(0.1, interval - tail)
 end
 
 function ReadReport:status()
@@ -505,7 +528,15 @@ function ReadReport:start(reason)
     self.stop_reason = nil
     self.last_skip = nil
     if self.get_document() ~= nil then
+        -- Some KOReader builds miss NetworkConnected. A fresh positive active
+        -- connectivity check before a new foreground clock is a safe boundary:
+        -- no closed/sleep time exists to preserve for the old offline span.
+        if self.network_offline and self.is_online() == true then
+            self.network_offline = nil
+        end
         self.last_accounted_at = self.active_now()
+        self.clock_account_key = self:_account_key()
+        self.clock_account_bound = true
     end
 
     local task
@@ -516,7 +547,7 @@ function ReadReport:start(reason)
         self:_tick(generation, task)
     end
     self.task = task
-    self.scheduler:scheduleIn(self:_interval(), task)
+    self.scheduler:scheduleIn(self:_next_live_delay(book_id), task)
     log("info", "reading time report started:",
         "reason=", reason or "unknown",
         "book_id=", book_id,
@@ -563,7 +594,7 @@ function ReadReport:reschedule(reason)
         return false
     end
     self.scheduler:unschedule(self.task)
-    self.scheduler:scheduleIn(self:_interval(), self.task)
+    self.scheduler:scheduleIn(self:_next_live_delay(self.current_book_id), self.task)
     log("info", "reading time report rescheduled:",
         "reason=", reason or "unspecified",
         "interval=", self:_interval())
@@ -576,19 +607,70 @@ function ReadReport:on_reader_ready()
 end
 
 function ReadReport:on_suspend()
-    self:_capture_active_time()
+    self:_capture_active_time(nil, {
+        flush_online = true,
+        handoff_due = true,
+    })
     self.suspended = true
     self:stop("suspend")
+end
+
+-- QR login calls this before replacing account-scoped settings. It closes the
+-- old clock against the old database, then deliberately excludes time spent
+-- inside the login UI from either account.
+function ReadReport:on_account_changed(expected_account_key)
+    if expected_account_key ~= nil
+        and expected_account_key ~= self:_account_key() then
+        return false
+    end
+    self:_capture_active_time(nil, {
+        flush_online = true,
+        handoff_due = true,
+    })
+    self.account_transition = true
+    self.clock_account_key = nil
+    self.clock_account_bound = nil
+    self:stop("account_changed")
+    return true
+end
+
+function ReadReport:on_account_ready()
+    self.account_transition = nil
+    self.clock_account_key = self:_account_key()
+    self.clock_account_bound = true
+    self.last_accounted_at = self.get_document() and self.active_now() or nil
+    return self:maybe_start("account_changed")
+end
+
+function ReadReport:on_network_disconnected()
+    if self.network_offline then return false end
+    self:_capture_active_time(nil, { force_offline = true })
+    self.network_offline = true
+    return true
+end
+
+function ReadReport:on_network_restored()
+    if not self.network_offline then return false end
+    -- The whole observed disconnected span belongs to the durable replay
+    -- queue even though connectivity is already back at this callback.
+    self:_capture_active_time(nil, { force_offline = true })
+    self.network_offline = nil
+    return true
 end
 
 function ReadReport:on_resume()
     self.suspended = false
     self.last_accounted_at = self.get_document() and self.active_now() or nil
+    self.clock_account_key = self:_account_key()
+    self.clock_account_bound = true
     return self:maybe_start("resume")
 end
 
 function ReadReport:on_close_document()
-    self:_capture_active_time()
+    self:_capture_active_time(nil, {
+        flush_online = true,
+        handoff_due = true,
+    })
     local config = self:_config()
     if config.report_on_open ~= false or config.mode == "auto" then
         self:stop("document_closed")
@@ -605,14 +687,34 @@ function ReadReport:on_close_document()
     self:maybe_start("document_closed_background")
 end
 
-function ReadReport:_capture_active_time(position)
+function ReadReport:_capture_active_time(position, options)
+    options = options or {}
     if self.suspended or self.current_book_source == "offline_queue"
         or self.get_document() == nil or not self.last_accounted_at then
         return 0
     end
     local now = self.active_now()
+    local account_key = self:_account_key()
+    if self.account_transition then
+        self.last_accounted_at = nil
+        return 0
+    end
+    if self.clock_account_bound and account_key ~= self.clock_account_key then
+        -- Without the pre-mutation account hook there is no trustworthy split
+        -- point. Never charge the old account's interval to the new login.
+        log("warn", "reading time account changed without boundary hook")
+        self.clock_account_key = account_key
+        self.clock_account_bound = true
+        self.last_accounted_at = now
+        return 0
+    end
+    self.clock_account_key = account_key
+    self.clock_account_bound = true
     local elapsed = math.max(0, math.floor(now - self.last_accounted_at))
-    if elapsed <= 0 then return 0 end
+    local can_flush_tail = options.flush_online == true and self.library_db
+        and type(self.library_db.stageOnlineReadTime) == "function"
+    if elapsed <= 0 and not options.force_offline
+        and not can_flush_tail then return 0 end
     if not position and type(self.position_provider) == "function"
         and self.current_book_id then
         position = self.position_provider(self.current_book_id)
@@ -621,22 +723,48 @@ function ReadReport:_capture_active_time(position)
     if self.library_db and type(self.library_db.enqueueReadTime) == "function"
         and self.current_book_id then
         local queued
-        local enqueue_options
-        if self.is_online() then
-            enqueue_options = {
-                max_chunk_seconds = math.min(60, self:_interval()),
-            }
+        local modern_offline = false
+        local positively_online = self.is_online() == true
+        local missed_restore = not options.force_offline
+            and self.network_offline and positively_online
+        local connected = not options.force_offline and not self.network_offline
+            and positively_online
+        if connected and type(self.library_db.stageOnlineReadTime) == "function" then
+            queued, first_id = self.library_db:stageOnlineReadTime(
+                self.current_book_id, elapsed, position, self:_interval(),
+                options.flush_online == true, options.handoff_due == true)
+        elseif not connected
+            and type(self.library_db.enqueueOfflineReadTime) == "function" then
+            modern_offline = true
+            queued, first_id = self.library_db:enqueueOfflineReadTime(
+                self.current_book_id, elapsed, position)
+        else
+            local enqueue_options
+            if connected then
+                enqueue_options = {
+                    max_chunk_seconds = math.min(60, self:_interval()),
+                }
+            end
+            queued, first_id = self.library_db:enqueueReadTime(
+                self.current_book_id, elapsed, position, enqueue_options)
         end
-        queued, first_id = self.library_db:enqueueReadTime(
-            self.current_book_id, elapsed, position, enqueue_options)
         if not queued then
             return 0
         end
-        self:_request_sync("read_time_captured", {
-            source = "read_report",
-            book_id = tostring(self.current_book_id),
-            elapsed_seconds = elapsed,
-        })
+        if missed_restore then
+            -- This capture closes the observed offline span into durable replay.
+            -- Later captures resume the healthy online-tail path even though the
+            -- platform omitted NetworkConnected.
+            self.network_offline = nil
+        end
+        if (not connected and (first_id or not modern_offline))
+            or (options.handoff_due == true and first_id) then
+            self:_request_sync("read_time_captured", {
+                source = "read_report",
+                book_id = tostring(self.current_book_id),
+                elapsed_seconds = elapsed,
+            })
+        end
     end
     self.last_accounted_at = self.last_accounted_at + elapsed
     return elapsed, first_id
@@ -653,7 +781,8 @@ end
 
 function ReadReport:_schedule_next(generation, task, delay)
     if self.generation == generation and self.task == task then
-        self.scheduler:scheduleIn(delay or self:_interval(), task)
+        self.scheduler:scheduleIn(delay or self:_next_live_delay(
+            self.current_book_id), task)
     end
 end
 
@@ -807,17 +936,26 @@ function ReadReport:_precheck(replay_only)
     if not replay_only and type(self.position_provider) == "function" then
         position, position_reason, position_applies = self.position_provider(book_id)
     end
+    if self.library_db
+        and type(self.library_db.recoverStaleReadTimeClaims) == "function" then
+        self.library_db:recoverStaleReadTimeClaims(
+            self.now() - JOB_TIMEOUT_SECONDS - 30)
+    end
     -- Replaying old rows must not capture new time on every ACK. The live
     -- tick, suspend and close continue to account for foreground reading.
     local elapsed, fresh_id = 0, nil
     if not replay_only or not self.is_online() then
-        elapsed, fresh_id = self:_capture_active_time(position)
+        elapsed, fresh_id = self:_capture_active_time(position, {
+            flush_online = not replay_only,
+        })
+    end
+    local deferred_live = false
+    if not replay_only and not fresh_id and self.library_db
+        and type(self.library_db.nextLiveReadTime) == "function" then
+        fresh_id = self.library_db:nextLiveReadTime(book_id)
+        deferred_live = fresh_id ~= nil
     end
     if self.library_db and type(self.library_db.claimReadTime) == "function" then
-        if type(self.library_db.recoverStaleReadTimeClaims) == "function" then
-            self.library_db:recoverStaleReadTimeClaims(
-                self.now() - JOB_TIMEOUT_SECONDS - 30)
-        end
         local fresh_online = fresh_id ~= nil and not replay_only
         if not fresh_online then
             local has_pending = type(self.library_db.hasPendingOfflineWork) ~= "function"
@@ -844,12 +982,38 @@ function ReadReport:_precheck(replay_only)
                 position_applies = position_applies == true,
             } or nil)
         if not allowed then
+            local handoff = lease_or_reason == "offline"
+                or lease_or_reason == "authentication_required"
+                or lease_or_reason == "rate_limited"
+            if fresh_online and handoff
+                and type(self.library_db.releaseLiveReadTime) == "function"
+                and self.library_db:releaseLiveReadTime(fresh_id) then
+                self:_request_sync("read_time_captured", {
+                    source = "read_report", book_id = tostring(book_id),
+                    elapsed_seconds = elapsed,
+                })
+            end
             self.state = lease_or_reason == "offline" and "offline" or "waiting"
             self:_log_skip(lease_or_reason)
             return false
         end
+        if fresh_online and deferred_live and position == nil
+            and type(self.library_db.releaseLiveReadTime) == "function"
+            and self.library_db:releaseLiveReadTime(fresh_id) then
+            self:_release_network_gate(lease_or_reason, {
+                accepted = false, write_attempted = false,
+                error_kind = "position_unavailable",
+            })
+            self:_request_sync("read_time_captured", {
+                source = "read_report", book_id = tostring(book_id),
+                elapsed_seconds = elapsed,
+            })
+            self.state = "waiting_for_progress"
+            return false
+        end
         local queued = self.library_db:claimReadTime(
-            self.session_id, fresh_online and fresh_id or nil)
+            self.session_id, fresh_online and fresh_id or nil,
+            fresh_online and position or nil)
         if queued then
             if (fresh_online and fresh_id
                     and tonumber(queued.id) ~= tonumber(fresh_id))
@@ -869,10 +1033,11 @@ function ReadReport:_precheck(replay_only)
             end
             queued._network_lease = lease_or_reason
             queued._fresh_online = fresh_online
-            queued._force_context = fresh_online and position == nil or nil
+            queued._force_context = fresh_online
+                and next(queued.position or {}) == nil or nil
             queued._background_replay = replay_only or nil
             return true, queued.book_id,
-                fresh_online and position or nil, queued, lease_or_reason
+                fresh_online and queued.position or nil, queued, lease_or_reason
         end
         self:_release_network_gate(lease_or_reason, {
             accepted = false, write_attempted = false,
@@ -1173,6 +1338,19 @@ function ReadReport:_apply_queued_outcome(queued, outcome)
             settled = self.library_db:ackReadTime(queued)
             if settled then
                 require("weread.lib.sync_status").noteAck(self, self.now())
+                local current_account = type(self.library_db.accountKey) == "function"
+                    and self.library_db:accountKey() or queued.account_key
+                if queued._fresh_online
+                    and queued.account_key == current_account
+                    and type(self.on_live_position_ack) == "function"
+                    and type(queued.position) == "table"
+                    and next(queued.position) ~= nil then
+                    local ok, err = pcall(self.on_live_position_ack,
+                        queued.book_id, queued.position, queued.account_key)
+                    if not ok then
+                        log("warn", "live position ACK callback failed:", tostring(err))
+                    end
+                end
             end
         elseif type(outcome) == "table"
             and outcome.error_kind == "rejected"

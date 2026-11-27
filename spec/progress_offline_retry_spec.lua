@@ -60,6 +60,9 @@ local sync = setmetatable({
     state = "idle",
 }, ProgressSync)
 sync._fetch_remote = function() return { percent = 10, chapter_uid = 1 } end
+books.book.last_confirmed_account = "100"
+books.book.last_confirmed_position = { percent = 10, chapter_uid = 1 }
+books.book.last_confirmed_remote_position = { percent = 10, chapter_uid = 1 }
 
 local position = { book_id = "book", percent = 42, captured_at = 99 }
 assert(not sync:_upload_snapshot(position, "offline_close", false))
@@ -167,6 +170,9 @@ do
                     book_id = "b", chapter_uid = 1, percent = 80, captured_at = 2,
                 },
                 pending_upload_account = "100",
+                last_confirmed_account = "100",
+                last_confirmed_position = { chapter_uid = 1, percent = 10 },
+                last_confirmed_remote_position = { chapter_uid = 1, percent = 10 },
             },
         }, {
             a = { chapter_uid = 1, percent = 40 },

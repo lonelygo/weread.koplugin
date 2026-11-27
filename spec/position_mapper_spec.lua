@@ -175,5 +175,32 @@ test("missing remote offset falls back to raw percent", function()
     eq(normalized.percent, 40, "raw percent preserved")
 end)
 
+test("physical anchor is authoritative over percent projection", function()
+    eq(Mapper.same_position(
+        { percent = 23, chapter_uid = 22, chapter_offset = 150 },
+        { percent = 23.8, chapter_uid = 22, chapter_offset = 150 }
+    ), true, "same chapter offset")
+    eq(Mapper.same_position(
+        { percent = 23, chapter_uid = 22, chapter_offset = 150 },
+        { percent = 23.1, chapter_uid = 22, chapter_offset = 160 }
+    ), false, "material offset difference")
+end)
+
+test("missing offset is not confused with chapter offset zero", function()
+    local missing = assert(Mapper.normalize_remote({
+        progress = 0,
+        chapterUid = 11,
+    }, "book", "web", chapters))
+    eq(Mapper.has_physical_position(missing), false, "missing offset remains unknown")
+    eq(Mapper.same_position(
+        { percent = 0, chapter_uid = 11, chapter_offset = 0 },
+        missing
+    ), true, "raw percent fallback can still align")
+    eq(Mapper.same_physical_position(
+        { percent = 0, chapter_uid = 11, chapter_offset = 0 },
+        missing
+    ), false, "unknown offset is not a physical match")
+end)
+
 print(string.format("position_mapper_spec: %d checks, %d failure(s)", checks, failures))
 os.exit(failures == 0 and 0 or 1)

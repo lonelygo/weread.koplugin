@@ -12,7 +12,11 @@ end
 
 local LibraryDB = {}
 LibraryDB.__index = LibraryDB
-local SCHEMA_VERSION = 1
+local SCHEMA_VERSION = 2
+-- Shared by every LibraryDB object in this KOReader process. Rows carrying a
+-- different token came from a crashed/restarted process and can be recovered
+-- immediately without waiting for the same book to be reopened.
+local PROCESS_ID = (tostring({}) .. tostring(os.time())):gsub("[^%w]", "")
 
 local function status_changed(self)
     local ok, SyncStatus = pcall(require, "weread.lib.sync_status")
@@ -176,6 +180,12 @@ function LibraryDB:open()
             )
         ]])
         db:exec([[
+            CREATE TABLE IF NOT EXISTS read_time_online_tail (
+                book_id         TEXT PRIMARY KEY,
+                elapsed_seconds INTEGER NOT NULL DEFAULT 0
+            ) WITHOUT ROWID
+        ]])
+        db:exec([[
             CREATE TABLE IF NOT EXISTS local_annotation_snapshots (
                 book_id       TEXT NOT NULL,
                 document_path TEXT NOT NULL,
@@ -244,6 +254,190 @@ function LibraryDB:open()
         return nil
     end
     return db
+end
+
+-- Sub-interval connected time stays out of the offline outbox. It survives a
+-- close/reopen or restart without making Home claim that offline work exists.
+function LibraryDB:onlineReadTail(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then return 0 end
+    local db = self:open()
+    if not db then return 0 end
+    local stmt
+    local seconds = 0
+    local ok = pcall(function()
+        stmt = db:prepare([[
+            SELECT elapsed_seconds FROM read_time_online_tail WHERE book_id=?
+        ]])
+        local row = stmt:reset():bind(book_id):step()
+        seconds = row and tonumber(row[1]) or 0
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    return ok and math.max(0, seconds) or 0
+end
+
+local function write_carried_read_time(self, book_id, elapsed, position, options)
+    options = options or {}
+    local interval = math.max(1, math.floor(tonumber(options.interval) or 30))
+    local position_payload, encode_err = encode(position or {})
+    if not position_payload then
+        logger.warn("library_db carried read time encode failed:", encode_err)
+        return false
+    end
+    local db = self:open()
+    if not db then return false end
+    local stmt
+    local transaction_open = false
+    local first_id
+    local ok, err = pcall(function()
+        db:exec("BEGIN IMMEDIATE")
+        transaction_open = true
+        stmt = db:prepare([[
+            SELECT elapsed_seconds FROM read_time_online_tail WHERE book_id=?
+        ]])
+        local row = stmt:reset():bind(book_id):step()
+        local total = elapsed + (row and tonumber(row[1]) or 0)
+        close_statement(stmt)
+        stmt = nil
+        stmt = db:prepare("DELETE FROM read_time_online_tail WHERE book_id=?")
+        stmt:reset():bind(book_id):step()
+        close_statement(stmt)
+        stmt = nil
+        if options.handoff_due == true or options.offline == true then
+            stmt = db:prepare([[
+                SELECT id FROM read_time_outbox
+                 WHERE book_id=? AND state='live_pending' ORDER BY id LIMIT 1
+            ]])
+            local live_row = stmt:reset():bind(book_id):step()
+            first_id = live_row and tonumber(live_row[1]) or first_id
+            close_statement(stmt)
+            stmt = db:prepare([[
+                UPDATE read_time_outbox
+                   SET state='pending', claim_token='', claimed_at=0
+                 WHERE book_id=? AND state='live_pending'
+            ]])
+            stmt:reset():bind(book_id):step()
+            close_statement(stmt)
+            stmt = nil
+        end
+        local deliver = options.offline == true and total
+            or options.flush == true and math.floor(total / interval) * interval or 0
+        local remainder = total - deliver
+        if remainder > 0 then
+            stmt = db:prepare([[
+                INSERT INTO read_time_online_tail
+                    (book_id, elapsed_seconds)
+                VALUES (?, ?)
+                ON CONFLICT(book_id) DO UPDATE SET
+                    elapsed_seconds=excluded.elapsed_seconds
+            ]])
+            stmt:reset():bind(book_id, remainder):step()
+            close_statement(stmt)
+            stmt = nil
+        end
+        if deliver > 0 then
+            stmt = db:prepare([[
+                INSERT INTO read_time_outbox
+                    (book_id, elapsed_seconds, position_payload, created_at,
+                     state, claim_token)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ]])
+            local created_at = os.time()
+            while deliver > 0 do
+                local chunk = options.offline == true and 30
+                    or math.min(60, interval)
+                local seconds = math.min(chunk, deliver)
+                local state = (options.offline == true
+                    or options.handoff_due == true) and "pending" or "live_pending"
+                stmt:reset():bind(book_id, seconds, position_payload, created_at,
+                    state, state == "live_pending" and PROCESS_ID or ""):step()
+                if not first_id then
+                    local id_stmt = db:prepare("SELECT last_insert_rowid()")
+                    local id_row = id_stmt:reset():step()
+                    first_id = id_row and tonumber(id_row[1]) or nil
+                    close_statement(id_stmt)
+                end
+                deliver = deliver - seconds
+            end
+        end
+        close_statement(stmt)
+        stmt = nil
+        db:exec("COMMIT")
+        transaction_open = false
+    end)
+    close_statement(stmt)
+    if not ok and transaction_open then pcall(function() db:exec("ROLLBACK") end) end
+    pcall(function() db:close() end)
+    if not ok then logger.warn("library_db carried read time write failed:", err)
+    elseif first_id and (options.offline == true
+            or options.handoff_due == true) then status_changed(self) end
+    return ok, ok and first_id or nil
+end
+
+-- Add active connected seconds to the private tail. A normal timer tick sets
+-- flush=true and reserves complete intervals as hidden live rows. Close and
+-- suspend hand full intervals to replay while retaining only the short tail.
+function LibraryDB:stageOnlineReadTime(book_id, elapsed_seconds, position,
+        interval_seconds, flush, handoff_due)
+    book_id = tostring(book_id or "")
+    local elapsed = math.max(0, math.floor(tonumber(elapsed_seconds) or 0))
+    if book_id == "" or (elapsed <= 0 and flush ~= true) then return false end
+    return write_carried_read_time(self, book_id, elapsed, position, {
+        interval = interval_seconds,
+        flush = flush == true,
+        handoff_due = handoff_due == true,
+    })
+end
+
+-- A real offline boundary converts the private tail and newly elapsed time to
+-- the existing replay queue atomically.
+function LibraryDB:enqueueOfflineReadTime(book_id, elapsed_seconds, position)
+    book_id = tostring(book_id or "")
+    local elapsed = math.max(0, math.floor(tonumber(elapsed_seconds) or 0))
+    if book_id == "" then return false end
+    return write_carried_read_time(self, book_id, elapsed, position, {
+        offline = true,
+    })
+end
+
+function LibraryDB:nextLiveReadTime(book_id)
+    book_id = tostring(book_id or "")
+    if book_id == "" then return nil end
+    local db = self:open()
+    if not db then return nil end
+    local stmt
+    local id
+    local ok = pcall(function()
+        stmt = db:prepare([[
+            SELECT id FROM read_time_outbox
+             WHERE book_id=? AND state='live_pending' ORDER BY id LIMIT 1
+        ]])
+        local row = stmt:reset():bind(book_id):step()
+        id = row and tonumber(row[1]) or nil
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    return ok and id or nil
+end
+
+function LibraryDB:releaseLiveReadTime(id)
+    local db = self:open()
+    if not db then return false end
+    local stmt
+    local affected = 0
+    local ok = pcall(function()
+        stmt = db:prepare([[
+            UPDATE read_time_outbox SET state='pending', retry_after=0
+             WHERE id=? AND state='live_pending'
+        ]])
+        stmt:reset():bind(tonumber(id)):step()
+        affected = changed_rows(db)
+    end)
+    close_statement(stmt)
+    pcall(function() db:close() end)
+    if ok and affected == 1 then status_changed(self) end
+    return ok and affected == 1
 end
 
 -- Offline replay uses 30-second slices. A normal connected report may
@@ -325,12 +519,17 @@ function LibraryDB:nextReadTime()
     return ok and item or nil
 end
 
-function LibraryDB:claimReadTime(owner, exact_id)
+function LibraryDB:claimReadTime(owner, exact_id, refreshed_position)
     local path = self:databasePath()
+    local account_key = self:accountKey()
     local db = self:open()
     if not db then return nil end
-    local token = table.concat({ tostring(owner or "reader"), tostring(os.time()),
-        tostring(math.random(100000, 999999)) }, ":")
+    local token = table.concat({ PROCESS_ID, tostring(owner or "reader"),
+        tostring(os.time()), tostring(math.random(100000, 999999)) }, ":")
+    local refreshed_payload
+    if type(refreshed_position) == "table" and next(refreshed_position) ~= nil then
+        refreshed_payload = encode(refreshed_position)
+    end
     local stmt
     local item
     local transaction_open = false
@@ -339,9 +538,9 @@ function LibraryDB:claimReadTime(owner, exact_id)
         transaction_open = true
         if exact_id ~= nil then
             stmt = db:prepare([[
-                SELECT id, book_id, elapsed_seconds, position_payload, created_at
+                SELECT id, book_id, elapsed_seconds, position_payload, created_at, state
                   FROM read_time_outbox
-                 WHERE id=? AND state='pending' LIMIT 1
+                 WHERE id=? AND state IN ('pending','live_pending') LIMIT 1
             ]])
             stmt:reset():bind(tonumber(exact_id))
         else
@@ -357,6 +556,9 @@ function LibraryDB:claimReadTime(owner, exact_id)
         stmt = nil
         if row then
             local seconds = tonumber(row[3]) or 0
+            local live = tostring(row[6] or "") == "live_pending"
+            local position_payload = live and refreshed_payload or nil
+            position_payload = position_payload or row[4]
             if not exact_id and seconds > 30 then
                 -- A 60-second live reservation may have gone offline before
                 -- its first POST. Replay that untouched duration in 30s slices.
@@ -370,16 +572,22 @@ function LibraryDB:claimReadTime(owner, exact_id)
             end
             stmt = db:prepare([[
                 UPDATE read_time_outbox
-                   SET state='claimed', claim_token=?, claimed_at=?, elapsed_seconds=?
-                 WHERE id=? AND state='pending'
+                   SET state=?, claim_token=?, claimed_at=?, elapsed_seconds=?,
+                       position_payload=?
+                 WHERE id=? AND state=?
             ]])
-            stmt:reset():bind(token, os.time(), seconds, tonumber(row[1])):step()
+            stmt:reset():bind(live and "live_claimed" or "claimed",
+                token, os.time(), seconds, position_payload, tonumber(row[1]),
+                live and "live_pending" or "pending"):step()
             if changed_rows(db) == 1 then
                 item = {
                     id = tonumber(row[1]), book_id = tostring(row[2]),
                     elapsed_seconds = seconds,
-                    position = decode(row[4]) or {}, created_at = tonumber(row[5]) or 0,
+                    position = decode(position_payload) or {},
+                    created_at = tonumber(row[5]) or 0,
                     claim_token = token, database_path = path,
+                    account_key = account_key,
+                    _fresh_online = live or nil,
                 }
             end
         end
@@ -411,7 +619,8 @@ function LibraryDB:ackReadTime(item)
         transaction_open = true
         stmt = db:prepare([[
             DELETE FROM read_time_outbox
-             WHERE id=? AND state='claimed' AND claim_token=? AND book_id=? AND elapsed_seconds=?
+             WHERE id=? AND state IN ('claimed','live_claimed')
+               AND claim_token=? AND book_id=? AND elapsed_seconds=?
         ]])
         stmt:reset():bind(tonumber(item.id), tostring(item.claim_token), item.book_id, item.elapsed_seconds):step()
         close_statement(stmt)
@@ -482,7 +691,7 @@ function LibraryDB:quarantineReadTime(item, err)
         stmt = db:prepare([[
             UPDATE read_time_outbox
                SET state='unknown', last_error=?, claim_token='', claimed_at=0
-             WHERE id=? AND state='claimed' AND claim_token=?
+             WHERE id=? AND state IN ('claimed','live_claimed') AND claim_token=?
         ]])
         stmt:reset():bind(safe_queue_reason(err), tonumber(item.id),
             tostring(item.claim_token)):step()
@@ -509,7 +718,7 @@ function LibraryDB:rejectReadTime(item, err)
         stmt = db:prepare([[
             UPDATE read_time_outbox
                SET state='rejected', last_error=?, claim_token='', claimed_at=0
-             WHERE id=? AND state='claimed' AND claim_token=?
+             WHERE id=? AND state IN ('claimed','live_claimed') AND claim_token=?
         ]])
         stmt:reset():bind(safe_queue_reason(err or "server_rejected"),
             tonumber(item.id), tostring(item.claim_token)):step()
@@ -606,7 +815,7 @@ function LibraryDB:releaseReadTimeClaim(item, retry_delay)
         stmt = db:prepare([[
             UPDATE read_time_outbox
                SET state='pending', claim_token='', claimed_at=0, retry_after=?
-             WHERE id=? AND state='claimed' AND claim_token=?
+             WHERE id=? AND state IN ('claimed','live_claimed') AND claim_token=?
         ]])
         local after = retry_delay and (os.time() + retry_delay) or 0
         stmt:reset():bind(after, tonumber(item.id), tostring(item.claim_token)):step()
@@ -839,18 +1048,32 @@ function LibraryDB:recoverStaleReadTimeClaims(cutoff)
     local stmt
     local affected = 0
     local ok = pcall(function()
+        db:exec("BEGIN IMMEDIATE")
+        stmt = db:prepare([[
+            UPDATE read_time_outbox
+               SET state='pending', claim_token='', claimed_at=0
+             WHERE state='live_pending'
+               AND (claim_token<>? OR created_at<=?)
+        ]])
+        stmt:reset():bind(PROCESS_ID, tonumber(cutoff) or 0):step()
+        affected = affected + changed_rows(db)
+        close_statement(stmt)
+        stmt = nil
         stmt = db:prepare([[
             UPDATE read_time_outbox
                SET state='unknown', last_error='interrupted_claim',
                    claim_token='', claimed_at=0
-             WHERE state='claimed' AND claimed_at<=?
+             WHERE state IN ('claimed','live_claimed')
+               AND (substr(claim_token,1,?)<>? OR claimed_at<=?)
         ]])
-        stmt:reset():bind(tonumber(cutoff) or 0):step()
+        stmt:reset():bind(#PROCESS_ID, PROCESS_ID, tonumber(cutoff) or 0):step()
+        affected = affected + changed_rows(db)
         close_statement(stmt)
         stmt = nil
-        affected = changed_rows(db)
+        db:exec("COMMIT")
     end)
     close_statement(stmt)
+    if not ok then pcall(function() db:exec("ROLLBACK") end) end
     pcall(function() db:close() end)
     if ok and affected > 0 then status_changed(self) end
     return ok

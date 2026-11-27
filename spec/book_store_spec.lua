@@ -41,6 +41,9 @@ local ok, index = BookStore.save(settings, "book/42", {
     author = "Fixture author",
     progress = 37,
     chapter_uid = 9,
+    last_confirmed_account = "reader",
+    last_confirmed_position = { chapter_uid = 9, chapter_offset = 180 },
+    last_confirmed_remote_position = { chapter_uid = 9, chapter_offset = 183 },
     mp_articles = { { title = "Fixture article" } },
     chapters = { { chapterUid = 9 } },
 })
@@ -72,6 +75,10 @@ expect(loaded.title == "Fixture book" and loaded.author == "Fixture author",
     "metadata did not round-trip")
 expect(loaded.progress == 37 and loaded.chapter_uid == 9,
     "reading state did not round-trip")
+expect(loaded.last_confirmed_account == "reader"
+    and loaded.last_confirmed_position.chapter_offset == 180
+    and loaded.last_confirmed_remote_position.chapter_offset == 183,
+    "reopening a book must preserve both sides of a resolved position")
 expect(loaded.mp_articles[1].title == "Fixture article",
     "article data did not round-trip")
 expect(loaded.chapters == nil,

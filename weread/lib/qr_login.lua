@@ -291,6 +291,9 @@ function QRLogin:_complete_protocol(login_result, generation)
         login_method = "qr",
         login_time = os.time(),
     }
+    local old_vid = self.settings:get("account", {}).user_vid
+    local switched = tostring(old_vid or "") ~= web_login_vid
+    if switched then self.host:onWeReadAccountChanging(old_vid) end
     self.settings:update_auth({
         cookies = cookies,
         api_key = api_key,
@@ -298,9 +301,7 @@ function QRLogin:_complete_protocol(login_result, generation)
         wr_wrpa = "",
         account = account,
     }, { replace_cookies = true })
-    if self.host.onWeReadAccountChanged then
-        self.host:onWeReadAccountChanged()
-    end
+    self.host:onWeReadAccountChanged(switched)
     if self.host.offline_sync then self.host.offline_sync:request("login_completed") end
     self.login_cookies = nil
     return account
